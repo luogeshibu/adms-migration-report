@@ -4,6 +4,9 @@ input_g_files/
 # G 文件输出目录
 output_g_files/
 
+# G 文件模板目录
+template_g_files/
+
 # 兼容可能使用的其他输出目录名
 out_g_files/
 

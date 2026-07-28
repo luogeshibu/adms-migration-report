@@ -39,6 +39,7 @@ r"""
         JED-CTL-ADF-15.sln.pic.g
         JED-CTL-ADF-16.sln.pic.g
     output_g_files\
+        JED-CTL-ADF-merged-15-16.sln.pic.g
 """
 
 from __future__ import annotations

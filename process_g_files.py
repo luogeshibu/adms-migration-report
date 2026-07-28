@@ -8,6 +8,14 @@ import xml.etree.ElementTree as ET
 替换 ZhaiWaiJieDiDaoZha 元素的 p_NameString 属性YcccD 为 Q1D
 处理后的文件会输出到 output_g_files 文件夹中，原文件不会被修改
 
+目录结构：
+    process_g_files.py
+    input_g_files\
+        JED-CTL-ADF-15.sln.pic.g
+        JED-CTL-ADF-16.sln.pic.g
+    output_g_files\
+        JED-CTL-ADF-15.sln.pic.g
+        JED-CTL-ADF-16.sln.pic.g   
 """
 
 INPUT_FOLDER = "input_g_files"
