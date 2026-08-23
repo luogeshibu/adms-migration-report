@@ -1,3 +1,16 @@
+## v0.8.33 validation additions
+
+- RMU post-edit reselection preserves the horizontal review viewport after Resolution/comment/status saves.
+- The current cell is restored in the left-edge visible column rather than the far-right protected Index/RMU key cell.
+- A UI contract test prevents regression to `PositionAtCenter` horizontal panning.
+
+## v0.8.31 validation additions
+
+- Change Audit now presents a dedicated Module column and business-facing Field labels without mutating immutable SQLite audit keys.
+- Existing RMU and Signal Mapping audit rows are translated at render/export time, so historical project.db files require no migration.
+- Signal Mapping `DBSMART:<RMU>` records render as `RMU <id>` while the raw field key remains available in the App tooltip.
+- Formal Excel Change Audit Log uses the same Module / Record / Field presentation as the desktop App.
+
 ## v0.8.30 validation additions
 
 - Pass RMUs default to Not Required but can record an optional human Review comment in the Resolution column.

@@ -143,6 +143,18 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertIn('color is isolated to the Review cell', self.ui)
         self.assertNotIn('if status in {"REVIEWED", "AUTO VALIDATED"}', self.ui)
 
+
+    def test_rmu_post_edit_reselection_preserves_horizontal_viewport(self):
+        start = self.ui.index("    def _select_comparison_rmu(self, rmu: str):")
+        end = self.ui.index("    def refresh_changes(self):", start)
+        block = self.ui[start:end]
+        self.assertIn("old_h = table.horizontalScrollBar().value()", block)
+        self.assertIn("visible_col = table.columnAt(0)", block)
+        self.assertIn("table.scrollToItem(active_item, QAbstractItemView.EnsureVisible)", block)
+        self.assertIn("table.horizontalScrollBar().setValue(old_h)", block)
+        self.assertIn("QTimer.singleShot(0", block)
+        self.assertNotIn("QAbstractItemView.PositionAtCenter", block)
+
     def test_signal_mapping_has_explicit_result_filter(self):
         self.assertIn('self.db_smart_result_combo.addItems(["ALL RESULTS", "MATCHED", "MISMATCHED", "UNCHECKED"])', self.ui)
         self.assertIn('result_filter == "MISMATCHED"', self.ui)

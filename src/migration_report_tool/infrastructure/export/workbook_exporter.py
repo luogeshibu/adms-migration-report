@@ -34,6 +34,7 @@ from ...schema import COMPARISON_GROUPS, SOURCE_TYPES
 from ...storage import ProjectStore
 from ...review_status import analysis_review_state, field_false_color, signal_review_display_status
 from ...config.sources import schema_for
+from ...services.audit_presentation import present_audit_item
 from ...services.schema_service import (
     get_source_display_names, field_display_name, apply_display_names_to_groups,
     RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS,
@@ -442,7 +443,7 @@ def _build_audit_log_sheet(wb, store: ProjectStore):
     if AUDIT_LOG_SHEET in wb.sheetnames:
         del wb[AUDIT_LOG_SHEET]
     ws = wb.create_sheet(AUDIT_LOG_SHEET)
-    headers = ["ID", "RMU / Record", "Field", "Original Value", "New Value", "Reason", "Modified By", "Modified At"]
+    headers = ["ID", "Module", "Record", "Field", "Original Value", "New Value", "Reason", "Modified By", "Modified At"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -450,14 +451,15 @@ def _build_audit_log_sheet(wb, store: ProjectStore):
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = _CELL_BORDER
     for item in reversed(store.changes()):
-        ws.append([item[k] for k in ("id", "rmu", "field_name", "old_value", "new_value", "reason", "modified_by", "modified_at")])
+        presented = present_audit_item(item)
+        ws.append([presented[k] for k in ("id", "module", "record", "field", "original_value", "new_value", "reason", "modified_by", "modified_at")])
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.border = _CELL_BORDER
-            cell.alignment = Alignment(vertical="top", wrap_text=cell.column in {4, 5, 6})
+            cell.alignment = Alignment(vertical="top", wrap_text=cell.column in {5, 6, 7})
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for i, width in enumerate([8, 18, 22, 30, 30, 38, 18, 22], 1):
+    for i, width in enumerate([8, 24, 18, 28, 30, 30, 38, 18, 22], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.sheet_view.showGridLines = False
     return ws

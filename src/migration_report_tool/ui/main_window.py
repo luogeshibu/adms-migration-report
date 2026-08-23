@@ -87,6 +87,7 @@ from ..services.standard_reference_service import (
     current_standard_reference_info, install_standard_reference, restore_bundled_standard_reference,
 )
 from ..services.zenon_sld_service import regenerate_site_zenon_sld
+from ..services.audit_presentation import present_audit_item
 
 from ..repository import (
     SOURCE_DEFINITIONS,
@@ -2683,7 +2684,7 @@ class MainWindow(QMainWindow):
         ibox.setContentsMargins(16, 12, 16, 12)
         ititle = QLabel("What is the Audit Log?")
         ititle.setObjectName("SectionTitle")
-        idesc = QLabel("Whenever a reviewer changes an RMU Data Review value, selects a structured RMU Resolution, or reviews a Signal Mapping row, the application stores the record, field, original value, new value, reason, Windows user and timestamp. This page is intentionally read-only and is used for traceability, review handover and version auditing.")
+        idesc = QLabel("Whenever a reviewer changes RMU Data Review, Signal Mapping Review, source mapping or Resolution data, the application stores an immutable audit record. Module and Field are shown with business-facing names while the original internal field key remains available in the Field tooltip for technical traceability.")
         idesc.setWordWrap(True)
         idesc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         idesc.setObjectName("Muted")
@@ -2691,18 +2692,19 @@ class MainWindow(QMainWindow):
         ibox.addWidget(idesc)
         layout.addWidget(info)
 
-        self.changes_table = QTableWidget(0, 8)
-        headers = ["ID", "RMU / Record", "Field", "Original Value", "New Value", "Reason", "Modified By", "Modified At"]
+        self.changes_table = QTableWidget(0, 9)
+        headers = ["ID", "Module", "Record", "Field", "Original Value", "New Value", "Reason", "Modified By", "Modified At"]
         self.changes_table.setHorizontalHeaderLabels(headers)
         _configure_table_base(self.changes_table)
         _set_fixed_column(self.changes_table, 0, 64)
-        _set_interactive_column(self.changes_table, 1, 170)
-        _set_interactive_column(self.changes_table, 2, 155)
-        _set_interactive_column(self.changes_table, 3, 220)
-        _set_interactive_column(self.changes_table, 4, 220)
-        _set_stretch_column(self.changes_table, 5)
-        _set_fixed_column(self.changes_table, 6, 130)
-        _set_fixed_column(self.changes_table, 7, 180)
+        _set_interactive_column(self.changes_table, 1, 190)
+        _set_interactive_column(self.changes_table, 2, 150)
+        _set_interactive_column(self.changes_table, 3, 190)
+        _set_interactive_column(self.changes_table, 4, 210)
+        _set_interactive_column(self.changes_table, 5, 210)
+        _set_stretch_column(self.changes_table, 6)
+        _set_fixed_column(self.changes_table, 7, 130)
+        _set_fixed_column(self.changes_table, 8, 180)
 
         self.changes_stack = QStackedWidget()
         self.changes_stack.addWidget(self.changes_table)
@@ -4052,15 +4054,47 @@ class MainWindow(QMainWindow):
 
 
     def _select_comparison_rmu(self, rmu: str):
-        """Restore a reviewed row selection after the table refreshes."""
+        """Restore a reviewed row without changing the horizontal viewport.
+
+        The business RMU key lives in the main grid's Index/RMU column, which is
+        far to the right of the Analysis/Remarks/Resolution review workspace.
+        Selecting that key cell and calling ``scrollToItem`` used to make Qt
+        horizontally pan to Index after every Resolution/comment save.  Locate
+        the row by the key column, but keep the current left-edge visible column
+        as the active cell and restore the horizontal scrollbar defensively.
+        """
+        if not hasattr(self, "comparison_table"):
+            return
+        table = self.comparison_table
+        old_h = table.horizontalScrollBar().value()
         rmu_col = next((i for i, (key, _label, _width) in enumerate(COMPARISON_COLUMNS) if key == "rmu"), -1)
-        for row in range(self.comparison_table.rowCount()):
-            item = self.comparison_table.item(row, rmu_col) if rmu_col >= 0 else None
-            if item and item.text() == str(rmu):
-                self.comparison_table.clear_spreadsheet_selection()
-                item.setSelected(True)
-                self.comparison_table.setCurrentItem(item)
-                self.comparison_table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+        if rmu_col < 0:
+            return
+
+        # Keep the active/current cell inside the user's current viewport.  This
+        # lets scrollToItem adjust vertically without dragging the grid right to
+        # the Index/RMU key column.
+        visible_col = table.columnAt(0)
+        if visible_col < 0 or table.isColumnHidden(visible_col):
+            current_col = table.currentColumn()
+            if current_col >= 0 and not table.isColumnHidden(current_col):
+                visible_col = current_col
+            else:
+                visible_col = next((c for c in range(table.columnCount()) if not table.isColumnHidden(c)), 0)
+
+        for row in range(table.rowCount()):
+            key_item = table.item(row, rmu_col)
+            if key_item and key_item.text() == str(rmu):
+                active_item = table.item(row, visible_col) or key_item
+                table.clear_spreadsheet_selection()
+                active_item.setSelected(True)
+                table.setCurrentItem(active_item)
+                table.scrollToItem(active_item, QAbstractItemView.EnsureVisible)
+                # Qt may perform one deferred ensure-visible pass after the
+                # current index changes, so restore once synchronously and once
+                # on the next event-loop turn.
+                table.horizontalScrollBar().setValue(old_h)
+                QTimer.singleShot(0, lambda value=old_h: table.horizontalScrollBar().setValue(value))
                 break
 
     def refresh_changes(self):
@@ -4070,11 +4104,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, "changes_stack"):
             self.changes_stack.setCurrentWidget(self.changes_table if changes else self.changes_empty)
         self.changes_table.setRowCount(len(changes))
-        keys = ["id", "rmu", "field_name", "old_value", "new_value", "reason", "modified_by", "modified_at"]
-        for r, data in enumerate(changes):
+        keys = ["id", "module", "record", "field", "original_value", "new_value", "reason", "modified_by", "modified_at"]
+        for r, raw in enumerate(changes):
+            data = present_audit_item(raw)
             for c, key in enumerate(keys):
                 item = QTableWidgetItem(clean(data.get(key, "")))
-                item.setToolTip(item.text())
+                if key == "field":
+                    internal = clean(data.get("internal_field"))
+                    item.setToolTip(f"{item.text()}\nInternal field: {internal}" if internal else item.text())
+                else:
+                    item.setToolTip(item.text())
                 self.changes_table.setItem(r, c, item)
 
     def refresh_versions(self):

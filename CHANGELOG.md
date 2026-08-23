@@ -1,4 +1,27 @@
+## v0.8.33 - Preserve Review Grid Viewport After Edits
+
+- Fixed RMU Data Review horizontally jumping toward the Index/source columns after saving a structured Resolution or optional manual Review comment.
+- RMU reselection now locates the row using the protected RMU key but keeps the active cell inside the user's current visible viewport.
+- Horizontal scroll position is restored synchronously and on the next Qt event-loop turn to prevent deferred ensure-visible scrolling.
+- Resolution, manual Review comment, optional Pass Review and audited value-edit refresh paths all inherit the same viewport-preserving behavior.
+- Added a regression contract preventing `PositionAtCenter` reselection of the far-right RMU key column.
+
+## v0.8.32 - Public README Cleanup
+
+- Removed company and country/project branding from the public README title.
+- README now uses the generic public repository name `ADMS Migration Report Tool`.
+- Application UI/project identity is unchanged.
+
+## v0.8.31 - Business-Facing Change Audit
+
+- Added a Module column to Change Audit so RMU Data Review, Signal Mapping Review, Site Data Sources and Display Name actions are immediately distinguishable.
+- Replaced internal audit field keys in the UI/export with business-facing Field labels while preserving immutable raw keys in SQLite.
+- Field tooltips expose the original internal key for technical traceability.
+- Normalized audit Record labels such as `DBSMART:5839` to `RMU 5839`.
+- Updated the exported Change Audit Log sheet to match the application business view.
+
 ## v0.8.30 - Optional RMU Review Comments in Resolution
+
 
 - Added an audited `manual_comment` field to RMU human Review state.
 - Pass RMUs still default to `Not Required`, but the Resolution column can now be double-clicked to record an optional human Review comment.

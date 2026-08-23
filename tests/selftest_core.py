@@ -134,6 +134,7 @@ def _run_selftest_isolated():
             assert wb["STANDARD"].max_row > 1
             assert wb["Import Sources"]["A1"].value == "Source Type"
             assert wb["Change Audit Log"]["A1"].value == "ID"
+            assert [wb["Change Audit Log"].cell(1, c).value for c in range(1, 5)] == ["ID", "Module", "Record", "Field"]
             # STANDARD is copied from the bundled IOA STANDARD workbook; legacy DATA/DB-smart helpers are absent.
             assert "DATA" not in wb.sheetnames
             assert "DB-smsrt report" not in wb.sheetnames
