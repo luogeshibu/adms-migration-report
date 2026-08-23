@@ -84,11 +84,14 @@ class BuildPipelineContractTests(unittest.TestCase):
 
     def test_rmu_review_status_is_explicit_not_inferred_from_any_audit_change(self):
         text = (self.root / "src" / "migration_report_tool" / "ui" / "main_window.py").read_text(encoding="utf-8")
-        self.assertIn('review_btn = QPushButton("Set Review")', text)
+        store = (self.root / "src" / "migration_report_tool" / "infrastructure" / "database" / "sqlite_store.py").read_text(encoding="utf-8")
+        self.assertIn('review_btn = QPushButton("Review / Resolve")', text)
         self.assertIn('self.store.rmu_review_map()', text)
-        self.assertIn('self.store.update_rmu_review_status(', text)
+        self.assertIn('self.store.set_rmu_resolution(', text)
+        self.assertIn('def sync_rmu_review_from_resolutions(', store)
+        self.assertIn('self.update_rmu_review_status(', store)
         self.assertNotIn('change_rmus = {x["rmu"] for x in self.store.changes()', text)
-        self.assertIn('self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "UNREVIEWED", "REVIEWED", "NEEDS ACTION"])', text)
+        self.assertIn('self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "NOT REQUIRED", "UNREVIEWED", "REVIEWED", "NEEDS ACTION", "VALIDATION REQUIRED"])', text)
         self.assertNotIn('self.status_combo.addItems(["ALL", "MATCHED", "WARNING", "FAILED"', text)
 
     def test_release_packages_svg_icons_and_qtsvg(self):

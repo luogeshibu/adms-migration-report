@@ -1,3 +1,68 @@
+## v0.8.30 - Optional RMU Review Comments in Resolution
+
+- Added an audited `manual_comment` field to RMU human Review state.
+- Pass RMUs still default to `Not Required`, but the Resolution column can now be double-clicked to record an optional human Review comment.
+- When a single Pass RMU is manually marked Reviewed or Needs Action, the App immediately offers the Review Comment editor.
+- Issue RMUs continue to use structured per-FALSE Resolution decisions; optional Pass comments never replace or bypass issue Resolution.
+- RMU search now includes the optional manual Review comment.
+- Formal Excel export writes optional Pass human-review comments into the Resolution column.
+- Manual Review comments are preserved independently of the automatic Analysis result and are audited as `rmu_review_comment`.
+
+## v0.8.29 - Optional RMU Pass Review Parity
+
+- RMU Data Review now matches Signal Mapping Review: automatic Pass rows default to `Not Required` but are no longer locked.
+- Pass RMUs can be explicitly marked `Reviewed` or `Needs Action`, or reset to the default `Not Required` state.
+- Issue RMUs still require structured per-FALSE-field Resolution and cannot bypass Resolution by manually marking Reviewed.
+- Rows without a complete automatic Analysis remain `Validation Required` and cannot be manually overridden.
+- Optional Pass reviews do not inflate the required Human Review denominator; optional `Needs Action` still blocks formal export.
+- RMU Review filters now include `NOT REQUIRED` and `VALIDATION REQUIRED`.
+- Excel export preserves explicit optional RMU Reviewed / Needs Action states.
+
+## v0.8.28 - Optional Manual Review and Neutral Comments
+
+- Signal Mapping Comments cells now always render with a plain white background in the App and formal Excel export; comments are annotation-only and never inherit validation/review colors.
+- Matched signals still default to `Not Required`, but are no longer locked: reviewers can explicitly mark them `Reviewed` or `Needs Action` when a manual check is useful.
+- `Default / Clear Manual Review` returns a matched row to `Not Required` and a mismatch row to `Unreviewed`.
+- Unchecked rows remain `Validation Required`; review status cannot override incomplete validation, while Comments can still be recorded.
+- Required Human Review progress still counts mismatches only. Optional `Needs Action` on a matched signal is nevertheless treated as an actionable condition and blocks formal export.
+- App and Excel now share one signal review display-status function to prevent status drift between UI and exported reports.
+
+## v0.8.27 - Signal Locator Lockstep Synchronization
+
+- Fixed Signal Mapping Review frozen Row Locator drifting away from the main grid during vertical scrolling.
+- Signal locator now uses the same `ScrollPerPixel` mode as the main grid, so synchronized scrollbar values use the same coordinate system.
+- Locator RMU and Type are now rendered directly from the same `row.values` used by the main RMU group, eliminating a second presentation identity path.
+- Fixed Signal Mapping row painting so each visible row carries its own automatic analysis result instead of reusing a stale loop value.
+- RMU Data Review locator behavior was rechecked and already used matching pixel-scroll modes.
+
+## v0.8.26 - Review Visual Separation and Table Readability
+
+- Reserved green Review status exclusively for human-reviewed exceptions.
+- Replaced automatic `Auto Validated` Review text with neutral `Not Required` for RMU pass rows and matched Signal Mapping rows.
+- Added a unified Human Review palette: Not Required (blue-gray), Unreviewed (neutral), Reviewed (green), Needs Action (red), Validation Required (amber).
+- Separated Signal Mapping automatic row tint from Human Review status color so Matched and Reviewed can no longer be confused.
+- Widened frozen Signal Mapping Review status columns to prevent status text clipping.
+- Updated formal Excel export to use the same automatic-analysis vs Human Review color semantics as the desktop App.
+
+## v0.8.25 - Exception-Based Human Review and Validation Coverage
+
+- Human Review progress now counts only actionable exceptions: one item per active RMU FALSE field plus one item per Signal Mapping mismatch.
+- Pass RMUs and Matched signals are shown as `Auto Validated` and no longer inflate the Human Review denominator.
+- Signal `Unchecked` rows are treated as Validation Coverage gaps, not Human Review items. Any unchecked signal blocks formal `READY FOR EXPORT`.
+- Added delivery state `VALIDATION INCOMPLETE · N UNCHECKED`.
+- Dashboard RMU Review now reports Resolved Issues / total RMU issue decisions; Signal Review reports processed mismatch decisions / total mismatches.
+- Workflow Human Review percentage is calculated from exception decisions only. Zero exceptions means Human Review is already complete once Validation Coverage is complete.
+- RMU `Set Review` action is replaced by `Resolve Issues`; pass rows require no manual review.
+- Signal Human Review can be applied only to MISMATCHED rows; Matched is Auto Validated and Unchecked must be corrected/revalidated.
+- RMU Resolution changes now participate in report freshness checks.
+
+## v0.8.24 - Windows Formal Build Regression Fix
+
+- Fixed Windows `WinError 32` during regression cleanup by explicitly closing every application-global `global_settings.db` SQLite connection.
+- Formal end-to-end self-test now uses an isolated temporary application-global settings root and never depends on or modifies the operator's saved global Display Name overrides.
+- Prevents legitimate workstation Display Name customizations from changing deterministic Excel header assertions during release builds.
+- No RMU comparison, Signal Mapping, Resolution, Review, feeder normalization or report business rules were changed.
+
 ## v0.8.23 - Simplified Analysis Colors and Live Review Status
 
 - Simplified RMU Analysis colors to three row meanings only: Pass, Has Issues, and Critical.

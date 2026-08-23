@@ -1,3 +1,32 @@
+## v0.8.30 validation additions
+
+- Pass RMUs default to Not Required but can record an optional human Review comment in the Resolution column.
+- Optional RMU comments are stored in `rmu_reviews.manual_comment`, audited, searchable and exported.
+- Issue RMUs still require one structured Resolution per FALSE Analysis field.
+- Double-clicking Resolution routes Pass RMUs to the comment editor and issue RMUs to the structured Resolution dialog.
+
+## v0.8.27 validation additions
+
+- Signal Mapping main grid and frozen locator both use pixel-based vertical scrolling.
+- Signal locator RMU/Type are sourced from the exact same visible row values as the main RMU group.
+- Per-row automatic Signal analysis state is preserved through filtering/rendering.
+
+## v0.8.25 validation additions
+
+- Human Review denominator is exception-only: RMU FALSE-field decisions + Signal mismatches.
+- Pass RMUs and Matched signals are excluded from Human Review and display Auto Validated.
+- Signal Unchecked is excluded from Human Review, displayed as Validation Required, and blocks formal export readiness.
+- `VALIDATION INCOMPLETE · N UNCHECKED` is a first-class delivery state.
+- RMU dashboard review progress uses structured Resolution counts; Signal dashboard review progress uses mismatch-only review counts.
+- Signal review action rejects Matched/Unchecked rows and instructs the operator to use MISMATCHED review or revalidation respectively.
+- Report freshness includes `rmu_resolutions.updated_at`.
+- Formal unittest entry point and pytest suite pass with the new workflow semantics.
+
+## v0.8.24 validation additions
+
+- Application-global SQLite access explicitly closes database handles after every read/write, preventing Windows file-lock failures during TemporaryDirectory cleanup.
+- End-to-end formal self-test isolates `MIGRATION_REPORT_TOOL_USER_DATA_ROOT`, so saved operator Display Name overrides cannot affect deterministic workbook assertions.
+
 ## v0.8.23 validation additions
 
 - RMU one-issue and two-issue rows use the same issue background while retaining their exact Analysis labels.
@@ -308,3 +337,28 @@ The source package has one authoritative production build/release entry point: r
 - `ABH-22` and `ABN-22` are explicitly covered as a mismatch even with the same numeric feeder number.
 - Numeric-only feeder values use the selected site as a station hint.
 - FEEDER tooltip text documents the station-aware comparison rule.
+
+## v0.8.26 validation additions
+
+- Human Review green is reserved for `Reviewed` exception decisions only.
+- Automatic RMU Pass / Signal Matched rows display `Not Required` in neutral blue-gray.
+- Signal automatic row tint is independent from the Human Review cell color.
+- Frozen Signal Review width was increased so status text is not clipped.
+- Formal Excel export mirrors the same Review/Analysis semantic separation.
+- Windows formal unittest entry point and pytest both cover the new review status contract.
+
+## v0.8.28 validation additions
+
+- Signal Comments are neutral white in both App and Excel.
+- Matched rows default to Not Required but accept explicit Reviewed / Needs Action.
+- Clearing a matched manual review returns it to Not Required.
+- Unchecked rows remain Validation Required.
+- Required review progress remains mismatch-based; optional matched Needs Action still blocks export.
+
+## v0.8.29 validation additions
+
+- RMU Pass rows now match Signal Mapping behavior: `Not Required` is the default, not a lock.
+- Optional RMU Pass review supports Reviewed / Needs Action / clear-to-default while leaving automatic Analysis unchanged.
+- Issue RMUs still require per-field structured Resolution; incomplete automatic Analysis remains Validation Required.
+- Optional Pass review does not inflate the required exception Human Review denominator; optional Needs Action remains an export blocker.
+- RMU Review filters and Excel export preserve the full displayed Review state.

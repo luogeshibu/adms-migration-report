@@ -1,6 +1,8 @@
 """Non-UI validation of comparison, SQLite, template-fill and export behavior."""
 from pathlib import Path
+import os
 import shutil
+import tempfile
 
 from openpyxl import load_workbook
 
@@ -8,6 +10,24 @@ from migration_report_tool.core import COLUMNS, ProjectStore, REPORT_MERGES, bui
 
 
 def run_selftest():
+    # Formal regression/self-test must never read or modify the operator's
+    # application-global Display Name database.  A real workstation can have
+    # legitimate global overrides (for example Device -> RMU Type), which must
+    # not change a build test's expected workbook contract.
+    old_user_data = os.environ.get("MIGRATION_REPORT_TOOL_USER_DATA_ROOT")
+    isolated_user_data = tempfile.TemporaryDirectory()
+    os.environ["MIGRATION_REPORT_TOOL_USER_DATA_ROOT"] = str(Path(isolated_user_data.name) / "user-data")
+    try:
+        _run_selftest_isolated()
+    finally:
+        if old_user_data is None:
+            os.environ.pop("MIGRATION_REPORT_TOOL_USER_DATA_ROOT", None)
+        else:
+            os.environ["MIGRATION_REPORT_TOOL_USER_DATA_ROOT"] = old_user_data
+        isolated_user_data.cleanup()
+
+
+def _run_selftest_isolated():
     mapping = {
         "se_list": "SE.xlsx",
         "zenon_db": "ZENON-DB.csv",
@@ -52,6 +72,19 @@ def run_selftest():
                     analysis_fingerprint=store._rmu_field_fingerprint(issue_row, field),
                 )
         store.sync_rmu_review_from_resolutions(issue_rmu, issue_row, "selftest")
+        # Pass RMUs default to Not Required, but optional human Review must be
+        # persisted and exported without changing the automatic Analysis result.
+        manual_pass_row = next(
+            row for row in rows
+            if row["rmu"] != rows[0]["rmu"]
+            and all(str(row.get(f"analysis_{field}", "")).upper() != "FALSE" for field in ("name", "feeder", "smart", "type", "ip", "link"))
+        )
+        store.update_rmu_review_status(
+            manual_pass_row["rmu"], "REVIEWED", "selftest",
+            reason="Optional RMU manual Review on automatic Pass result",
+        )
+        manual_pass_comment = "Optional site verification completed."
+        store.update_rmu_manual_review_comment(manual_pass_row["rmu"], manual_pass_comment, "selftest")
         target = export_report(store)
         assert target.exists(), "Excel export not created"
 
@@ -64,7 +97,8 @@ def run_selftest():
             ws = wb["RMU Data Review"]
             assert ws["A1"].value == "Review"
             assert ws["A2"].value == "Review"
-            assert ws["A3"].value == "UNREVIEWED"
+            assert ws["A3"].value == "NOT REQUIRED"
+            assert ws["A3"].fill.fgColor.rgb.endswith("EEF4F8"), "Automatic pass must use neutral Not Required review color"
             assert ws["B1"].value == "Analysis"
             assert [ws.cell(2, c).value for c in range(2, 8)] == ["NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK"]
             assert ws["H1"].value == "Remarks"
@@ -78,6 +112,11 @@ def run_selftest():
             issue_excel_row = next(r for r in range(3, ws.max_row + 1) if str(ws.cell(r, 11).value or "") == str(issue_rmu))
             assert ws.cell(issue_excel_row, 9).value, "Resolution summary must be exported"
             assert ws.cell(issue_excel_row, 1).value == "REVIEWED"
+            assert ws.cell(issue_excel_row, 1).fill.fgColor.rgb.endswith("DDF5E7"), "Human Reviewed must be green"
+            manual_pass_excel_row = next(r for r in range(3, ws.max_row + 1) if str(ws.cell(r, 11).value or "") == str(manual_pass_row["rmu"]))
+            assert ws.cell(manual_pass_excel_row, 1).value == "REVIEWED", "Optional Pass RMU Review must be exported"
+            assert ws.cell(manual_pass_excel_row, 1).fill.fgColor.rgb.endswith("DDF5E7"), "Optional human Reviewed must use the Reviewed color"
+            assert ws.cell(manual_pass_excel_row, 9).value == manual_pass_comment, "Optional Pass RMU comment must be exported in Resolution"
 
             # Signal Mapping Review must also mirror the App model: Review first, then RMU/source groups.
             signal = wb["Signal Mapping Review"]
@@ -88,7 +127,9 @@ def run_selftest():
             assert signal["C2"].value == "RMU"
             assert signal["D2"].value == "Type"
             assert signal["E1"].value == "ZENON"
-            assert signal["A3"].value == "UNREVIEWED"
+            assert signal["A3"].value == "NOT REQUIRED"
+            assert signal["A3"].fill.fgColor.rgb.endswith("EEF4F8"), "Matched signal must not reuse Reviewed green"
+            assert signal["B3"].fill.fgColor.rgb.endswith("FFFFFF"), "Signal Comments must always stay neutral white"
 
             assert wb["STANDARD"].max_row > 1
             assert wb["Import Sources"]["A1"].value == "Source Type"

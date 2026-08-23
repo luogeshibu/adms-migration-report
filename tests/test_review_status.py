@@ -4,7 +4,7 @@ from pathlib import Path
 
 from migration_report_tool.storage import ProjectStore
 
-from migration_report_tool.review_status import analysis_review_state, field_false_color
+from migration_report_tool.review_status import analysis_review_state, field_false_color, signal_review_display_status
 
 
 def row(**updates):
@@ -59,6 +59,18 @@ class ReviewStatusTests(unittest.TestCase):
         self.assertIsNotNone(field_false_color("IP"))
         self.assertIsNotNone(field_false_color("LINK"))
 
+    def test_signal_matched_defaults_not_required_but_allows_explicit_review(self):
+        self.assertEqual(signal_review_display_status("TRUE", "UNREVIEWED"), "NOT REQUIRED")
+        self.assertEqual(signal_review_display_status("TRUE", "REVIEWED"), "REVIEWED")
+        self.assertEqual(signal_review_display_status("TRUE", "NEEDS ACTION"), "NEEDS ACTION")
+
+    def test_signal_mismatch_uses_required_review_state(self):
+        self.assertEqual(signal_review_display_status("FALSE", "UNREVIEWED"), "UNREVIEWED")
+        self.assertEqual(signal_review_display_status("FALSE", "REVIEWED"), "REVIEWED")
+
+    def test_signal_unchecked_cannot_be_overridden_by_review(self):
+        self.assertEqual(signal_review_display_status("", "REVIEWED"), "VALIDATION REQUIRED")
+
 
 class RmuReviewPersistenceTests(unittest.TestCase):
     def test_explicit_rmu_review_status_is_persisted_and_audited(self):
@@ -74,6 +86,22 @@ class RmuReviewPersistenceTests(unittest.TestCase):
                 self.assertEqual(change["new_value"], "REVIEWED")
                 store.update_rmu_review_status("8664", "UNREVIEWED", "tester")
                 self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "UNREVIEWED")
+            finally:
+                store.db.close()
+
+    def test_optional_rmu_manual_review_comment_is_persisted_and_audited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProjectStore(Path(tmp))
+            try:
+                store.update_rmu_manual_review_comment("8664", "Checked on site; no action required.", "tester")
+                review = store.rmu_review_map()["8664"]
+                self.assertEqual(review["manual_comment"], "Checked on site; no action required.")
+                self.assertEqual(store.rmu_manual_review_comment("8664"), "Checked on site; no action required.")
+                change = store.changes()[0]
+                self.assertEqual(change["field_name"], "rmu_review_comment")
+                self.assertEqual(change["new_value"], "Checked on site; no action required.")
+                store.update_rmu_manual_review_comment("8664", "", "tester")
+                self.assertEqual(store.rmu_manual_review_comment("8664"), "")
             finally:
                 store.db.close()
 

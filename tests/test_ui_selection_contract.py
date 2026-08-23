@@ -71,6 +71,14 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertIn("self.db_smart_locator = SpreadsheetTableWidget(0, 3)", self.ui)
         self.assertIn('self.db_smart_locator.setHorizontalHeaderLabels(["RMU", "Type", "Review"])', self.ui)
 
+
+    def test_signal_mapping_locator_stays_in_pixel_lockstep(self):
+        self.assertIn('self.db_smart_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)', self.ui)
+        self.assertIn('self.db_smart_locator.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)', self.ui)
+        self.assertIn('self.db_smart_locator.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)', self.ui)
+        self.assertIn('main_rmu = clean(row.values[0])', self.ui)
+        self.assertIn('shown.append((row, status, comments, analysis_result))', self.ui)
+
     def test_dashboard_exception_actions_apply_real_filters(self):
         self.assertIn("self.dashboard_rmu_issues_button.clicked.connect(self.open_dashboard_rmu_issues)", self.ui)
         self.assertIn('self.analysis_combo.setCurrentText("ANY MISMATCH")', self.ui)
@@ -82,7 +90,16 @@ class UISelectionContractTests(unittest.TestCase):
     def test_review_cells_are_directly_editable_by_double_click(self):
         self.assertIn("self.comparison_locator.cellDoubleClicked.connect(self._edit_comparison_locator_review)", self.ui)
         self.assertIn("self.db_smart_locator.cellDoubleClicked.connect(self._edit_db_smart_locator_review)", self.ui)
-        self.assertIn("pass rows set Review directly; issue rows open structured Resolution", self.ui)
+        self.assertIn("Review defaults to Not Required. Double-click for optional manual Review", self.ui)
+
+    def test_rmu_pass_not_required_is_optional_manual_review(self):
+        self.assertIn('"Default / Clear Manual Review": "UNREVIEWED"', self.ui)
+        self.assertIn('"Optional RMU manual Review on automatic Pass result"', self.ui)
+        self.assertIn('stored_review if state.has_result and stored_review in {"REVIEWED", "NEEDS ACTION"}', self.ui)
+        self.assertIn('Pass RMU(s) can be optionally reviewed separately', self.ui)
+        self.assertIn('def edit_rmu_manual_review_comment(', self.ui)
+        self.assertIn('manual_review_comment = self.store.rmu_manual_review_comment(rmu)', self.ui)
+        self.assertIn('Double-click to record or edit the optional human Review comment', self.ui)
 
     def test_rmu_legend_uses_minimal_color_semantics(self):
         self.assertIn('("#FFF8D8", "Has Issues"', self.ui)
@@ -94,9 +111,37 @@ class UISelectionContractTests(unittest.TestCase):
     def test_delivery_status_is_live_review_stage(self):
         self.assertIn('display_state = f"REVIEW PENDING · {review_pct}%"', self.ui)
         self.assertIn('display_state = f"ACTION REQUIRED · {needs_action}"', self.ui)
+        self.assertIn('display_state = f"VALIDATION INCOMPLETE · {validation_unchecked} UNCHECKED"', self.ui)
         self.assertNotIn('state = "VALIDATION COMPLETE"', self.ui)
-        self.assertIn('Review {reviewed_or_action} / {len(active_rmus)}', self.ui)
-        self.assertIn('Resolution {resolved_issue_decisions} / {total_issue_decisions} issues', self.ui)
+        self.assertIn('Human Review {resolved_issue_decisions} / {total_issue_decisions} issue decision(s)', self.ui)
+        self.assertIn('review_total = rmu_review_total + signal_review_total', self.ui)
+        self.assertIn('validation_unchecked=signal_unchecked', self.ui)
+
+    def test_human_review_counts_exceptions_only(self):
+        self.assertIn('MetricCard("Resolved Issues"', self.ui)
+        self.assertIn('each RMU FALSE field + each Signal mismatch', self.ui)
+        self.assertIn('mismatch_keys = {', self.ui)
+        self.assertIn('signal_review_total = len(mismatch_keys)', self.ui)
+        self.assertIn('Pass RMUs do not require Human Review', self.ui)
+        self.assertIn('Unchecked signals are a Validation Coverage gap', self.ui)
+
+    def test_non_exception_rows_default_to_not_required_but_manual_review_is_optional(self):
+        self.assertIn('"NOT REQUIRED": ("Not Required"', self.ui)
+        self.assertIn('"VALIDATION REQUIRED": ("Validation Required"', self.ui)
+        self.assertIn('Matched rows default to Not Required, but reviewers may still add Comments', self.ui)
+        self.assertIn('Default / Clear Manual Review', self.ui)
+        self.assertIn('analysis_result == "TRUE"', self.ui)
+
+
+    def test_signal_comments_are_always_neutral_white(self):
+        self.assertIn('item.setBackground(QColor("#FFFFFF"))', self.ui)
+        self.assertIn('Double-click to add an optional review comment', self.ui)
+
+    def test_review_color_is_distinct_from_automatic_validation(self):
+        self.assertIn('"NOT REQUIRED": ("Not Required", "#EEF4F8"', self.ui)
+        self.assertIn('"REVIEWED": ("Reviewed", "#DDF5E7"', self.ui)
+        self.assertIn('color is isolated to the Review cell', self.ui)
+        self.assertNotIn('if status in {"REVIEWED", "AUTO VALIDATED"}', self.ui)
 
     def test_signal_mapping_has_explicit_result_filter(self):
         self.assertIn('self.db_smart_result_combo.addItems(["ALL RESULTS", "MATCHED", "MISMATCHED", "UNCHECKED"])', self.ui)

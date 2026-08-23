@@ -58,6 +58,7 @@ class ProjectStore:
         );
         CREATE TABLE IF NOT EXISTS rmu_reviews (
             rmu TEXT PRIMARY KEY, review_status TEXT NOT NULL DEFAULT 'UNREVIEWED',
+            manual_comment TEXT NOT NULL DEFAULT '',
             reviewed_by TEXT, reviewed_at TEXT, updated_at TEXT, analysis_hash TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS rmu_resolutions (
@@ -86,6 +87,8 @@ class ProjectStore:
         rmu_review_columns = {row[1] for row in self.db.execute("PRAGMA table_info(rmu_reviews)")}
         if "analysis_hash" not in rmu_review_columns:
             self.db.execute("ALTER TABLE rmu_reviews ADD COLUMN analysis_hash TEXT NOT NULL DEFAULT ''")
+        if "manual_comment" not in rmu_review_columns:
+            self.db.execute("ALTER TABLE rmu_reviews ADD COLUMN manual_comment TEXT NOT NULL DEFAULT ''")
         signal_review_columns = {row[1] for row in self.db.execute("PRAGMA table_info(db_smart_reviews)")}
         if "row_hash" not in signal_review_columns:
             self.db.execute("ALTER TABLE db_smart_reviews ADD COLUMN row_hash TEXT NOT NULL DEFAULT ''")
@@ -495,6 +498,45 @@ class ProjectStore:
             row["rmu"]: dict(row)
             for row in self.db.execute("SELECT * FROM rmu_reviews")
         }
+
+    def rmu_manual_review_comment(self, rmu: str) -> str:
+        row = self.db.execute("SELECT manual_comment FROM rmu_reviews WHERE rmu=?", (clean(rmu),)).fetchone()
+        return clean(row["manual_comment"]) if row else ""
+
+    def update_rmu_manual_review_comment(
+        self, rmu: str, comment: str, modified_by: str,
+        reason: str = "Optional RMU manual Review comment updated",
+    ) -> None:
+        """Store a free-form note for an optional human Review on a Pass RMU.
+
+        Structured issue Resolution remains separate in ``rmu_resolutions``.
+        The comment is intentionally independent of review_status so a reviewer
+        may record context while the automatic result still defaults to Not Required.
+        """
+        rmu = clean(rmu)
+        if not rmu:
+            raise ValueError("RMU is required for manual review comment")
+        new_value = str(comment or "").strip()
+        current = self.db.execute("SELECT * FROM rmu_reviews WHERE rmu=?", (rmu,)).fetchone()
+        old_value = clean(current["manual_comment"]) if current and "manual_comment" in current.keys() else ""
+        if old_value == new_value:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        if current is None:
+            self.db.execute(
+                "INSERT INTO rmu_reviews(rmu,review_status,manual_comment,reviewed_by,reviewed_at,updated_at,analysis_hash) VALUES(?,?,?,?,?,?,?)",
+                (rmu, "UNREVIEWED", new_value, "", "", now, ""),
+            )
+        else:
+            self.db.execute(
+                "UPDATE rmu_reviews SET manual_comment=?,updated_at=? WHERE rmu=?",
+                (new_value, now, rmu),
+            )
+        self.db.execute(
+            "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
+            (rmu, "rmu_review_comment", old_value, new_value, reason, modified_by or "system", now),
+        )
+        self.db.commit()
 
     def update_rmu_review_status(
         self, rmu: str, review_status: str, modified_by: str,

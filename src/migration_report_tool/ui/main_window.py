@@ -73,7 +73,7 @@ from ..core import (
     import_source,
 )
 from ..db_smart import DBSmartReport, build_signal_mapping_report
-from ..review_status import analysis_review_state
+from ..review_status import analysis_review_state, signal_review_display_status
 
 from ..config.sources import schema_for
 from ..config.source_modules import MODULE_SOURCE_GROUPS
@@ -100,6 +100,24 @@ from ..repository import (
     sync_site_to_project,
 )
 
+
+
+
+# Human Review visual semantics are deliberately separate from automatic
+# Analysis colors. Green is reserved for an exception that a person actually
+# reviewed; automatic pass/match rows show "Not Required" in a neutral blue-gray.
+REVIEW_VISUALS = {
+    "NOT REQUIRED": ("Not Required", "#EEF4F8", "#3B5B73"),
+    "UNREVIEWED": ("Unreviewed", "#F3F4F6", "#475467"),
+    "REVIEWED": ("Reviewed", "#DDF5E7", "#087443"),
+    "NEEDS ACTION": ("Needs Action", "#FDECEC", "#B42318"),
+    "VALIDATION REQUIRED": ("Validation Required", "#FFF4D6", "#8A5B00"),
+}
+
+def _review_visual(status: str) -> tuple[str, QColor, QColor]:
+    key = clean(status).upper() or "UNREVIEWED"
+    label, fill, text = REVIEW_VISUALS.get(key, (key.title(), "#F3F4F6", "#475467"))
+    return label, QColor(fill), QColor(text)
 
 COLORS = {
     "nav": "#0F2742",
@@ -1438,7 +1456,7 @@ class MainWindow(QMainWindow):
         self.metric_rmu_total = MetricCard("Total RMUs", "0", "#2365A8")
         self.metric_rmu_pass = MetricCard("Pass", "0", "#12805C")
         self.metric_rmu_issues = MetricCard("With Issues", "0", "#C9871A")
-        self.metric_rmu_reviewed = MetricCard("Reviewed", "0 / 0", "#6F4DA5")
+        self.metric_rmu_reviewed = MetricCard("Resolved Issues", "0 / 0", "#6F4DA5")
         self.metric_rmu_needs_action = MetricCard("Needs Action", "0", "#B42318")
         for i, card in enumerate((
             self.metric_rmu_total, self.metric_rmu_pass, self.metric_rmu_issues,
@@ -1776,7 +1794,7 @@ class MainWindow(QMainWindow):
         page, layout = self._page_container()
         layout.addWidget(PageHeader(
             "RMU Data Review",
-            "Saudi ADMS RMU migration consistency review across SE, zenOn and ADMS. Analysis is calculated automatically; Review is a separate human workflow state. Drag to select cells; Ctrl adds non-contiguous blocks; double-click a value for an audited correction or SE Comment.",
+            "Saudi ADMS RMU migration consistency review across SE, zenOn and ADMS. Analysis is calculated automatically; Review is a separate human workflow state. Drag to select cells; Ctrl adds non-contiguous blocks; double-click a FALSE or Resolution cell to resolve exceptions; double-click Review for optional manual verification.",
         ))
 
         controls = QFrame()
@@ -1789,7 +1807,7 @@ class MainWindow(QMainWindow):
         self.search_edit.textChanged.connect(self.refresh_comparison)
         self.search_edit.setMinimumWidth(330)
         self.rmu_review_filter_combo = QComboBox()
-        self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "UNREVIEWED", "REVIEWED", "NEEDS ACTION"])
+        self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "NOT REQUIRED", "UNREVIEWED", "REVIEWED", "NEEDS ACTION", "VALIDATION REQUIRED"])
         self.rmu_review_filter_combo.setToolTip("Filter only by the manual human Review state. Automated Analysis is filtered separately.")
         self.rmu_review_filter_combo.currentTextChanged.connect(self.refresh_comparison)
         self.analysis_combo = QComboBox()
@@ -1801,8 +1819,8 @@ class MainWindow(QMainWindow):
         ])
         self.analysis_combo.setToolTip("Filter by Analysis result")
         self.analysis_combo.currentTextChanged.connect(self.refresh_comparison)
-        review_btn = QPushButton("Set Review")
-        review_btn.setToolTip("Set the manual Review state for selected RMUs: UNREVIEWED, REVIEWED, or NEEDS ACTION")
+        review_btn = QPushButton("Review / Resolve")
+        review_btn.setToolTip("Issue RMUs open structured Resolution. Pass RMUs may optionally be marked Reviewed / Needs Action or restored to the default Not Required state.")
         review_btn.clicked.connect(self.set_comparison_review_status)
         columns_btn = QPushButton("Columns")
         columns_btn.setToolTip("Show or hide RMU Data Review groups and fields")
@@ -1974,15 +1992,15 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "comparison_locator"):
             return
         self.comparison_locator.setRowCount(len(shown))
-        review_labels = {"UNREVIEWED": "Unreviewed", "REVIEWED": "Reviewed", "NEEDS ACTION": "Needs Action"}
-        review_colors = {"UNREVIEWED": "#F3F4F6", "REVIEWED": "#EAF7F0", "NEEDS ACTION": "#FFF0E0"}
+        # Review uses its own semantic palette. Automatic pass is Not Required
+        # (blue-gray), while green is reserved for a human-reviewed exception.
         for r, (data, review_status) in enumerate(shown):
             state = analysis_review_state(data)
             values = [
                 clean(data.get("no", "")),
                 clean(data.get("rmu", "")),
                 state.row_label,
-                review_labels.get(review_status, review_status.title()),
+                _review_visual(review_status)[0],
             ]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1991,14 +2009,21 @@ class MainWindow(QMainWindow):
                     (f" · Mismatch: {', '.join(state.false_fields)}" if state.false_fields else "")
                 )
                 if c == 3:
-                    tooltip += " · Double-click: pass rows set Review directly; issue rows open structured Resolution"
+                    tooltip += (
+                        " · Double-click to resolve this RMU's exception(s)"
+                        if state.issue_count > 0 else
+                        " · Automatic Analysis passed; Review defaults to Not Required. Double-click for optional manual Review"
+                    )
                 item.setToolTip(tooltip)
                 if c < 2:
                     item.setBackground(QColor("#FFFFFF"))
                 elif c == 2:
                     item.setBackground(QColor("#" + state.row_color))
                 else:
-                    item.setBackground(QColor(review_colors.get(review_status, "#F3F4F6")))
+                    label, review_fill, review_text = _review_visual(review_status)
+                    item.setText(label)
+                    item.setBackground(review_fill)
+                    item.setForeground(review_text)
                 if c in {0, 1, 2, 3}:
                     font = item.font(); font.setBold(True); item.setFont(font)
                 if c in {2, 3}:
@@ -2123,8 +2148,8 @@ class MainWindow(QMainWindow):
         db_summary_box.setSpacing(3)
         db_summary_box.addWidget(self.db_smart_summary)
         signal_review_guide = QLabel(
-            "Review workflow: Matched/Mismatched is automatic. Mark Reviewed after verification; use Needs Action for mapping corrections. "
-            "If the validation content for a reviewed signal changes, that row automatically returns to Unreviewed while Comments and Audit history remain available."
+            "Review workflow: Matched/Mismatched is automatic. Matched rows default to Not Required, but reviewers may still add Comments or explicitly mark Reviewed / Needs Action when a manual check is useful. "
+            "Only mismatches count toward required Human Review progress. Unchecked rows remain Validation Required until revalidated. If reviewed validation content changes, the saved review is reset while Comments and Audit history remain available."
         )
         signal_review_guide.setObjectName("Muted")
         signal_review_guide.setWordWrap(True)
@@ -2158,7 +2183,7 @@ class MainWindow(QMainWindow):
         db_locator_groups = (("Row Locator", "#E8EDF3", (
             ("locator_rmu", "RMU", 90),
             ("locator_type", "Type", 75),
-            ("locator_review", "Review", 105),
+            ("locator_review", "Review", 140),
         )),)
         self.db_smart_locator_header = GroupedReportHeader(db_locator_groups, self.db_smart_locator)
         self.db_smart_locator.setHorizontalHeader(self.db_smart_locator_header)
@@ -2170,10 +2195,16 @@ class MainWindow(QMainWindow):
         self.db_smart_locator.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.db_smart_locator.setColumnWidth(0, 90)
         self.db_smart_locator.setColumnWidth(1, 75)
-        self.db_smart_locator.setColumnWidth(2, 105)
-        self.db_smart_locator.setFixedWidth(90 + 75 + 105 + 4)
+        self.db_smart_locator.setColumnWidth(2, 140)
+        self.db_smart_locator.setFixedWidth(90 + 75 + 140 + 4)
         self.db_smart_locator.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.db_smart_locator.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Keep the frozen locator in the exact same pixel-scroll coordinate
+        # system as the main Signal Mapping grid.  Mixing ScrollPerItem here
+        # with ScrollPerPixel on the main table makes the two views drift apart
+        # progressively while scrolling.
+        self.db_smart_locator.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.db_smart_locator.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.db_smart_locator.setFocusPolicy(Qt.NoFocus)
         self.db_smart_locator.cellClicked.connect(self._activate_db_smart_row_from_locator)
         self.db_smart_locator.cellDoubleClicked.connect(self._edit_db_smart_locator_review)
@@ -2222,7 +2253,7 @@ class MainWindow(QMainWindow):
 
     def _db_smart_groups(self, report: DBSmartReport):
         review_group = ("Review", "#D8E1EA", (
-            ("db_review_status", "Review", 125),
+            ("db_review_status", "Review", 145),
             ("db_review_comments", "Comments", 300),
         ))
         source_groups = apply_display_names_to_groups(
@@ -2373,13 +2404,14 @@ class MainWindow(QMainWindow):
         shown = []
         for row in report.rows:
             review = review_map.get(row.row_key, {})
-            status = clean(review.get("review_status")) or "UNREVIEWED"
+            stored_status = clean(review.get("review_status")).upper() or "UNREVIEWED"
             comments = clean(review.get("comments"))
-            if review_filter != "ALL REVIEWS" and status != review_filter:
-                continue
             analysis_result = ""
             if report.analysis_column is not None and report.analysis_column < len(row.values):
                 analysis_result = clean(row.values[report.analysis_column]).upper()
+            status = signal_review_display_status(analysis_result, stored_status)
+            if review_filter != "ALL REVIEWS" and status != review_filter:
+                continue
             if result_filter == "MATCHED" and analysis_result != "TRUE":
                 continue
             if result_filter == "MISMATCHED" and analysis_result != "FALSE":
@@ -2389,7 +2421,10 @@ class MainWindow(QMainWindow):
             searchable = " | ".join((status, comments, *row.values)).casefold()
             if term and term not in searchable:
                 continue
-            shown.append((row, status, comments))
+            # Carry the automatic result together with the exact displayed row.
+            # This prevents the paint loop from accidentally reusing the last
+            # analysis_result computed during filtering.
+            shown.append((row, status, comments, analysis_result))
 
         self.db_smart_table.setRowCount(len(shown))
         if hasattr(self, "db_smart_locator"):
@@ -2397,23 +2432,46 @@ class MainWindow(QMainWindow):
         self.db_smart_row_keys = []
         source_analysis_true = 0
         source_analysis_false = 0
-        for visual_row, (row, status, comments) in enumerate(shown):
+        for visual_row, (row, status, comments, analysis_result) in enumerate(shown):
             self.db_smart_row_keys.append(row.row_key)
             values = [status, comments, *row.values]
-            row_fill = QColor("#FFFFFF")
-            if status == "REVIEWED": row_fill = QColor("#EAF7F0")
-            elif status == "NEEDS ACTION": row_fill = QColor("#FFF0E0")
+            # Row background expresses automatic validation only. Human Review
+            # color is isolated to the Review cell so it cannot be confused with
+            # Matched/Pass system results.
+            if analysis_result == "TRUE":
+                row_fill = QColor("#EAF7F0")
+            elif analysis_result == "FALSE":
+                row_fill = QColor("#FFF8D8")
+            else:
+                row_fill = QColor("#FFF4D6")
+            review_label, review_fill, review_text = _review_visual(status)
 
             if hasattr(self, "db_smart_locator"):
+                # The locator is a frozen presentation of the *same visible
+                # source row* as the main grid.  Read RMU/Type from row.values,
+                # which is exactly what the main RMU group renders, instead of
+                # maintaining a second independent identity source.
+                main_rmu = clean(row.values[0]) if len(row.values) > 0 else clean(row.rmu)
                 row_type = clean(row.values[1]) if len(row.values) > 1 else ""
-                locator_values = [clean(row.rmu), row_type, status]
+                locator_values = [main_rmu, row_type, status]
                 for locator_col, locator_value in enumerate(locator_values):
                     locator_item = QTableWidgetItem(locator_value)
-                    locator_tip = f"RMU {clean(row.rmu)} · {row_type or '—'} · {status}"
+                    locator_tip = f"RMU {main_rmu} · {row_type or '—'} · {status}"
                     if locator_col == 2:
-                        locator_tip += " · Double-click Review to change the human review state"
+                        locator_tip += (
+                            " · Double-click to set optional Human Review"
+                            if analysis_result == "TRUE"
+                            else " · Double-click to set required Human Review"
+                            if analysis_result == "FALSE"
+                            else " · Validation must be completed before setting Review"
+                        )
                     locator_item.setToolTip(locator_tip)
-                    locator_item.setBackground(row_fill if locator_col == 2 else QColor("#FFFFFF"))
+                    if locator_col == 2:
+                        locator_item.setText(review_label)
+                        locator_item.setBackground(review_fill)
+                        locator_item.setForeground(review_text)
+                    else:
+                        locator_item.setBackground(QColor("#FFFFFF"))
                     if locator_col in {0, 2}:
                         font = locator_item.font(); font.setBold(True); locator_item.setFont(font)
                     if locator_col == 2:
@@ -2425,11 +2483,23 @@ class MainWindow(QMainWindow):
                 item.setBackground(row_fill)
                 item.setToolTip(clean(value))
                 if col == 0:
+                    item.setText(review_label)
                     item.setData(Qt.ItemDataRole.UserRole, row.row_key)
                     font = item.font(); font.setBold(True); item.setFont(font)
-                    item.setForeground(QColor(COLORS["success"] if status == "REVIEWED" else COLORS["warning"] if status == "NEEDS ACTION" else COLORS["muted"]))
-                if col == 1 and comments:
-                    font = item.font(); font.setBold(True); item.setFont(font)
+                    item.setBackground(review_fill)
+                    item.setForeground(review_text)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setToolTip(
+                        "Human Review: " + review_label +
+                        (" · Automatic validation passed; manual Review is optional and remains available" if analysis_result == "TRUE" else
+                         " · Double-click to change the Human Review decision" if analysis_result == "FALSE" else
+                         " · Validation result is incomplete and must be revalidated")
+                    )
+                if col == 1:
+                    # Comments are annotation-only. They never inherit automatic
+                    # validation or Human Review colors; keep a plain white cell.
+                    item.setBackground(QColor("#FFFFFF"))
+                    item.setToolTip(comments or "Double-click to add an optional review comment")
                 source_col = col - 2
                 if source_col == report.analysis_column:
                     normalized = clean(value).upper()
@@ -2445,11 +2515,6 @@ class MainWindow(QMainWindow):
         self._apply_db_smart_visibility()
         if hasattr(self, "db_smart_locator"):
             self.db_smart_locator.verticalScrollBar().setValue(self.db_smart_table.verticalScrollBar().value())
-        active_keys = {row.row_key for row in report.rows}
-        total_reviews = Counter(
-            (clean(review_map.get(key, {}).get("review_status")) or "UNREVIEWED")
-            for key in active_keys
-        )
         # Count source analysis from the whole report, not only the current filter.
         all_true = all_false = 0
         if report.analysis_column is not None:
@@ -2459,10 +2524,19 @@ class MainWindow(QMainWindow):
                 all_false += value == "FALSE"
         checked = all_true + all_false
         unchecked = max(0, len(report.rows) - checked)
+        mismatch_keys = {
+            row.row_key for row in report.rows
+            if report.analysis_column is not None and clean(row.values[report.analysis_column]).upper() == "FALSE"
+        }
+        mismatch_reviews = Counter(
+            clean(review_map.get(key, {}).get("review_status")).upper() or "UNREVIEWED"
+            for key in mismatch_keys
+        )
+        mismatch_processed = mismatch_reviews["REVIEWED"] + mismatch_reviews["NEEDS ACTION"]
         self.db_smart_summary.setText(
             f"Total {len(report.rows)} · Shown {len(shown)} · Checked {checked} · Matched {all_true} · "
-            f"Mismatched {all_false} · Unchecked {unchecked} · Reviewed {total_reviews['REVIEWED']} · "
-            f"Needs Action {total_reviews['NEEDS ACTION']}"
+            f"Mismatched {all_false} · Unchecked {unchecked} · Human Review {mismatch_processed}/{all_false} mismatches · "
+            f"Needs Action {mismatch_reviews['NEEDS ACTION']}"
         )
 
     def _selected_db_smart_row_keys(self) -> list[str]:
@@ -2480,47 +2554,86 @@ class MainWindow(QMainWindow):
         return keys
 
     def set_db_smart_review_status(self):
+        """Set optional/required Human Review on checked Signal Mapping rows.
+
+        Mismatches are required Human Review items. Matched rows default to
+        Not Required, but a reviewer may still explicitly mark Reviewed or
+        Needs Action. Unchecked rows remain Validation Required and are skipped.
+        """
         if not self.store or not self.db_smart_report:
             return
         row_keys = self._selected_db_smart_row_keys()
         if not row_keys:
-            QMessageBox.information(self, "Signal Mapping Review", "Select one or more signal rows first.")
+            QMessageBox.information(self, "Signal Mapping Human Review", "Select one or more checked signal rows first.")
             return
+
+        rows_by_key = {row.row_key: row for row in self.db_smart_report.rows}
+        checked_keys = []
+        unchecked_count = 0
+        for row_key in row_keys:
+            row = rows_by_key.get(row_key)
+            if not row:
+                continue
+            result = ""
+            if self.db_smart_report.analysis_column is not None:
+                result = clean(row.values[self.db_smart_report.analysis_column]).upper()
+            if result in {"TRUE", "FALSE"}:
+                checked_keys.append(row_key)
+            else:
+                unchecked_count += 1
+
+        if not checked_keys:
+            QMessageBox.information(
+                self, "Validation Required",
+                "The selected signal row(s) are Unchecked. Complete/re-run validation before setting Human Review. "
+                "Comments may still be recorded independently."
+            )
+            return
+
         review_map = self.store.db_smart_review_map()
-        statuses = ["UNREVIEWED", "REVIEWED", "NEEDS ACTION"]
-        display_options = ["Unreviewed", "Reviewed", "Needs Action"]
-        current = clean(review_map.get(row_keys[0], {}).get("review_status")).upper() or "UNREVIEWED"
-        index = statuses.index(current) if len(row_keys) == 1 and current in statuses else 0
+        stored_values = [
+            clean(review_map.get(key, {}).get("review_status")).upper() or "UNREVIEWED"
+            for key in checked_keys
+        ]
+        values = ["UNREVIEWED", "REVIEWED", "NEEDS ACTION"]
+        display_options = ["Default / Clear Manual Review", "Reviewed", "Needs Action"]
+        current = stored_values[0] if len(checked_keys) == 1 else "UNREVIEWED"
+        index = values.index(current) if current in values else 0
         selected_label, ok = QInputDialog.getItem(
-            self, "Set Signal Review",
-            ("Selected signal" if len(row_keys) == 1 else f"{len(row_keys)} selected signals") +
-            "\nReviewed = verified/accepted · Needs Action = mapping correction required",
+            self, "Set Signal Human Review",
+            ("Selected signal" if len(checked_keys) == 1 else f"{len(checked_keys)} selected checked signals") +
+            "\nMatched rows default to Not Required but may be manually Reviewed / Needs Action." +
+            "\nMismatched rows require Human Review. Default/Clear returns each row to its automatic/default review state.",
             display_options, index, False,
         )
         if not ok:
             return
-        value = statuses[display_options.index(selected_label)]
-        rows_by_key = {row.row_key: row for row in self.db_smart_report.rows}
+        value = values[display_options.index(selected_label)]
         site_name = self.store.config.get("site_name") or self.store.config.get("repository_site") or self.store.folder.name
-        for row_key in row_keys:
+        for row_key in checked_keys:
             row = rows_by_key.get(row_key)
             if not row:
                 continue
             self.store.update_db_smart_review(
                 row_key=row_key, rmu=row.rmu, field="review_status", value=value,
                 modified_by=self.user_name, source_hash=self.db_smart_report.source_hash,
-                row_hash=signal_review_row_hash(row, self.db_smart_report.analysis_column), site_name=site_name, reason="Signal Mapping Review status changed",
+                row_hash=signal_review_row_hash(row, self.db_smart_report.analysis_column), site_name=site_name,
+                reason="Signal Mapping Human Review status changed",
             )
         self._render_db_smart_rows()
+        self.refresh_changes()
         self.refresh_dashboard()
         self.refresh_export_page()
-        self.statusBar().showMessage(f"Review status updated for {len(row_keys)} signal row(s): {value}", 5000)
+        skipped = f" · {unchecked_count} unchecked skipped" if unchecked_count else ""
+        self.statusBar().showMessage(
+            f"Human Review updated for {len(checked_keys)} checked signal row(s): {value}{skipped}", 5000
+        )
 
     def edit_db_smart_cell(self, row_index: int, column_index: int):
         if not self.db_smart_report or not self.store or row_index >= len(getattr(self, "db_smart_row_keys", [])):
             return
         if column_index not in {0, 1}:
-            QMessageBox.information(self, "Read-only source", "Signal Mapping source columns are read-only. Review Status and Comments are stored separately in project.db.")
+            QMessageBox.information(self, "Read-only source", "Signal Mapping source columns are read-only. Review and Comments are stored separately in project.db.")
             return
         row_key = self.db_smart_row_keys[row_index]
         row = next((item for item in self.db_smart_report.rows if item.row_key == row_key), None)
@@ -2528,18 +2641,15 @@ class MainWindow(QMainWindow):
             return
         review = self.store.db_smart_review_map().get(row_key, {})
         if column_index == 0:
-            old = clean(review.get("review_status")).upper() or "UNREVIEWED"
-            statuses = ["UNREVIEWED", "REVIEWED", "NEEDS ACTION"]
-            display_options = ["Unreviewed", "Reviewed", "Needs Action"]
-            selected_label, ok = QInputDialog.getItem(
-                self, "Set Signal Review", f"RMU {row.rmu or '—'} review status",
-                display_options, statuses.index(old) if old in statuses else 0, False
-            )
-            if not ok:
-                return
-            value = statuses[display_options.index(selected_label)]
-            field = "review_status"
-            reason = "Signal Mapping review status changed"
+            # Matched rows default to Not Required but can still receive an
+            # explicit manual Review. Unchecked rows remain Validation Required.
+            self.db_smart_table.clear_spreadsheet_selection()
+            item = self.db_smart_table.item(row_index, 0)
+            if item is not None:
+                item.setSelected(True)
+                self.db_smart_table.setCurrentItem(item)
+            self.set_db_smart_review_status()
+            return
         else:
             old = clean(review.get("comments"))
             value, ok = QInputDialog.getMultiLineText(self, "Signal Mapping Comments", f"RMU {row.rmu or '—'} review comments", old)
@@ -3472,56 +3582,159 @@ class MainWindow(QMainWindow):
             f"RMU {rmu} Resolution saved · Review: {review_status} · {summary}", 7000
         )
 
+    def edit_rmu_manual_review_comment(self, rmu: str, *, prompt_title: str = "RMU Manual Review Comment") -> bool:
+        """Edit the optional human-review note shown in Resolution for a Pass RMU.
+
+        Issue rows keep using structured per-FALSE Resolution decisions; this
+        comment path is only for automatically passed RMUs that a reviewer still
+        chooses to inspect or annotate.
+        """
+        if not self.store:
+            return False
+        data = self._comparison_row_by_rmu(rmu)
+        if not data:
+            return False
+        state = analysis_review_state(data)
+        if not state.has_result:
+            QMessageBox.information(
+                self, "Validation Required",
+                f"RMU {rmu} does not yet have a complete automatic Analysis result. Run Validation before recording an optional manual Review comment."
+            )
+            return False
+        if state.issue_count > 0:
+            self.open_rmu_resolution_dialog(rmu)
+            return False
+        old_comment = self.store.rmu_manual_review_comment(rmu)
+        comment, ok = QInputDialog.getMultiLineText(
+            self, prompt_title,
+            f"RMU {rmu} passed automatic Analysis. Record an optional human Review comment.\n\n"
+            "This note appears in the Resolution column and the Migration Report; it does not change the automatic Analysis result.",
+            old_comment,
+        )
+        if not ok:
+            return False
+        self.store.update_rmu_manual_review_comment(
+            rmu, comment, self.user_name,
+            reason="Optional RMU manual Review comment updated",
+        )
+        self.refresh_all()
+        self._select_comparison_rmu(rmu)
+        self.statusBar().showMessage(
+            f"RMU {rmu} manual Review comment " + ("saved" if clean(comment) else "cleared"), 5000
+        )
+        return True
+
     def set_comparison_review_status(self):
+        """Review selected RMUs without mixing system Analysis and human Review.
+
+        - Active issue rows always use structured Resolution; one FALSE field is
+          one required decision and cannot be bypassed by manually setting Reviewed.
+        - Pass rows default to NOT REQUIRED but may be optionally marked REVIEWED
+          or NEEDS ACTION. Clearing the manual state returns them to NOT REQUIRED.
+        - Rows without an automatic Analysis result remain VALIDATION REQUIRED.
+        """
         if not self.store:
             return
         rmus = self._selected_comparison_rmus()
         if not rmus:
-            QMessageBox.information(self, "RMU Review", "Select one or more RMU rows first.")
+            QMessageBox.information(self, "RMU Human Review", "Select one or more RMU rows first.")
             return
+
         issue_rmus = []
+        pass_rmus = []
+        validation_required = []
         for rmu in rmus:
             data = self._comparison_row_by_rmu(rmu)
-            if data and analysis_review_state(data).issue_count > 0:
+            if not data:
+                continue
+            state = analysis_review_state(data)
+            if state.issue_count > 0:
                 issue_rmus.append(rmu)
-        if issue_rmus:
-            if len(rmus) == 1:
-                self.open_rmu_resolution_dialog(rmus[0])
+            elif state.has_result:
+                pass_rmus.append(rmu)
             else:
-                QMessageBox.information(
-                    self, "Structured Resolution required",
-                    f"{len(issue_rmus)} selected RMU(s) contain Analysis errors.\n\n"
-                    "Each error requires its own Resolution decision, so issue rows cannot be bulk-marked Reviewed. "
-                    "Open each issue RMU and resolve every FALSE field. Pass rows can still be reviewed in bulk."
-                )
+                validation_required.append(rmu)
+
+        # Exception rows must always use the structured Resolution workflow.
+        if issue_rmus:
+            if len(rmus) == 1 and len(issue_rmus) == 1:
+                self.open_rmu_resolution_dialog(issue_rmus[0])
+                return
+            QMessageBox.information(
+                self, "Structured Resolution required",
+                f"{len(issue_rmus)} selected RMU(s) contain Analysis errors. Each FALSE field requires its own Resolution decision, so issue RMUs must be resolved individually."
+                + (f"\n\n{len(pass_rmus)} Pass RMU(s) can be optionally reviewed separately." if pass_rmus else "")
+                + (f"\n{len(validation_required)} RMU(s) still require Validation." if validation_required else "")
+            )
+            return
+
+        if validation_required and not pass_rmus:
+            QMessageBox.information(
+                self, "Validation Required",
+                "The selected RMU row(s) do not have a complete automatic Analysis result. Run Validation before assigning a human Review state."
+            )
+            return
+
+        if not pass_rmus:
             return
 
         review_map = self.store.rmu_review_map()
-        statuses = ["UNREVIEWED", "REVIEWED", "NEEDS ACTION"]
-        display_options = ["Unreviewed", "Reviewed", "Needs Action"]
-        current = clean(review_map.get(rmus[0], {}).get("review_status")).upper() or "UNREVIEWED"
-        index = statuses.index(current) if len(rmus) == 1 and current in statuses else 0
-        selected_label, ok = QInputDialog.getItem(
+        existing = {
+            clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
+            for rmu in pass_rmus
+        }
+        current_label = (
+            "Reviewed" if existing == {"REVIEWED"}
+            else "Needs Action" if existing == {"NEEDS ACTION"}
+            else "Default / Clear Manual Review"
+        )
+        options = ["Default / Clear Manual Review", "Reviewed", "Needs Action"]
+        current_index = options.index(current_label) if current_label in options else 0
+        choice, ok = QInputDialog.getItem(
             self,
-            "Set RMU Review",
-            (f"RMU {rmus[0]}" if len(rmus) == 1 else f"{len(rmus)} selected pass RMUs") +
-            "\nPass rows have no mismatch Resolution requirement.",
-            display_options,
-            index,
-            False,
+            "Optional RMU Human Review",
+            f"{len(pass_rmus)} Pass RMU(s) selected.\n\n"
+            "Pass rows default to Not Required. You may still record an explicit human Review; this does not change the automatic Analysis result.",
+            options, current_index, False,
         )
         if not ok:
             return
-        value = statuses[display_options.index(selected_label)]
-        for rmu in rmus:
-            self.store.update_rmu_review_status(
-                rmu=rmu, review_status=value, modified_by=self.user_name,
-                reason="RMU Data Review status changed for pass row",
+        value = {
+            "Default / Clear Manual Review": "UNREVIEWED",
+            "Reviewed": "REVIEWED",
+            "Needs Action": "NEEDS ACTION",
+        }[choice]
+        reason = (
+            "Optional RMU manual Review cleared; automatic Pass returns to Not Required"
+            if value == "UNREVIEWED"
+            else "Optional RMU manual Review on automatic Pass result"
+        )
+        for rmu in pass_rmus:
+            self.store.update_rmu_review_status(rmu, value, self.user_name, reason=reason)
+
+        # For a single optional Pass review, immediately offer the Resolution
+        # area as a human-review comment. Batch status changes remain fast; each
+        # RMU comment can still be edited later by double-clicking Resolution.
+        if len(pass_rmus) == 1 and value in {"REVIEWED", "NEEDS ACTION"}:
+            comment_saved = self.edit_rmu_manual_review_comment(
+                pass_rmus[0], prompt_title="Optional RMU Human Review Comment"
             )
+            if not comment_saved:
+                # The Review status was already persisted. If the reviewer
+                # cancels the optional comment prompt, still refresh the UI so
+                # Reviewed / Needs Action becomes visible immediately.
+                self.refresh_all()
+                self._select_comparison_rmu(pass_rmus[0])
+            return
+
         self.refresh_all()
-        if len(rmus) == 1:
-            self._select_comparison_rmu(rmus[0])
-        self.statusBar().showMessage(f"Review status updated for {len(rmus)} RMU(s): {value}", 5000)
+        if len(pass_rmus) == 1:
+            self._select_comparison_rmu(pass_rmus[0])
+        self.statusBar().showMessage(
+            f"RMU Review updated: {len(pass_rmus)} Pass row(s) → "
+            + ("Not Required (default)" if value == "UNREVIEWED" else choice),
+            6000,
+        )
 
     def edit_comparison_cell(self, row_index: int, column_index: int):
         if not self.store:
@@ -3539,7 +3752,17 @@ class MainWindow(QMainWindow):
             "analysis_type", "analysis_ip", "analysis_link",
         }
         if field == "comments":
-            self.open_rmu_resolution_dialog(rmu)
+            data = self._comparison_row_by_rmu(rmu)
+            state = analysis_review_state(data or {})
+            if state.issue_count > 0:
+                self.open_rmu_resolution_dialog(rmu)
+            elif state.has_result:
+                self.edit_rmu_manual_review_comment(rmu)
+            else:
+                QMessageBox.information(
+                    self, "Validation Required",
+                    f"RMU {rmu} has no complete automatic Analysis result yet. Run Validation before recording Review/Resolution information."
+                )
             return
         if field in analysis_fields:
             if clean(value).upper() == "FALSE":
@@ -3595,7 +3818,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "Review not complete",
                 f"Current delivery state: {delivery_state or 'Review incomplete'}\n\n"
-                "The workbook can still be exported as a review draft, but it should not be used as the final handover until all Review items are complete and no Needs Action remains.\n\nExport review draft now?",
+                "The workbook can still be exported as a review draft, but it should not be used as the final handover until Validation Coverage is complete, all exception Review items are resolved, and no Needs Action remains.\n\nExport review draft now?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
@@ -3699,13 +3922,24 @@ class MainWindow(QMainWindow):
         shown = []
         for data in rows:
             rmu = clean(data.get("rmu"))
-            review_status = clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
+            state = analysis_review_state(data)
+            stored_review = clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
+            # Human Review exists only for exception rows. Pass is automatically
+            # validated; rows with no analysis result remain a validation concern.
+            review_status = (
+                stored_review if state.issue_count > 0
+                else stored_review if state.has_result and stored_review in {"REVIEWED", "NEEDS ACTION"}
+                else "NOT REQUIRED" if state.has_result
+                else "VALIDATION REQUIRED"
+            )
             if review_filter != "ALL REVIEWS" and review_status != review_filter:
                 continue
             if not self._analysis_filter_match(data, analysis_filter):
                 continue
             resolution_summary = self.store.rmu_resolution_summary(rmu)
-            searchable = " | ".join(clean(data.get(k)) for k, _, _ in COLUMNS) + " | " + resolution_summary
+            manual_review_comment = self.store.rmu_manual_review_comment(rmu)
+            review_text = resolution_summary if state.issue_count > 0 else manual_review_comment
+            searchable = " | ".join(clean(data.get(k)) for k, _, _ in COLUMNS) + " | " + review_text
             if term and term not in searchable.lower():
                 continue
             shown.append((data, review_status))
@@ -3716,9 +3950,12 @@ class MainWindow(QMainWindow):
         for r, (data, tag) in enumerate(shown):
             row_fill = self._analysis_row_fill(data)
             rmu = clean(data.get("rmu"))
+            state = analysis_review_state(data)
             resolution_summary = self.store.rmu_resolution_summary(rmu)
+            manual_review_comment = self.store.rmu_manual_review_comment(rmu)
+            resolution_display = resolution_summary if state.issue_count > 0 else manual_review_comment
             for c, (key, _label, _) in enumerate(COMPARISON_COLUMNS):
-                value = resolution_summary if key == "comments" else clean(data.get(key, ""))
+                value = resolution_display if key == "comments" else clean(data.get(key, ""))
                 item = QTableWidgetItem(value)
                 # The review block stays visually neutral.  Starting with
                 # No./RMU, all actual source-data columns carry the row-level
@@ -3736,10 +3973,17 @@ class MainWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignCenter)
                 else:
                     if key == "comments":
-                        tooltip = self.store.rmu_resolution_tooltip(rmu)
-                        state = analysis_review_state(data)
                         if state.issue_count > 0:
+                            tooltip = self.store.rmu_resolution_tooltip(rmu)
                             tooltip += "\n\nDouble-click to resolve every active FALSE Analysis field."
+                        elif state.has_result:
+                            tooltip = (
+                                (manual_review_comment or "No optional manual Review comment recorded.")
+                                + "\n\nDouble-click to record or edit the optional human Review comment. "
+                                  "This does not change the automatic Pass result."
+                            )
+                        else:
+                            tooltip = "Validation Required before Review/Resolution information can be recorded."
                         item.setToolTip(tooltip)
                     else:
                         item.setToolTip(value)
@@ -3784,28 +4028,26 @@ class MainWindow(QMainWindow):
             f"Total {len(rows)} · Shown {len(shown)} · {issue_text}"
         )
 
-        active_rmus = [clean(row.get("rmu")) for row in rows if clean(row.get("rmu"))]
-        active_rmus = list(dict.fromkeys(active_rmus))
-        review_counts = Counter(
-            clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
-            for rmu in active_rmus
-        )
-        reviewed_or_action = review_counts["REVIEWED"] + review_counts["NEEDS ACTION"]
-        review_pct = int(round((reviewed_or_action / len(active_rmus) * 100.0) if active_rmus else 0.0))
         all_resolutions = self.store.rmu_resolution_map()
         total_issue_decisions = 0
         resolved_issue_decisions = 0
+        needs_action_decisions = 0
         for row in rows:
             rmu = clean(row.get("rmu"))
             state = analysis_review_state(row)
-            total_issue_decisions += state.issue_count
             saved = all_resolutions.get(rmu, {}) if isinstance(all_resolutions, dict) else {}
-            resolved_issue_decisions += sum(1 for field in state.false_fields if field in saved)
+            for field in state.false_fields:
+                total_issue_decisions += 1
+                decision = clean((saved.get(field) or {}).get("decision_type")).upper()
+                if decision:
+                    resolved_issue_decisions += 1
+                    if decision == "NEEDS_ACTION":
+                        needs_action_decisions += 1
+        resolution_pct = int(round((resolved_issue_decisions / total_issue_decisions * 100.0) if total_issue_decisions else 100.0))
         if hasattr(self, "comparison_review_progress"):
             self.comparison_review_progress.setText(
-                f"Review {reviewed_or_action} / {len(active_rmus)} · {review_pct}% · "
-                f"Resolution {resolved_issue_decisions} / {total_issue_decisions} issues · "
-                f"Needs Action {review_counts['NEEDS ACTION']}"
+                f"Human Review {resolved_issue_decisions} / {total_issue_decisions} issue decision(s) · {resolution_pct}% · "
+                f"Unresolved {max(0, total_issue_decisions - resolved_issue_decisions)} · Needs Action {needs_action_decisions}"
             )
 
 
@@ -3871,20 +4113,22 @@ class MainWindow(QMainWindow):
             label.update()
 
     def _update_delivery_workflow(
-        self, *, sources_complete: bool, validation_complete: bool,
+        self, *, sources_complete: bool, validation_complete: bool, validation_unchecked: int,
         review_total: int, reviewed: int, needs_action: int, report_exported: bool,
     ) -> None:
-        """Refresh the current delivery stage from live validation/review state.
+        """Refresh delivery stage from validation coverage and exception review.
 
-        Validation completion is a technical milestone, not the final project
-        status. Once validation exists, the top-right status represents the
-        human Review stage until every active RMU and signal record has been
-        processed and no Needs Action remains.
+        Human Review counts only exception decisions that actually require a
+        person: one item for every active RMU FALSE field plus one item for
+        every Signal Mapping mismatch. Pass RMUs and matched signals are
+        automatically validated and never inflate Human Review progress.
+        Unchecked signals are a Validation Coverage gap and block formal export.
         """
-        processed = reviewed + needs_action
+        processed = min(review_total, max(0, reviewed))
         unreviewed = max(0, review_total - processed)
-        review_pct = int(round((processed / review_total * 100.0) if review_total else 0.0))
-        review_complete = bool(review_total) and unreviewed == 0 and needs_action == 0
+        review_pct = int(round((processed / review_total * 100.0) if review_total else 100.0))
+        review_complete = unreviewed == 0 and needs_action == 0
+        validation_coverage_complete = validation_complete and validation_unchecked == 0
 
         if not sources_complete:
             state = "SOURCES INCOMPLETE"
@@ -3892,6 +4136,9 @@ class MainWindow(QMainWindow):
         elif not validation_complete:
             state = "VALIDATION REQUIRED"
             display_state = state
+        elif validation_unchecked:
+            state = "VALIDATION INCOMPLETE"
+            display_state = f"VALIDATION INCOMPLETE · {validation_unchecked} UNCHECKED"
         elif needs_action:
             state = "ACTION REQUIRED"
             display_state = f"ACTION REQUIRED · {needs_action}"
@@ -3905,7 +4152,7 @@ class MainWindow(QMainWindow):
         self.project_delivery_state = state
         if hasattr(self, "project_state_label"):
             self.project_state_label.setText(f"STATUS · {display_state}")
-            if state in {"ACTION REQUIRED", "SOURCES INCOMPLETE"}:
+            if state in {"ACTION REQUIRED", "SOURCES INCOMPLETE", "VALIDATION INCOMPLETE"}:
                 self.project_state_label.setStyleSheet(
                     "color:#8B3A2B;background:#FFF1EF;border:1px solid #F0C3BC;border-radius:9px;padding:4px 9px;font-size:8.5pt;font-weight:700;"
                 )
@@ -3927,32 +4174,37 @@ class MainWindow(QMainWindow):
         self._set_workflow_badge(self.workflow_step_labels["sources"], "done" if sources_complete else "current")
         self._set_workflow_badge(
             self.workflow_step_labels["validation"],
-            "done" if validation_complete else ("current" if sources_complete else "pending"),
+            "done" if validation_coverage_complete else ("current" if sources_complete else "pending"),
         )
         self._set_workflow_badge(
             self.workflow_step_labels["review"],
-            "done" if review_complete else ("current" if validation_complete else "pending"),
+            "done" if review_complete and validation_coverage_complete else ("current" if validation_complete and review_total else "pending"),
         )
         self._set_workflow_badge(
             self.workflow_step_labels["report"],
-            "done" if (report_exported and review_complete) else ("current" if review_complete else "pending"),
+            "done" if (report_exported and review_complete and validation_coverage_complete) else ("current" if review_complete and validation_coverage_complete else "pending"),
         )
 
         if not sources_complete:
             detail = "Complete the required RMU and Signal Mapping source tables."
         elif not validation_complete:
             detail = "Sources are ready. Run Validation to calculate RMU and Signal Mapping results."
+        elif validation_unchecked:
+            detail = (
+                f"Validation coverage incomplete · {validation_unchecked} signal(s) unchecked · "
+                f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}%"
+            )
         elif needs_action:
             detail = (
-                f"Human Review {processed}/{review_total} · {review_pct}% · "
-                f"{needs_action} Needs Action · {unreviewed} Unreviewed"
+                f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}% · "
+                f"{needs_action} Needs Action · {unreviewed} unresolved"
             )
         elif review_complete and report_exported:
-            detail = "Human Review 100% complete · current Migration Report export is up to date."
+            detail = "Validation coverage complete · all exception decisions resolved · current Migration Report export is up to date."
         elif review_complete:
-            detail = "Human Review 100% complete · Migration Report is ready for export."
+            detail = "Validation coverage complete · all exception decisions resolved · Migration Report is ready for export."
         else:
-            detail = f"Human Review {processed}/{review_total} · {review_pct}% · {unreviewed} Unreviewed"
+            detail = f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}% · {unreviewed} unresolved"
         self.workflow_detail.setText(detail)
 
     def refresh_dashboard(self):
@@ -3992,7 +4244,7 @@ class MainWindow(QMainWindow):
             self.project_title.setText("No site selected")
             self.project_subtitle.setText("Migration Report · Select a site to validate and review migration data")
             self._update_delivery_workflow(
-                sources_complete=False, validation_complete=False, review_total=0,
+                sources_complete=False, validation_complete=False, validation_unchecked=0, review_total=0,
                 reviewed=0, needs_action=0, report_exported=False,
             )
             return
@@ -4003,28 +4255,48 @@ class MainWindow(QMainWindow):
         rmu_pass = sum(state.is_pass for state in rmu_states)
         rmu_issues = sum(state.issue_count > 0 for state in rmu_states)
         rmu_no_analysis = sum(not state.has_result for state in rmu_states)
-        review_map = self.store.rmu_review_map()
-        active_rmus = {clean(row.get("rmu")) for row in rows if clean(row.get("rmu"))}
-        rmu_review_counts = Counter(
-            clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
-            for rmu in active_rmus
-        )
+        # Human Review is exception-based: every active FALSE field is one
+        # required Resolution decision. Pass RMUs do not require Human Review and do not
+        # increase the Human Review denominator.
         rmu_total = len(rows)
-        rmu_reviewed = rmu_review_counts["REVIEWED"]
-        rmu_needs = rmu_review_counts["NEEDS ACTION"]
-        rmu_processed = rmu_reviewed + rmu_needs
-        rmu_unreviewed = max(0, rmu_total - rmu_processed)
-        rmu_review_pct = int(round((rmu_processed / rmu_total * 100.0) if rmu_total else 0.0))
+        all_resolutions = self.store.rmu_resolution_map()
+        rmu_review_total = 0
+        rmu_reviewed = 0
+        rmu_needs = 0
+        for row, state in zip(rows, rmu_states):
+            rmu = clean(row.get("rmu"))
+            saved = all_resolutions.get(rmu, {}) if isinstance(all_resolutions, dict) else {}
+            for field in state.false_fields:
+                rmu_review_total += 1
+                decision = clean((saved.get(field) or {}).get("decision_type")).upper()
+                if decision:
+                    rmu_reviewed += 1
+                    if decision == "NEEDS_ACTION":
+                        rmu_needs += 1
+        # Optional human Review on automatic Pass rows does not inflate the
+        # required exception-review denominator, but an explicit Needs Action is
+        # still a real delivery blocker and is visible in dashboard/project state.
+        rmu_review_map = self.store.rmu_review_map()
+        rmu_optional_needs = sum(
+            1
+            for row, state in zip(rows, rmu_states)
+            if state.is_pass
+            and (clean(rmu_review_map.get(clean(row.get("rmu")), {}).get("review_status")).upper() == "NEEDS ACTION")
+        )
+        rmu_needs += rmu_optional_needs
+        rmu_unreviewed = max(0, rmu_review_total - rmu_reviewed)
+        rmu_review_pct = int(round((rmu_reviewed / rmu_review_total * 100.0) if rmu_review_total else 100.0))
 
         self.metric_rmu_total.set_value(rmu_total)
         self.metric_rmu_pass.set_value(rmu_pass)
         self.metric_rmu_issues.set_value(rmu_issues)
-        self.metric_rmu_reviewed.set_value(f"{rmu_reviewed} / {rmu_total}")
+        self.metric_rmu_reviewed.set_value(f"{rmu_reviewed} / {rmu_review_total}")
         self.metric_rmu_needs_action.set_value(rmu_needs)
         self.dashboard_rmu_review_progress.setValue(rmu_review_pct)
         self.dashboard_rmu_review_progress.setFormat(f"{rmu_review_pct}%")
         self.dashboard_rmu_review_summary.setText(
-            f"Review progress: {rmu_processed} / {rmu_total} processed · Reviewed {rmu_reviewed} · Unreviewed {rmu_unreviewed} · Needs Action {rmu_needs}"
+            f"Human Review: {rmu_reviewed} / {rmu_review_total} RMU issue decision(s) · {rmu_review_pct}% · "
+            f"Unresolved {rmu_unreviewed} · Needs Action {rmu_needs}"
         )
 
         issue_counts = Counter(field for state in rmu_states for field in state.false_fields)
@@ -4071,7 +4343,7 @@ class MainWindow(QMainWindow):
                 signal_report = None
 
         signal_total = signal_checked = signal_matched = signal_mismatched = signal_unchecked = 0
-        signal_reviewed = signal_needs = signal_unreviewed = 0
+        signal_reviewed = signal_needs = signal_unreviewed = signal_review_total = 0
         if signal_report is None:
             for card in signal_cards:
                 card.set_value("0")
@@ -4093,16 +4365,32 @@ class MainWindow(QMainWindow):
             signal_checked = signal_matched + signal_mismatched
             signal_unchecked = max(0, signal_total - signal_checked)
             signal_review_map = self.store.db_smart_review_map()
-            active_keys = {row.row_key for row in signal_report.rows}
+            mismatch_keys = {
+                row.row_key for row in signal_report.rows
+                if signal_report.analysis_column is not None
+                and clean(row.values[signal_report.analysis_column]).upper() == "FALSE"
+            }
+            signal_review_total = len(mismatch_keys)
             signal_review_counts = Counter(
                 clean(signal_review_map.get(key, {}).get("review_status")).upper() or "UNREVIEWED"
-                for key in active_keys
+                for key in mismatch_keys
             )
             signal_reviewed = signal_review_counts["REVIEWED"]
-            signal_needs = signal_review_counts["NEEDS ACTION"]
-            signal_processed = signal_reviewed + signal_needs
-            signal_unreviewed = max(0, signal_total - signal_processed)
-            signal_review_pct = int(round((signal_processed / signal_total * 100.0) if signal_total else 0.0))
+            # Required Human Review progress counts mismatches only, but an
+            # optional Needs Action placed on a matched signal is still an
+            # actionable project condition and must block formal export.
+            checked_keys = {
+                row.row_key for row in signal_report.rows
+                if signal_report.analysis_column is not None
+                and clean(row.values[signal_report.analysis_column]).upper() in {"TRUE", "FALSE"}
+            }
+            signal_needs = sum(
+                (clean(signal_review_map.get(key, {}).get("review_status")).upper() == "NEEDS ACTION")
+                for key in checked_keys
+            )
+            signal_processed = signal_reviewed + signal_review_counts["NEEDS ACTION"]
+            signal_unreviewed = max(0, signal_review_total - signal_processed)
+            signal_review_pct = int(round((signal_processed / signal_review_total * 100.0) if signal_review_total else 100.0))
             rate = (signal_matched / signal_checked * 100.0) if signal_checked else 0.0
 
             self.metric_signal_total.set_value(signal_total)
@@ -4114,7 +4402,8 @@ class MainWindow(QMainWindow):
             self.dashboard_signal_review_progress.setValue(signal_review_pct)
             self.dashboard_signal_review_progress.setFormat(f"{signal_review_pct}%")
             self.dashboard_signal_review_summary.setText(
-                f"Review progress: {signal_processed} / {signal_total} processed · Reviewed {signal_reviewed} · Unreviewed {signal_unreviewed} · Needs Action {signal_needs}"
+                f"Human Review: {signal_processed} / {signal_review_total} mismatch decision(s) · {signal_review_pct}% · "
+                f"Unresolved {signal_unreviewed} · Needs Action {signal_needs}"
             )
             self.dashboard_signal_summary.setText(
                 f"Matched / Checked = {signal_matched} / {signal_checked} · Match rate {rate:.2f}% · Unchecked {signal_unchecked}"
@@ -4179,11 +4468,15 @@ class MainWindow(QMainWindow):
         )
         sources_complete = base_sources_ready and signal_sources_ready
         validation_complete = bool(rows) and signal_report is not None
-        review_total = rmu_total + signal_total
-        reviewed_total = rmu_reviewed + signal_reviewed
+        # Human Review denominator contains exception decisions only:
+        # each RMU FALSE field + each Signal mismatch. Matched/Pass rows are
+        # auto-validated; signal Unchecked belongs to Validation Coverage.
+        review_total = rmu_review_total + signal_review_total
+        signal_required_needs = signal_review_counts["NEEDS ACTION"] if signal_report is not None else 0
+        reviewed_total = rmu_reviewed + signal_reviewed + signal_required_needs
         needs_total = rmu_needs + signal_needs
         latest_state_ts = 0.0
-        for table_name in ("comparison", "rmu_reviews", "db_smart_reviews"):
+        for table_name in ("comparison", "rmu_reviews", "rmu_resolutions", "db_smart_reviews"):
             try:
                 value = self.store.db.execute(f"SELECT MAX(updated_at) FROM {table_name}").fetchone()[0]
                 if value:
@@ -4207,8 +4500,8 @@ class MainWindow(QMainWindow):
         report_exported = bool(latest_report_ts and latest_report_ts >= latest_state_ts)
         self._update_delivery_workflow(
             sources_complete=sources_complete, validation_complete=validation_complete,
-            review_total=review_total, reviewed=reviewed_total, needs_action=needs_total,
-            report_exported=report_exported,
+            validation_unchecked=signal_unchecked, review_total=review_total,
+            reviewed=reviewed_total, needs_action=needs_total, report_exported=report_exported,
         )
 
     def refresh_export_page(self):

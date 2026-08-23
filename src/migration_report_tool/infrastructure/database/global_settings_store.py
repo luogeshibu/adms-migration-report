@@ -7,6 +7,7 @@ survive release-folder replacement.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 import sqlite3
@@ -51,7 +52,11 @@ def source_display_names(source_type: str) -> dict[str, str]:
     source_type = str(source_type or "").strip()
     if not source_type:
         return {}
-    with _connect() as db:
+    # sqlite3.Connection's context manager commits/rolls back but does NOT
+    # close the handle.  That is harmless on POSIX but leaves
+    # global_settings.db locked on Windows and prevents TemporaryDirectory
+    # cleanup during formal regression builds.  Always close explicitly.
+    with closing(_connect()) as db:
         return {
             row["field_key"]: row["display_name"]
             for row in db.execute(
@@ -74,19 +79,22 @@ def replace_source_display_names(
     }
     before = source_display_names(source_type)
     now = datetime.now().isoformat(timespec="seconds")
-    with _connect() as db:
-        db.execute("DELETE FROM source_display_names WHERE source_type=?", (source_type,))
-        for key, value in sorted(cleaned.items()):
-            db.execute(
-                "INSERT INTO source_display_names(source_type,field_key,display_name,modified_by,modified_at) VALUES(?,?,?,?,?)",
-                (source_type, key, value, modified_by or "system", now),
-            )
-        for key in sorted(set(before) | set(cleaned)):
-            old_value = str(before.get(key, "") or "").strip()
-            new_value = str(cleaned.get(key, "") or "").strip()
-            if old_value == new_value:
-                continue
-            db.execute(
-                "INSERT INTO source_display_name_audit(source_type,field_key,old_value,new_value,modified_by,modified_at) VALUES(?,?,?,?,?,?)",
-                (source_type, key, old_value, new_value, modified_by or "system", now),
-            )
+    with closing(_connect()) as db:
+        # Explicit transaction + explicit close: on Windows the database file
+        # must be released before a test/application-data folder can be removed.
+        with db:
+            db.execute("DELETE FROM source_display_names WHERE source_type=?", (source_type,))
+            for key, value in sorted(cleaned.items()):
+                db.execute(
+                    "INSERT INTO source_display_names(source_type,field_key,display_name,modified_by,modified_at) VALUES(?,?,?,?,?)",
+                    (source_type, key, value, modified_by or "system", now),
+                )
+            for key in sorted(set(before) | set(cleaned)):
+                old_value = str(before.get(key, "") or "").strip()
+                new_value = str(cleaned.get(key, "") or "").strip()
+                if old_value == new_value:
+                    continue
+                db.execute(
+                    "INSERT INTO source_display_name_audit(source_type,field_key,old_value,new_value,modified_by,modified_at) VALUES(?,?,?,?,?,?)",
+                    (source_type, key, old_value, new_value, modified_by or "system", now),
+                )

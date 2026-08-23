@@ -32,7 +32,7 @@ from ...db_smart import DBSmartReport, build_signal_mapping_report_from_store
 from ...paths import resource_root
 from ...schema import COMPARISON_GROUPS, SOURCE_TYPES
 from ...storage import ProjectStore
-from ...review_status import analysis_review_state, field_false_color
+from ...review_status import analysis_review_state, field_false_color, signal_review_display_status
 from ...config.sources import schema_for
 from ...services.schema_service import (
     get_source_display_names, field_display_name, apply_display_names_to_groups,
@@ -71,8 +71,11 @@ FALSE_FEEDER = "F7D7D7"
 FALSE_SMART = "F7D7D7"
 FALSE_TYPE = "F7D7D7"
 
-REVIEWED = "EAF7F0"
-NEEDS_ACTION = "FFF0E0"
+REVIEW_NOT_REQUIRED = "EEF4F8"
+REVIEW_UNREVIEWED = "F3F4F6"
+REVIEWED = "DDF5E7"
+NEEDS_ACTION = "FDECEC"
+REVIEW_VALIDATION_REQUIRED = "FFF4D6"
 ANALYSIS_TRUE = "DDF5E7"
 ANALYSIS_FALSE = "F7D7D7"
 
@@ -230,16 +233,33 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
     analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "analysis_link"}
     neutral_review_keys = analysis_keys | {"remarks", "comments", "rmu_review_status"}
     review_map = store.rmu_review_map()
-    review_fills = {"UNREVIEWED": "F3F4F6", "REVIEWED": "EAF7F0", "NEEDS ACTION": "FFF0E0"}
+    review_fills = {
+        "NOT REQUIRED": REVIEW_NOT_REQUIRED,
+        "UNREVIEWED": REVIEW_UNREVIEWED,
+        "REVIEWED": REVIEWED,
+        "NEEDS ACTION": NEEDS_ACTION,
+        "VALIDATION REQUIRED": REVIEW_VALIDATION_REQUIRED,
+    }
 
     for row_idx, data in enumerate(store.rows(), 3):
         row_fill = _analysis_row_fill(data)
         rmu = str(data.get("rmu", "") or "").strip()
-        review_status = str(review_map.get(rmu, {}).get("review_status") or "UNREVIEWED").strip().upper()
+        analysis_state = analysis_review_state(data)
+        stored_review = str(review_map.get(rmu, {}).get("review_status") or "UNREVIEWED").strip().upper()
+        review_status = (
+            stored_review if analysis_state.issue_count > 0
+            else stored_review if analysis_state.has_result and stored_review in {"REVIEWED", "NEEDS ACTION"}
+            else "NOT REQUIRED" if analysis_state.has_result
+            else "VALIDATION REQUIRED"
+        )
         for col_idx, (key, _label, _width) in enumerate(columns, 1):
             value = (
                 review_status if key == "rmu_review_status"
-                else store.rmu_resolution_summary(rmu) if key == "comments"
+                else (
+                    store.rmu_resolution_summary(rmu)
+                    if analysis_state.issue_count > 0
+                    else store.rmu_manual_review_comment(rmu)
+                ) if key == "comments"
                 else data.get(key, "")
             )
             if value is None:
@@ -296,17 +316,30 @@ def _build_signal_mapping_review_sheet(wb, store: ProjectStore):
     columns = _write_grouped_headers(ws, groups)
     review_map = store.db_smart_review_map()
 
+    signal_review_fills = {
+        "NOT REQUIRED": REVIEW_NOT_REQUIRED,
+        "UNREVIEWED": REVIEW_UNREVIEWED,
+        "REVIEWED": REVIEWED,
+        "NEEDS ACTION": NEEDS_ACTION,
+        "VALIDATION REQUIRED": REVIEW_VALIDATION_REQUIRED,
+    }
     for row_idx, source_row in enumerate(report.rows, 3):
         review = review_map.get(source_row.row_key, {})
-        status = str(review.get("review_status") or "UNREVIEWED").strip().upper() or "UNREVIEWED"
+        stored_status = str(review.get("review_status") or "UNREVIEWED").strip().upper() or "UNREVIEWED"
+        analysis_result = ""
+        if report.analysis_column is not None and report.analysis_column < len(source_row.values):
+            analysis_result = str(source_row.values[report.analysis_column] or "").strip().upper()
+        status = signal_review_display_status(analysis_result, stored_status)
         comments = str(review.get("comments") or "")
         values = [status, comments, *source_row.values]
 
-        base_fill = REVIEWED if status == "REVIEWED" else NEEDS_ACTION if status == "NEEDS ACTION" else WHITE
+        # Automatic validation determines the row tint; Human Review uses only
+        # the Review cell. This keeps Matched and Reviewed visually distinct.
+        base_fill = ROW_PASS if analysis_result == "TRUE" else ROW_ONE_ISSUE if analysis_result == "FALSE" else REVIEW_VALIDATION_REQUIRED
         for col_idx, ((key, _label, _width), value) in enumerate(zip(columns, values), 1):
             cell = ws.cell(row_idx, col_idx, value)
-            fill = base_fill
-            bold = key in {"db_review_status"} or (key == "db_review_comments" and bool(str(value).strip()))
+            fill = signal_review_fills.get(status, REVIEW_UNREVIEWED) if key == "db_review_status" else WHITE if key == "db_review_comments" else base_fill
+            bold = key == "db_review_status"
             center = key == "db_review_status"
             wrap = key == "db_review_comments"
 

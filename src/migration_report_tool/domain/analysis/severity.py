@@ -93,3 +93,23 @@ def analysis_review_state(data: dict) -> AnalysisReviewState:
 
 def field_false_color(field_label: str) -> str | None:
     return FALSE_CELL_COLORS.get(str(field_label).strip().upper())
+
+
+def signal_review_display_status(analysis_result: object, stored_status: object) -> str:
+    """Return the visible Human Review state for one Signal Mapping row.
+
+    Automatic validation and Human Review are deliberately separate:
+    * MATCHED/TRUE defaults to ``NOT REQUIRED`` but a reviewer may explicitly
+      mark it ``REVIEWED`` or ``NEEDS ACTION``.
+    * MISMATCHED/FALSE is a required Human Review item and therefore uses the
+      stored ``UNREVIEWED``/``REVIEWED``/``NEEDS ACTION`` state.
+    * unchecked rows remain ``VALIDATION REQUIRED`` even if stale review data
+      exists, because validation coverage must be restored first.
+    """
+    result = str(analysis_result or "").strip().upper()
+    stored = str(stored_status or "").strip().upper() or "UNREVIEWED"
+    if result == "FALSE":
+        return stored if stored in {"UNREVIEWED", "REVIEWED", "NEEDS ACTION"} else "UNREVIEWED"
+    if result == "TRUE":
+        return stored if stored in {"REVIEWED", "NEEDS ACTION"} else "NOT REQUIRED"
+    return "VALIDATION REQUIRED"
