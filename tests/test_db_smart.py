@@ -1,0 +1,110 @@
+from pathlib import Path
+import csv
+import tempfile
+import unittest
+
+from migration_report_tool.db_smart import (
+    build_signal_mapping_report,
+    read_db_smart_report,
+)
+from migration_report_tool.storage import ProjectStore
+from migration_report_tool.paths import resource_root
+
+
+class SignalMappingReviewTests(unittest.TestCase):
+    def _write_ioa(self, path: Path):
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "RMU_NO", "ZENON_GSS-FID", "ZENON_signal_name", "ZENON_DOT_NO",
+                "ADMS_GSS-FID", "ADMS_signal_name", "ADMS_DOT_NO",
+            ])
+            w.writeheader()
+            w.writerow({
+                "RMU_NO": "26859", "ZENON_GSS-FID": "JED-CTL-RDS-09",
+                "ZENON_signal_name": "26859_Y1-RMURDS09_CMD", "ZENON_DOT_NO": "1",
+                "ADMS_GSS-FID": "JED CTL ADF 16", "ADMS_signal_name": "26859 Y1 CMD",
+                "ADMS_DOT_NO": "1",
+            })
+
+    def _write_adms_sld(self, path: Path, cabinet_type="3L1T"):
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["环网柜名称", "环网柜类型", "LINK"])
+            w.writeheader()
+            w.writerow({"环网柜名称": "26859", "环网柜类型": cabinet_type, "LINK": "TRUE"})
+
+    def test_signal_mapping_is_calculated_from_ioa_adms_sld_and_standard_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ioa = root / "ZENON-ADMS-IOA.csv"
+            adms_sld = root / "ADMS-SLD.csv"
+            self._write_ioa(ioa)
+            self._write_adms_sld(adms_sld)
+            standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
+            report = build_signal_mapping_report(ioa, adms_sld, standard)
+            self.assertEqual(report.sheet_name, "Calculated · IOA + ADMS SLD + STANDARD")
+            self.assertEqual(len(report.rows), 1)
+            row = report.rows[0]
+            self.assertEqual(row.rmu, "26859")
+            self.assertEqual(row.values[1], "3L1T")
+            self.assertEqual(row.values[8], "Y1 CMD")
+            self.assertEqual(row.values[9], "1")
+            self.assertEqual(row.values[10], "TRUE")
+            self.assertIn("Type (from ADMS SLD): 3L1T", row.analysis_detail)
+            self.assertIn("STANDARD", [g[0] for g in report.group_definitions][3])
+
+    def test_missing_standard_key_is_false_with_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ioa = root / "ZENON-ADMS-IOA.csv"
+            adms_sld = root / "ADMS-SLD.csv"
+            self._write_ioa(ioa)
+            self._write_adms_sld(adms_sld, cabinet_type="99L99T")
+            standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
+            report = build_signal_mapping_report(ioa, adms_sld, standard)
+            self.assertEqual(report.rows[0].values[10], "FALSE")
+            self.assertIn("STANDARD mapping not found", report.rows[0].analysis_detail)
+
+    def test_legacy_db_smart_sheet_is_not_a_source_anymore(self):
+        with self.assertRaises(RuntimeError):
+            read_db_smart_report(resource_root() / "templates" / "IOA STANDARD.xlsx")
+
+    def test_store_builder_uses_bundled_standard_not_site_report(self):
+        from migration_report_tool.db_smart import build_signal_mapping_report_from_store
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ioa = root / "ZENON-ADMS-IOA.csv"
+            adms_sld = root / "ADMS-SLD.csv"
+            self._write_ioa(ioa)
+            self._write_adms_sld(adms_sld)
+            store = ProjectStore(root / "project")
+            try:
+                store.set_source("ioa", ioa)
+                store.set_source("adms_sld", adms_sld)
+                report = build_signal_mapping_report_from_store(store)
+                self.assertEqual(report.rows[0].values[8], "Y1 CMD")
+                self.assertTrue(any(p.name == "IOA STANDARD.xlsx" for p in report.input_paths))
+            finally:
+                store.db.close()
+
+    def test_signal_mapping_review_is_persistent_and_audited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProjectStore(Path(tmp) / "ADF")
+            store.update_db_smart_review(
+                row_key="row-key-1", rmu="26859", field="review_status", value="REVIEWED",
+                modified_by="tester", source_hash="abc", site_name="ADF",
+            )
+            store.update_db_smart_review(
+                row_key="row-key-1", rmu="26859", field="comments", value="Checked by SE",
+                modified_by="tester", source_hash="abc", site_name="ADF",
+            )
+            review = store.db_smart_review_map()["row-key-1"]
+            self.assertEqual(review["review_status"], "REVIEWED")
+            self.assertEqual(review["comments"], "Checked by SE")
+            changes = store.changes()
+            self.assertEqual(len(changes), 2)
+            self.assertTrue(changes[0]["rmu"].startswith("DBSMART:"))
+            store.db.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

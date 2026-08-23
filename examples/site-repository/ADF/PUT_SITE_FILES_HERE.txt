@@ -1,0 +1,1 @@
+This folder demonstrates one site. Replace this marker with the site's standard source files.

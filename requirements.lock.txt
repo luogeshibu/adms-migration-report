@@ -1,0 +1,4 @@
+# Reproducible Windows x64 build lock. Update intentionally and run the full release pipeline.
+PySide6==6.11.2
+openpyxl==3.1.5
+PyInstaller==6.22.2
