@@ -37,6 +37,15 @@ class ReviewStatusTests(unittest.TestCase):
         self.assertEqual(a.row_status, "two_issues")
         self.assertEqual(b.row_status, "two_issues")
 
+    def test_one_and_two_issue_rows_share_one_visual_issue_color(self):
+        one = analysis_review_state(row(analysis_feeder="FALSE"))
+        two = analysis_review_state(row(analysis_feeder="FALSE", analysis_type="FALSE"))
+        self.assertEqual(one.row_color, two.row_color)
+
+    def test_all_false_fields_share_one_mismatch_color(self):
+        colors = {field_false_color(name) for name in ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK")}
+        self.assertEqual(len(colors), 1)
+
     def test_name_is_always_critical(self):
         state = analysis_review_state(row(analysis_name="FALSE"))
         self.assertTrue(state.is_critical)

@@ -45,7 +45,7 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertNotIn('QLabel("MIGRATION REVIEW")', self.ui)
         for text in ('1  Data Sources', '2  Validation', '3  Human Review', '4  Migration Report'):
             self.assertIn(text, self.ui)
-        for state in ('SOURCES INCOMPLETE', 'READY FOR VALIDATION', 'VALIDATION COMPLETE', 'REVIEW IN PROGRESS', 'ACTION REQUIRED', 'READY FOR EXPORT'):
+        for state in ('SOURCES INCOMPLETE', 'VALIDATION REQUIRED', 'REVIEW PENDING', 'ACTION REQUIRED', 'READY FOR EXPORT'):
             self.assertIn(state, self.ui)
 
     def test_signal_kpis_reconcile_checked_and_unchecked(self):
@@ -82,7 +82,21 @@ class UISelectionContractTests(unittest.TestCase):
     def test_review_cells_are_directly_editable_by_double_click(self):
         self.assertIn("self.comparison_locator.cellDoubleClicked.connect(self._edit_comparison_locator_review)", self.ui)
         self.assertIn("self.db_smart_locator.cellDoubleClicked.connect(self._edit_db_smart_locator_review)", self.ui)
-        self.assertIn("Double-click Review to change the human review state", self.ui)
+        self.assertIn("pass rows set Review directly; issue rows open structured Resolution", self.ui)
+
+    def test_rmu_legend_uses_minimal_color_semantics(self):
+        self.assertIn('("#FFF8D8", "Has Issues"', self.ui)
+        self.assertIn('("#F7D7D7", "FALSE = mismatch"', self.ui)
+        self.assertNotIn('("#FFF0A8", "FEEDER"', self.ui)
+        self.assertNotIn('("#D8E9FF", "SMART"', self.ui)
+        self.assertNotIn('("#FFDDB8", "TYPE"', self.ui)
+
+    def test_delivery_status_is_live_review_stage(self):
+        self.assertIn('display_state = f"REVIEW PENDING · {review_pct}%"', self.ui)
+        self.assertIn('display_state = f"ACTION REQUIRED · {needs_action}"', self.ui)
+        self.assertNotIn('state = "VALIDATION COMPLETE"', self.ui)
+        self.assertIn('Review {reviewed_or_action} / {len(active_rmus)}', self.ui)
+        self.assertIn('Resolution {resolved_issue_decisions} / {total_issue_decisions} issues', self.ui)
 
     def test_signal_mapping_has_explicit_result_filter(self):
         self.assertIn('self.db_smart_result_combo.addItems(["ALL RESULTS", "MATCHED", "MISMATCHED", "UNCHECKED"])', self.ui)

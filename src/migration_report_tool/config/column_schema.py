@@ -48,18 +48,18 @@ DATA_GROUPS = [
         ("analysis_ip", "IP", 80), ("analysis_link", "LINK", 80),
     ]),
     ("Remarks", "#D5D8DE", [("remarks", "Remarks", 300)]),
-    ("Comments", "#D8E1EA", [("comments", "Comments", 360)]),
+    ("Resolution", "#D8E1EA", [("comments", "Resolution", 360)]),
 ]
 COLUMNS = [column for _, _, columns in DATA_GROUPS for column in columns]
-EDITABLE_COLUMNS = {key for key, _, _ in COLUMNS if key not in {"no", "rmu"}}
+EDITABLE_COLUMNS = {key for key, _, _ in COLUMNS if key not in {"no", "rmu", "remarks", "comments"}}
 
 # RMU Data Review deliberately puts the review result first so reviewers can
 # see issues/reasons before scrolling through source-system fields.
-_REVIEW_GROUP_NAMES = {"Index", "Analysis", "Remarks", "Comments"}
+_REVIEW_GROUP_NAMES = {"Index", "Analysis", "Remarks", "Resolution"}
 COMPARISON_GROUPS = (
     [group for group in DATA_GROUPS if group[0] == "Analysis"]
     + [group for group in DATA_GROUPS if group[0] == "Remarks"]
-    + [group for group in DATA_GROUPS if group[0] == "Comments"]
+    + [group for group in DATA_GROUPS if group[0] == "Resolution"]
     + [group for group in DATA_GROUPS if group[0] == "Index"]
     + [group for group in DATA_GROUPS if group[0] not in _REVIEW_GROUP_NAMES]
 )
@@ -68,10 +68,11 @@ COMPARISON_COLUMNS = [column for _, _, columns in COMPARISON_GROUPS for column i
 # Versioned UI column-layout schema.  When new review columns are introduced,
 # older saved QSettings layouts must be migrated once; otherwise a user's
 # previous visible-column list silently hides the newly added fields.
-COMPARISON_COLUMN_SCHEMA_VERSION = 3
+COMPARISON_COLUMN_SCHEMA_VERSION = 4
 COMPARISON_COLUMN_MIGRATIONS = {
     2: {"analysis_ip", "analysis_link"},
     3: {"se_smart"},
+    4: {"comments"},
 }
 
 def migrate_comparison_visible_columns(saved_columns, saved_schema_version=0):
@@ -105,7 +106,7 @@ REPORT_MERGES = [
 REPORT_GROUP_STARTS = {
     "C1": "SE", "H1": "ZENON DB", "P1": "Driver Info", "AC1": "ZENON SLD XML",
     "AG1": "ADMS DB", "AP1": "ADMS Channel", "AS1": "ADMS SLD",
-    "AW1": "Analysis", "BA1": "Remarks", "BB1": "Comments",
+    "AW1": "Analysis", "BA1": "Remarks", "BB1": "Resolution",
 }
 
 SOURCE_TYPES = {

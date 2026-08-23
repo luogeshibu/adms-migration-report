@@ -58,24 +58,30 @@ def _normalize_numeric_token(token: str) -> str:
     return token
 
 
-# Feeder comparison is intentionally based on the logical feeder number.
-# Site/region prefixes are presentation conventions and must not create false
-# mismatches.  The current ADMS convention encodes feeder N as AH3NN:
+# FEEDER comparison uses the complete logical feeder identity:
 #
-#   ABN-AH312            -> 12
-#   ABN-AH301            -> 1
-#   JED-NTH-ABH-AH303    -> 3
+#     station/site token + feeder number
+#
+# Region prefixes such as JED-NTH are presentation/routing prefixes and are
+# ignored, but the station token itself is business-significant.  Therefore
+# ABH-22 and JED-NTH-ABH-22 are the same feeder, while ABN-22 is a different
+# feeder even though the numeric suffix is also 22.  The current ADMS
+# convention encodes feeder N as AH3NN:
+#
+#   ABN-AH312            -> ABN-12
+#   ABN-AH301            -> ABN-1
+#   JED-NTH-ABH-AH303    -> ABH-3
 #
 # Normal source values use a trailing numeric token:
 #
-#   ABN-12               -> 12
-#   JED-NTH-ABN-12       -> 12
-#   ABN-01               -> 1
+#   ABH-03               -> ABH-3
+#   JED-NTH-ABH-3        -> ABH-3
+#   JED-NTH-ABN-3        -> ABN-3   (different feeder)
 #
-# Comparison therefore uses the decoded numeric feeder identity.  This is a
-# confirmed project rule (not fuzzy matching).  If a value has no recognizable
-# numeric feeder token, a conservative textual fallback is kept so the mismatch
-# remains visible instead of being silently accepted.
+# This is a confirmed project rule.  If a feeder number is present without an
+# explicit station token, the selected repository site is used as the station
+# hint.  Unknown textual encodings remain conservative so they cannot silently
+# compare equal.
 _ADMS_AH3_SUFFIX = re.compile(r"^AH3(?P<feeder>\d{1,2})$", re.I)
 
 
@@ -91,23 +97,54 @@ def _logical_feeder_number(tokens: list[str]) -> str:
     return ""
 
 
-def normalize_feeder_for_compare(value: object, site_name: str | None = None) -> str:
-    """Return the logical feeder identity used by FEEDER Analysis.
+def _site_token_hint(site_name: str | None) -> str:
+    """Return the station token implied by the selected repository site.
 
-    Region/site prefixes are ignored for comparison.  ADMS ``AH3xx`` suffixes
-    are decoded and zero padding is removed.  The ``site_name`` argument is
-    retained for API compatibility and for the textual fallback only; numeric
-    feeder comparison no longer depends on the repository folder name.
+    Repository folders commonly use labels such as ``1-ABH`` / ``1-ABN2``
+    while older configuration may contain labels such as ``JEDDAH_ABH`` or
+    ``ABH110``.  Only this fallback path uses the repository label; an explicit
+    station token carried by a feeder value always wins.
+    """
+    tokens = _tokens(site_name or "")
+    candidates = [token for token in tokens if not token.isdigit()]
+    if not candidates:
+        return ""
+    token = candidates[-1]
+    # Common voltage suffixes may be appended to the station code in a site
+    # label (for example ABH110).  Do not strip single digits because ABN2 is a
+    # valid station token.
+    match = re.fullmatch(r"(?P<site>[A-Z][A-Z0-9]*?)(?:110|132|33)$", token)
+    return match.group("site") if match else token
+
+
+def _explicit_feeder_site_token(tokens: list[str]) -> str:
+    """Return the station token immediately preceding a decoded feeder suffix."""
+    if len(tokens) < 2:
+        return ""
+    candidate = tokens[-2]
+    # Generic labels do not prove station identity; use the selected-site hint
+    # instead when these are encountered.
+    if candidate in {"FEEDER", "FDR", "FD", "NO", "NUMBER"}:
+        return ""
+    return candidate
+
+
+def normalize_feeder_for_compare(value: object, site_name: str | None = None) -> str:
+    """Return ``<station>-<feeder>`` for FEEDER consistency analysis.
+
+    The station component is mandatory whenever it can be determined.  This
+    prevents same-number feeders from different stations from comparing equal.
 
     Examples::
 
-        ABN-12                    -> 12
-        JED-NTH-ABN-12            -> 12
-        ABN-AH312                 -> 12
-        ABN-1                     -> 1
-        ABN-01                    -> 1
-        ABN-AH301                 -> 1
-        JED-NTH-ABH-AH303         -> 3
+        ABN-12                    -> ABN-12
+        JED-NTH-ABN-12            -> ABN-12
+        ABN-AH312                 -> ABN-12
+        ABN-01                    -> ABN-1
+        JED-NTH-ABH-AH303         -> ABH-3
+        JED-NTH-ABN-AH303         -> ABN-3
+
+    ``ABH-3`` and ``ABN-3`` are therefore different logical feeders.
     """
     raw = clean(value).upper()
     if raw in {"", "0", "NULL", "NONE", "N/A", "NA", "-"}:
@@ -118,7 +155,8 @@ def normalize_feeder_for_compare(value: object, site_name: str | None = None) ->
 
     logical_number = _logical_feeder_number(tokens)
     if logical_number:
-        return logical_number
+        station = _explicit_feeder_site_token(tokens) or _site_token_hint(site_name)
+        return f"{station}-{logical_number}" if station else logical_number
 
     # No confirmed numeric feeder suffix was found.  Keep a conservative
     # textual representation.  If the selected site token sequence is present,
@@ -140,8 +178,15 @@ def normalize_feeder_for_compare(value: object, site_name: str | None = None) ->
                     tokens = tokens[i:]
                     return "-".join(_normalize_numeric_token(token) for token in tokens)
 
-    return "-".join(_normalize_numeric_token(token) for token in tokens)
+        # ``1-ABH`` should also match an embedded ``ABH`` even though the
+        # repository sequence number is not carried in source feeder names.
+        site_hint = _site_token_hint(site_name)
+        if site_hint:
+            for i, token in enumerate(tokens):
+                if token == site_hint:
+                    return "-".join(_normalize_numeric_token(token) for token in tokens[i:])
 
+    return "-".join(_normalize_numeric_token(token) for token in tokens)
 
 def normalize_ip(value: object) -> str:
     """Normalize IPv4/IPv6 addresses for Driver-info vs ADMS-channel checks.

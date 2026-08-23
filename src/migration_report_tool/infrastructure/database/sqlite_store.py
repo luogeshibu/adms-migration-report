@@ -60,6 +60,13 @@ class ProjectStore:
             rmu TEXT PRIMARY KEY, review_status TEXT NOT NULL DEFAULT 'UNREVIEWED',
             reviewed_by TEXT, reviewed_at TEXT, updated_at TEXT, analysis_hash TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS rmu_resolutions (
+            rmu TEXT NOT NULL, analysis_field TEXT NOT NULL, decision_type TEXT NOT NULL,
+            selected_source TEXT NOT NULL DEFAULT '', selected_value TEXT NOT NULL DEFAULT '',
+            normalized_value TEXT NOT NULL DEFAULT '', analysis_fingerprint TEXT NOT NULL DEFAULT '',
+            modified_by TEXT, modified_at TEXT,
+            PRIMARY KEY(rmu, analysis_field)
+        );
         CREATE TABLE IF NOT EXISTS db_smart_reviews (
             row_key TEXT PRIMARY KEY, site_name TEXT, rmu TEXT, source_hash TEXT, row_hash TEXT NOT NULL DEFAULT '',
             review_status TEXT NOT NULL DEFAULT 'UNREVIEWED', comments TEXT NOT NULL DEFAULT '',
@@ -165,6 +172,200 @@ class ProjectStore:
             self.config["sources"].pop(source_type, None)
             self.save_config()
 
+    _RMU_ANALYSIS_FIELDS = ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK")
+
+    @classmethod
+    def _active_rmu_issue_fields(cls, row: dict) -> list[str]:
+        return [
+            field for field in cls._RMU_ANALYSIS_FIELDS
+            if clean((row or {}).get(f"analysis_{field.lower()}" )).upper() == "FALSE"
+        ]
+
+    @staticmethod
+    def _rmu_field_fingerprint(row: dict, field: str) -> str:
+        field = clean(field).upper()
+        key = f"analysis_{field.lower()}"
+        candidates = ((row or {}).get("resolution_candidates") or {}).get(field, [])
+        payload = {
+            "result": clean((row or {}).get(key)),
+            "detail": clean((row or {}).get(f"{key}_detail")),
+            "candidates": candidates,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _sync_rmu_resolutions(self, rmu: str, row: dict) -> int:
+        """Invalidate structured decisions when the corresponding issue changed.
+
+        Current decisions are authoritative only for the exact validation inputs
+        that the reviewer saw.  Audit history remains immutable after a decision
+        is cleared.
+        """
+        active = set(self._active_rmu_issue_fields(row))
+        existing = list(self.db.execute("SELECT * FROM rmu_resolutions WHERE rmu=?", (rmu,)))
+        if not existing:
+            return 0
+        now = datetime.now().isoformat(timespec="seconds")
+        cleared = 0
+        for record in existing:
+            field = clean(record["analysis_field"]).upper()
+            current_fp = self._rmu_field_fingerprint(row, field) if field in active else ""
+            old_fp = clean(record["analysis_fingerprint"])
+            if field not in active or (old_fp and current_fp and old_fp != current_fp):
+                old_summary = self._resolution_record_summary(record)
+                self.db.execute("DELETE FROM rmu_resolutions WHERE rmu=? AND analysis_field=?", (rmu, field))
+                reason = (
+                    "Automatic reset: issue no longer exists after validation"
+                    if field not in active else
+                    "Automatic reset: issue source values changed after validation"
+                )
+                self.db.execute(
+                    "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
+                    (rmu, f"resolution.{field}", old_summary, "UNRESOLVED", reason, "SYSTEM", now),
+                )
+                cleared += 1
+            elif old_fp != current_fp:
+                self.db.execute(
+                    "UPDATE rmu_resolutions SET analysis_fingerprint=?,modified_at=? WHERE rmu=? AND analysis_field=?",
+                    (current_fp, now, rmu, field),
+                )
+        return cleared
+
+    @staticmethod
+    def _resolution_record_summary(record) -> str:
+        decision = clean(record["decision_type"]).upper()
+        source = clean(record["selected_source"])
+        value = clean(record["selected_value"])
+        if decision == "USE_SOURCE":
+            return f"Use {source}" + (f" = {value}" if value else "")
+        if decision == "NEEDS_ACTION":
+            return "Needs Action"
+        if decision == "ACCEPT_EXCEPTION":
+            return "Accepted Exception"
+        return decision.replace("_", " ").title() or "Unresolved"
+
+    def rmu_resolution_map(self, rmu: str | None = None) -> dict:
+        if rmu:
+            rows = self.db.execute(
+                "SELECT * FROM rmu_resolutions WHERE rmu=? ORDER BY analysis_field", (clean(rmu),)
+            )
+            return {clean(row["analysis_field"]).upper(): dict(row) for row in rows}
+        result: dict[str, dict[str, dict]] = {}
+        for row in self.db.execute("SELECT * FROM rmu_resolutions ORDER BY rmu,analysis_field"):
+            result.setdefault(clean(row["rmu"]), {})[clean(row["analysis_field"]).upper()] = dict(row)
+        return result
+
+    def rmu_resolution_summary(self, rmu: str) -> str:
+        resolutions = self.rmu_resolution_map(rmu)
+        parts = []
+        for field in self._RMU_ANALYSIS_FIELDS:
+            record = resolutions.get(field)
+            if not record:
+                continue
+            decision = clean(record.get("decision_type")).upper()
+            if decision == "USE_SOURCE":
+                parts.append(f"{field} → {clean(record.get('selected_source')) or 'Source'}")
+            elif decision == "NEEDS_ACTION":
+                parts.append(f"{field} → Needs Action")
+            elif decision == "ACCEPT_EXCEPTION":
+                parts.append(f"{field} → Accepted Exception")
+        return " · ".join(parts)
+
+    def rmu_resolution_tooltip(self, rmu: str) -> str:
+        resolutions = self.rmu_resolution_map(rmu)
+        if not resolutions:
+            return "No Resolution decisions recorded."
+        lines = []
+        for field in self._RMU_ANALYSIS_FIELDS:
+            record = resolutions.get(field)
+            if not record:
+                continue
+            lines.append(f"{field}: {self._resolution_record_summary(record)}")
+        return "\n".join(lines)
+
+    def set_rmu_resolution(
+        self, rmu: str, analysis_field: str, decision_type: str, modified_by: str,
+        *, selected_source: str = "", selected_value: str = "", normalized_value: str = "",
+        analysis_fingerprint: str = "", reason: str = "RMU issue Resolution decision",
+    ) -> None:
+        rmu = clean(rmu)
+        field = clean(analysis_field).upper()
+        decision = clean(decision_type).upper()
+        if not rmu or field not in self._RMU_ANALYSIS_FIELDS:
+            raise ValueError("RMU and a valid Analysis field are required")
+        if decision not in {"USE_SOURCE", "NEEDS_ACTION", "ACCEPT_EXCEPTION"}:
+            raise ValueError(f"Unsupported Resolution decision: {decision}")
+        if decision == "USE_SOURCE" and not clean(selected_source):
+            raise ValueError("A source is required for USE_SOURCE")
+        current = self.db.execute(
+            "SELECT * FROM rmu_resolutions WHERE rmu=? AND analysis_field=?", (rmu, field)
+        ).fetchone()
+        old_summary = self._resolution_record_summary(current) if current else "UNRESOLVED"
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = (
+            rmu, field, decision, clean(selected_source), clean(selected_value), clean(normalized_value),
+            clean(analysis_fingerprint), modified_by or "system", now,
+        )
+        self.db.execute(
+            """INSERT INTO rmu_resolutions
+            (rmu,analysis_field,decision_type,selected_source,selected_value,normalized_value,analysis_fingerprint,modified_by,modified_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(rmu,analysis_field) DO UPDATE SET
+              decision_type=excluded.decision_type,selected_source=excluded.selected_source,
+              selected_value=excluded.selected_value,normalized_value=excluded.normalized_value,
+              analysis_fingerprint=excluded.analysis_fingerprint,modified_by=excluded.modified_by,modified_at=excluded.modified_at
+            """, payload,
+        )
+        new_record = self.db.execute(
+            "SELECT * FROM rmu_resolutions WHERE rmu=? AND analysis_field=?", (rmu, field)
+        ).fetchone()
+        new_summary = self._resolution_record_summary(new_record)
+        if old_summary != new_summary:
+            self.db.execute(
+                "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
+                (rmu, f"resolution.{field}", old_summary, new_summary, reason, modified_by or "system", now),
+            )
+        self.db.commit()
+
+    def clear_rmu_resolution(self, rmu: str, analysis_field: str, modified_by: str, reason: str = "Resolution cleared") -> None:
+        rmu = clean(rmu); field = clean(analysis_field).upper()
+        current = self.db.execute(
+            "SELECT * FROM rmu_resolutions WHERE rmu=? AND analysis_field=?", (rmu, field)
+        ).fetchone()
+        if not current:
+            return
+        old_summary = self._resolution_record_summary(current)
+        now = datetime.now().isoformat(timespec="seconds")
+        self.db.execute("DELETE FROM rmu_resolutions WHERE rmu=? AND analysis_field=?", (rmu, field))
+        self.db.execute(
+            "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
+            (rmu, f"resolution.{field}", old_summary, "UNRESOLVED", reason, modified_by or "system", now),
+        )
+        self.db.commit()
+
+    def sync_rmu_review_from_resolutions(self, rmu: str, row: dict, modified_by: str) -> str:
+        """Derive human Review state from active issue decisions.
+
+        One active FALSE field requires exactly one Resolution decision. If any
+        issue is unresolved Review stays UNREVIEWED; if any decision is
+        NEEDS_ACTION Review is NEEDS ACTION; otherwise all issue decisions make
+        the row REVIEWED. Pass rows remain manually reviewable.
+        """
+        active = self._active_rmu_issue_fields(row)
+        if not active:
+            return clean(self.rmu_review_map().get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
+        resolutions = self.rmu_resolution_map(rmu)
+        if any(field not in resolutions for field in active):
+            target = "UNREVIEWED"
+        elif any(clean(resolutions[field].get("decision_type")).upper() == "NEEDS_ACTION" for field in active):
+            target = "NEEDS ACTION"
+        else:
+            target = "REVIEWED"
+        self.update_rmu_review_status(
+            rmu, target, modified_by, reason="Automatic Review state from structured Resolution decisions"
+        )
+        return target
+
     @staticmethod
     def _rmu_analysis_hash(row: dict) -> str:
         """Fingerprint only the automatic RMU analysis result.
@@ -220,6 +421,7 @@ class ProjectStore:
             rmu = clean(auto.get("rmu"))
             if rmu:
                 self._sync_rmu_review_analysis_hash(rmu, self._rmu_analysis_hash(auto))
+                self._sync_rmu_resolutions(rmu, auto)
             for field in EDITABLE_COLUMNS:
                 if (row["rmu"], field) in overrides:
                     row[field] = overrides[(row["rmu"], field)]
@@ -268,6 +470,7 @@ class ProjectStore:
             "rows": self.rows(),
             "changes": self.changes(),
             "rmu_reviews": list(self.rmu_review_map().values()),
+            "rmu_resolutions": self.rmu_resolution_map(),
             "db_smart_reviews": list(self.db_smart_review_map().values()),
             "source_display_names": {
                 source_type: self.source_display_names(source_type)

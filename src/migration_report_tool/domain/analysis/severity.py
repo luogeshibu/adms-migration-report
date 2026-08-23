@@ -1,13 +1,13 @@
 """Shared RMU review-status semantics used by UI and Excel export.
 
-Color has two independent meanings:
+The review UI intentionally uses a minimal color system:
 
-* row color = severity / number of failed Analysis checks;
-* FALSE cell color = the exact field that failed.
+* row color = pass / issue / critical severity;
+* every FALSE Analysis cell uses one shared mismatch highlight.
 
-The Analysis block currently contains NAME / FEEDER / SMART / TYPE / IP / LINK.
-Keeping row severity independent from field combinations prevents an explosion of
-special-case colors as checks are added.
+The column header already identifies NAME / FEEDER / SMART / TYPE / IP / LINK,
+so field-specific colors are deliberately avoided. This keeps the formal review
+grid readable and prevents color meaning from becoming ambiguous.
 """
 from __future__ import annotations
 
@@ -25,21 +25,15 @@ ANALYSIS_FIELDS = (
 ROW_COLORS = {
     "none": "FFFFFF",
     "pass": "EAF7F0",
+    # One-issue and two-issue rows intentionally share one issue color. The
+    # Analysis label still shows the exact count, so another color is redundant.
     "one_issue": "FFF8D8",
-    "two_issues": "FFF0E0",
+    "two_issues": "FFF8D8",
     "critical": "FDECEC",
 }
 
-# Stronger, low-saturation field colors.  These identify the exact mismatch,
-# not its severity.
-FALSE_CELL_COLORS = {
-    "NAME": "F7D7D7",      # red
-    "FEEDER": "FFF0A8",    # yellow
-    "SMART": "D8E9FF",     # blue
-    "TYPE": "FFDDB8",      # orange
-    "IP": "E6DEFF",        # violet
-    "LINK": "F5DCEE",      # rose
-}
+FALSE_MISMATCH_COLOR = "F7D7D7"
+FALSE_CELL_COLORS = {label: FALSE_MISMATCH_COLOR for label, _key in ANALYSIS_FIELDS}
 
 
 @dataclass(frozen=True)

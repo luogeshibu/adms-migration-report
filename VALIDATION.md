@@ -1,3 +1,21 @@
+## v0.8.23 validation additions
+
+- RMU one-issue and two-issue rows use the same issue background while retaining their exact Analysis labels.
+- Every RMU FALSE Analysis field uses the same mismatch-cell color in App and Excel.
+- RMU page summary includes live Review and structured Resolution progress.
+- Delivery status uses SOURCES INCOMPLETE / VALIDATION REQUIRED / REVIEW PENDING / ACTION REQUIRED / READY FOR EXPORT.
+- REVIEW PENDING includes the current combined RMU + Signal review percentage and refreshes after review/resolution actions.
+- READY FOR EXPORT requires all active review items to be processed and zero Needs Action.
+
+## v0.8.22 validation additions
+
+- RMU Resolution is structured and stored one record per `(RMU, Analysis Field)`.
+- Number of required decisions exactly matches the number of active FALSE Analysis fields.
+- Review state is automatically derived from Resolution completeness.
+- Re-validation selectively invalidates affected decisions when source values/details change.
+- Formal RMU Excel export uses `Resolution` instead of free-form RMU Comments.
+- Full automated regression suite passes with the new Resolution workflow.
+
 ## v0.8.20 validation additions
 
 - Dashboard exception actions are intent-aware: RMU Issues applies `ANY MISMATCH`; Signal Mismatches applies `MISMATCHED`.
@@ -282,3 +300,11 @@ The source package has one authoritative production build/release entry point: r
 - UI terminology only: `Open Workspace`, `Select Workspace`, and `Workspace`.
 - The underlying repository-root property, read-only source scanning, per-site application workspace, SQLite state, and comparison logic remain unchanged.
 - Regression check confirms user-facing `Open Root` / `Change Root` labels are no longer present in `main_window.py`.
+
+## v0.8.21 validation additions
+
+- FEEDER normalization retains the station token in the comparison key.
+- `ABH-22`, `JED-NTH-ABH-22`, and `JED-NTH-ABH-AH322` normalize to the same `ABH-22` identity.
+- `ABH-22` and `ABN-22` are explicitly covered as a mismatch even with the same numeric feeder number.
+- Numeric-only feeder values use the selected site as a station hint.
+- FEEDER tooltip text documents the station-aware comparison rule.

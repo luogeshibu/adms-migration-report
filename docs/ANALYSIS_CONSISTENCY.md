@@ -1,4 +1,4 @@
-# Analysis Consistency Standard — v0.5.3
+# Analysis Consistency Standard — v0.8.21
 
 The DATA `Analysis` group (`NAME / FEEDER / SMART / TYPE`) uses a shared consistency rule.
 
@@ -15,7 +15,7 @@ For each field, values are collected from the applicable sources: SE, ZENON DB, 
 ## Field normalization
 
 - **NAME**: RMU/cabinet identifier, case-normalized.
-- **FEEDER**: site-relative feeder normalization. For site `ABN2`, `ABN2-03`, `JED-NTH-ABN2-03` and `JED NTH-ABN2-3` normalize to `ABN2-3`.
+- **FEEDER**: station-aware feeder normalization. The comparison key is `station/site token + feeder number`. For example, `ABH-03`, `JED-NTH-ABH-03` and `JED-NTH-ABH-3` normalize to `ABH-3`, while `ABN-3` remains a different feeder.
 - **SMART**: `SMART`, `SMR`, `YES`, `TRUE`, `1`, and SE values such as `SMART NOP HT` normalize to `SMART`; `NORMAL`, `NO`, `FALSE`, `0`, etc. normalize to `NORMAL`.
 - **TYPE**: cabinet type such as `2L1T` / `3L1T`. Current ZENON DB `DEVICE` is treated as cabinet type. SE `EQUIP. TYPE` is not used as cabinet type because it represents SMART/NORMAL equipment classification in the current SE format.
 
@@ -37,6 +37,6 @@ When upgrading from a build that saved a four-column Analysis layout, the applic
 
 ## Feeder normalization rules
 
-Feeder comparison is site-relative and uses explicit business normalization. Region prefixes such as `JED-NTH` are ignored once the selected site token is found. Numeric zero padding is ignored (`ABH-03` = `ABH-3`). For ABH, the confirmed ADMS encoding `AH3xx` is decoded to feeder `xx`, so `JED-NTH-ABH-AH303` = `ABH-03` and `JED-NTH-ABH-AH308` = `ABH-08`. Unknown encodings are never guessed; they remain visible as mismatches.
+Feeder comparison uses the complete logical identity `station/site token + feeder number`. Region/routing prefixes such as `JED-NTH` are ignored, but the station token itself is never discarded. Numeric zero padding is ignored (`ABH-03` = `ABH-3`). The confirmed ADMS encoding `AH3xx` is decoded to feeder `xx` while retaining the station token, so `JED-NTH-ABH-AH303` = `ABH-03` = `ABH-3`. Crucially, `ABH-22` and `ABN-22` are different feeders even though the number is the same. Numeric-only values use the selected repository site as a station hint. Unknown encodings are never guessed; they remain visible as mismatches.
 
 The old ADMS Channel source-level `Analysis` column has been removed. IP consistency is represented only by the main Analysis `IP` field.

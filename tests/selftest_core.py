@@ -29,11 +29,29 @@ def run_selftest():
         assert len(COLUMNS) == 55, f"RMU review schema must contain 55 source/review columns, got {len(COLUMNS)}"
         assert "channel_analysis" not in rows[0], "obsolete ADMS Channel Analysis field must not be computed"
         store.save_comparison(rows)
-        first_rmu = rows[0]["rmu"]
-        store.update_value(first_rmu, "comments", "SE review: verify field mapping", "selftest", "SE user comment / modification advice")
-        # A rerun must retain the manually reviewed comment through the audit override layer.
-        rerun_rows, _ = build_comparison(store)
-        store.save_comparison(rerun_rows)
+        # Structured Resolution replaces free-form RMU Comments. Pick one issue
+        # row and resolve every FALSE field with the first available source;
+        # LINK uses Accepted Exception because it is an association flag.
+        issue_row = next(row for row in rows if any(str(row.get(f"analysis_{field.lower()}", "")).upper() == "FALSE" for field in ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK")))
+        issue_rmu = issue_row["rmu"]
+        for field in ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK"):
+            if str(issue_row.get(f"analysis_{field.lower()}", "")).upper() != "FALSE":
+                continue
+            candidates = (issue_row.get("resolution_candidates") or {}).get(field, [])
+            if field != "LINK" and candidates:
+                candidate = candidates[0]
+                store.set_rmu_resolution(
+                    issue_rmu, field, "USE_SOURCE", "selftest",
+                    selected_source=candidate.get("source", ""), selected_value=candidate.get("value", ""),
+                    normalized_value=candidate.get("normalized", ""),
+                    analysis_fingerprint=store._rmu_field_fingerprint(issue_row, field),
+                )
+            else:
+                store.set_rmu_resolution(
+                    issue_rmu, field, "ACCEPT_EXCEPTION", "selftest",
+                    analysis_fingerprint=store._rmu_field_fingerprint(issue_row, field),
+                )
+        store.sync_rmu_review_from_resolutions(issue_rmu, issue_row, "selftest")
         target = export_report(store)
         assert target.exists(), "Excel export not created"
 
@@ -50,14 +68,16 @@ def run_selftest():
             assert ws["B1"].value == "Analysis"
             assert [ws.cell(2, c).value for c in range(2, 8)] == ["NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK"]
             assert ws["H1"].value == "Remarks"
-            assert ws["I1"].value == "Comments"
+            assert ws["I1"].value == "Resolution"
             assert ws["J1"].value == "Index"
             assert ws["J2"].value == "No."
             assert ws["K2"].value == "RMU"
             assert ws["L1"].value == "SE"
             assert str(ws["K3"].value) == str(rows[0]["rmu"])
-            # The manually reviewed App comment must be exported in the App Comments column.
-            assert ws["I3"].value == "SE review: verify field mapping"
+            # Structured issue decisions must be exported in the Resolution column.
+            issue_excel_row = next(r for r in range(3, ws.max_row + 1) if str(ws.cell(r, 11).value or "") == str(issue_rmu))
+            assert ws.cell(issue_excel_row, 9).value, "Resolution summary must be exported"
+            assert ws.cell(issue_excel_row, 1).value == "REVIEWED"
 
             # Signal Mapping Review must also mirror the App model: Review first, then RMU/source groups.
             signal = wb["Signal Mapping Review"]

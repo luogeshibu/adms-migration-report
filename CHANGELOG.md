@@ -1,3 +1,39 @@
+## v0.8.23 - Simplified Analysis Colors and Live Review Status
+
+- Simplified RMU Analysis colors to three row meanings only: Pass, Has Issues, and Critical.
+- One-issue and two-issue rows now share the same pale-yellow issue color; their labels still show the exact issue count.
+- All FALSE Analysis cells now use one shared pale-red mismatch highlight; the column header identifies NAME / FEEDER / SMART / TYPE / IP / LINK.
+- Simplified the RMU legend to Pass / Has Issues / Critical / FALSE = mismatch.
+- Replaced the long RMU workflow paragraph with live Review and Resolution progress: reviewed/processed RMUs, percentage, resolved issue decisions, total active issues, and Needs Action count.
+- The top-right project status is now the live workflow stage rather than the last technical milestone. After validation it shows REVIEW PENDING with the combined RMU + Signal review percentage until all review items are complete.
+- ACTION REQUIRED includes the live Needs Action count; READY FOR EXPORT appears only when all RMU and Signal review items are processed and no Needs Action remains.
+- Validation remains a completed workflow step after Run Validation, but `VALIDATION COMPLETE` is no longer used as the overall delivery status.
+- Excel RMU review colors and embedded color explanations now match the simplified App color system.
+
+## v0.8.22 - Structured RMU Resolution Workflow
+
+- Replaced free-form RMU `Comments` with a read-only **Resolution** summary.
+- Every FALSE RMU Analysis field now creates one independent Resolution decision row: N errors require N decisions.
+- Double-click a FALSE Analysis cell or the Resolution column to open the structured Resolution dialog.
+- Cross-source issues (NAME / FEEDER / SMART / TYPE / IP) allow the reviewer to select the authoritative source/value from the latest Validation.
+- LINK uses explicit action decisions because it is an ADMS-SLD association state rather than a cross-source value.
+- Supported decisions: `Use <Source>`, `Needs Action`, and `Accept Exception`; `Unresolved` clears an existing decision.
+- RMU Review is now derived from Resolution completeness: any unresolved issue -> Unreviewed; any Needs Action -> Needs Action; otherwise all active issues resolved -> Reviewed.
+- Changed source values automatically invalidate only the affected Resolution decision and return the RMU to Unreviewed while preserving Audit history.
+- Structured Resolution decisions are stored in SQLite, included in version snapshots, shown in Audit Log, and exported in the formal RMU Data Review workbook.
+- Pass RMUs remain manually reviewable; issue RMUs cannot be bulk-marked Reviewed without per-error decisions.
+- Added regression tests for per-error decision count, automatic Review derivation, Needs Action behavior, and selective invalidation after re-validation.
+
+## v0.8.21 - Station-Aware Feeder Consistency
+
+- FEEDER Analysis now compares the complete logical feeder identity: station/site token + feeder number.
+- Region/routing prefixes such as `JED-NTH` remain ignored, so `ABH-22` and `JED-NTH-ABH-22` are equivalent.
+- Same-number feeders from different stations are now correctly different: `ABH-22` != `ABN-22`.
+- ADMS `AH3xx` feeder encoding continues to be decoded while retaining the station token, e.g. `JED-NTH-ABH-AH322` -> `ABH-22`.
+- Numeric-only feeder values use the selected repository site's station token as a fallback identity.
+- FEEDER tooltips now state the station-aware rule explicitly and display station-aware normalized values.
+- Added regression coverage for cross-station same-number feeder mismatches.
+
 ## v0.8.20 - Actionable Review Navigation
 
 - RMU frozen Review cells can now be double-clicked to change the human Review state directly; the existing Set Review button remains available for multi-row review.

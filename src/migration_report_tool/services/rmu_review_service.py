@@ -14,6 +14,9 @@ from ..storage import ProjectStore
 
 def _consistency_tooltip(label: str, result) -> str:
     lines = [f"{label} consistency check"]
+    if label.upper() == "FEEDER":
+        lines.append("Rule: station/site token + feeder number must match; routing prefixes such as JED-NTH are ignored.")
+        lines.append("Example: ABH-22 = JED-NTH-ABH-22, but ABH-22 != ABN-22.")
     if not result.normalized_by_source:
         lines += ["", "No non-blank source values", "Result: N/A"]
         return "\n".join(lines)
@@ -31,6 +34,24 @@ def _consistency_tooltip(label: str, result) -> str:
         lines.append("Only one source has a value; blank sources are ignored by rule.")
     return "\n".join(lines)
 
+
+
+def _resolution_candidates(result) -> list[dict[str, str]]:
+    """Return structured source choices for one automatic consistency issue.
+
+    Raw and normalized values are kept together so Review can show exactly
+    what each source supplied without re-parsing tooltip text.
+    """
+    candidates = []
+    raw_by_source = getattr(result, "raw_by_source", {}) or {}
+    normalized_by_source = getattr(result, "normalized_by_source", {}) or {}
+    for source, normalized in normalized_by_source.items():
+        candidates.append({
+            "source": clean(source),
+            "value": clean(raw_by_source.get(source) or normalized),
+            "normalized": clean(normalized),
+        })
+    return candidates
 
 def _link_analysis(raw_value: object) -> tuple[str, str]:
     """Interpret ADMS-SLD LINK as the RMU association state.
@@ -249,6 +270,18 @@ def build_comparison(store: ProjectStore, adapter: SourceAdapter | None = None) 
             "analysis_type_detail": _consistency_tooltip("TYPE", type_result),
             "analysis_ip_detail": _consistency_tooltip("IP", ip_result),
             "analysis_link_detail": link_detail,
+            "resolution_candidates": {
+                "NAME": _resolution_candidates(name_result),
+                "FEEDER": _resolution_candidates(feeder_result),
+                "SMART": _resolution_candidates(smart_result),
+                "TYPE": _resolution_candidates(type_result),
+                "IP": _resolution_candidates(ip_result),
+                "LINK": ([{
+                    "source": "ADMS SLD",
+                    "value": asld_link_raw or "<blank>",
+                    "normalized": link_display or "FALSE",
+                }] if g else []),
+            },
             "status": status, "remarks": "; ".join(remarks), "comments": "",
         })
     summary = Counter(r["status"] for r in rows)

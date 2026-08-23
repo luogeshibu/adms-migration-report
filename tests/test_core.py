@@ -114,14 +114,14 @@ class AnalysisConsistencyTests(unittest.TestCase):
         self.assertTrue(compare_consistency({"A": "26859", "B": "26859"}, normalize_name).value)
         self.assertFalse(compare_consistency({"A": "26859", "B": "26860"}, normalize_name).value)
 
-    def test_feeder_normalization_ignores_site_prefix_and_zero_padding(self):
+    def test_feeder_normalization_keeps_station_and_ignores_region_prefix(self):
         from migration_report_tool.analysis import normalize_feeder_for_compare
         values = {
             normalize_feeder_for_compare("ABN2-03", "ABN2"),
             normalize_feeder_for_compare("JED-NTH-ABN2-3", "ABN2"),
             normalize_feeder_for_compare("JED NTH-ABN2-03", "ABN2"),
         }
-        self.assertEqual(values, {"3"})
+        self.assertEqual(values, {"ABN2-3"})
 
     def test_abh_feeder_normalization_decodes_adms_ah3_encoding(self):
         from migration_report_tool.analysis import normalize_feeder_for_compare
@@ -131,21 +131,21 @@ class AnalysisConsistencyTests(unittest.TestCase):
             normalize_feeder_for_compare("JED-NTH-ABH-3", "ABH"),
             normalize_feeder_for_compare("JED-NTH-ABH-AH303", "ABH"),
         }
-        self.assertEqual(equivalents_03, {"3"})
-        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH308", "ABH"), "8")
+        self.assertEqual(equivalents_03, {"ABH-3"})
+        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH308", "ABH"), "ABH-8")
         # Repository/site labels are not guaranteed to equal the feeder site token.
-        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH303", "JEDDAH_ABH"), "3")
-        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-3", "ABH110"), "3")
-        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH303", None), "3")
+        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH303", "JEDDAH_ABH"), "ABH-3")
+        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-3", "ABH110"), "ABH-3")
+        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABH-AH303", None), "ABH-3")
 
     def test_abn_adms_ah3_feeder_encoding_uses_logical_suffix_number(self):
         from migration_report_tool.analysis import normalize_feeder_for_compare
-        self.assertEqual(normalize_feeder_for_compare("ABN-12", "1-ABN"), "12")
-        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABN-12", "1-ABN"), "12")
-        self.assertEqual(normalize_feeder_for_compare("ABN-AH312", "1-ABN"), "12")
-        self.assertEqual(normalize_feeder_for_compare("ABN-1", "1-ABN"), "1")
-        self.assertEqual(normalize_feeder_for_compare("ABN-01", "1-ABN"), "1")
-        self.assertEqual(normalize_feeder_for_compare("ABN-AH301", "1-ABN"), "1")
+        self.assertEqual(normalize_feeder_for_compare("ABN-12", "1-ABN"), "ABN-12")
+        self.assertEqual(normalize_feeder_for_compare("JED-NTH-ABN-12", "1-ABN"), "ABN-12")
+        self.assertEqual(normalize_feeder_for_compare("ABN-AH312", "1-ABN"), "ABN-12")
+        self.assertEqual(normalize_feeder_for_compare("ABN-1", "1-ABN"), "ABN-1")
+        self.assertEqual(normalize_feeder_for_compare("ABN-01", "1-ABN"), "ABN-1")
+        self.assertEqual(normalize_feeder_for_compare("ABN-AH301", "1-ABN"), "ABN-1")
 
     def test_abn_feeder_consistency_matches_user_examples(self):
         from migration_report_tool.analysis import compare_consistency, normalize_feeder_for_compare
@@ -163,7 +163,7 @@ class AnalysisConsistencyTests(unittest.TestCase):
             "ADMS DB": "ABN-AH301",
         }, normalizer)
         self.assertTrue(result_1.value)
-        self.assertEqual(set(result_1.normalized_by_source.values()), {"1"})
+        self.assertEqual(set(result_1.normalized_by_source.values()), {"ABN-1"})
 
     def test_unknown_abh_feeder_encoding_is_not_guessed(self):
         from migration_report_tool.analysis import normalize_feeder_for_compare
@@ -185,10 +185,30 @@ class AnalysisConsistencyTests(unittest.TestCase):
             "ADMS DB": "JED-NTH-ABH-AH303",
         }, normalizer)
         self.assertFalse(mismatch.value)
-        self.assertEqual(mismatch.normalized_by_source["SE"], "3")
-        self.assertEqual(mismatch.normalized_by_source["ZENON SLD XML"], "3")
-        self.assertEqual(mismatch.normalized_by_source["ADMS DB"], "3")
-        self.assertEqual(mismatch.normalized_by_source["ZENON DB"], "40")
+        self.assertEqual(mismatch.normalized_by_source["SE"], "ABH-3")
+        self.assertEqual(mismatch.normalized_by_source["ZENON SLD XML"], "ABH-3")
+        self.assertEqual(mismatch.normalized_by_source["ADMS DB"], "ABH-3")
+        self.assertEqual(mismatch.normalized_by_source["ZENON DB"], "DHN-40")
+
+    def test_same_number_different_station_is_feeder_mismatch(self):
+        from migration_report_tool.analysis import compare_consistency, normalize_feeder_for_compare
+        normalizer = lambda value: normalize_feeder_for_compare(value, "1-ABH")
+        result = compare_consistency({
+            "SE": "ABH-22",
+            "ZENON DB": "JED-NTH-ABH-22",
+            "ZENON SLD XML": "JED-NTH-ABH-22",
+            "ADMS DB": "JED-NTH-ABN-22",
+        }, normalizer)
+        self.assertFalse(result.value)
+        self.assertEqual(result.normalized_by_source["SE"], "ABH-22")
+        self.assertEqual(result.normalized_by_source["ZENON DB"], "ABH-22")
+        self.assertEqual(result.normalized_by_source["ZENON SLD XML"], "ABH-22")
+        self.assertEqual(result.normalized_by_source["ADMS DB"], "ABN-22")
+
+    def test_numeric_only_feeder_uses_selected_station_hint(self):
+        from migration_report_tool.analysis import normalize_feeder_for_compare
+        self.assertEqual(normalize_feeder_for_compare("22", "1-ABH"), "ABH-22")
+        self.assertEqual(normalize_feeder_for_compare("22", "1-ABN"), "ABN-22")
 
     def test_zero_placeholder_handling(self):
         from migration_report_tool.analysis import normalize_feeder_for_compare, normalize_type, normalize_smart

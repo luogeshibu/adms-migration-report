@@ -42,3 +42,8 @@ Row color communicates **severity**, not a specific field combination:
 
 The Analysis block stays neutral. Only FALSE cells identify the exact problem:
 NAME red, FEEDER yellow, SMART blue, TYPE orange. This replaces the old special FEEDER+TYPE purple row rule and scales to any future combination.
+
+
+## Structured RMU Resolution (v0.8.22+)
+
+RMU free-form Comments are no longer part of the formal review workflow. Each active FALSE Analysis field requires exactly one structured Resolution decision. Cross-source mismatches can select one authoritative source/value; LINK uses action decisions. Review remains Unreviewed until every active issue has a decision, becomes Needs Action when any decision requires correction, and becomes Reviewed when all active issues are resolved without Needs Action. Re-validation invalidates stale decisions when their issue fingerprint changes while preserving Audit history.

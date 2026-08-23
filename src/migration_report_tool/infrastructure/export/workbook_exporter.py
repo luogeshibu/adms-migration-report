@@ -63,13 +63,13 @@ WHITE = "FFFFFF"
 
 ROW_PASS = "EAF7F0"
 ROW_ONE_ISSUE = "FFF8D8"
-ROW_TWO_ISSUES = "FFF0E0"
+ROW_TWO_ISSUES = "FFF8D8"
 ROW_CRITICAL = "FDECEC"
 
 FALSE_NAME = "F7D7D7"
-FALSE_FEEDER = "FFF0A8"
-FALSE_SMART = "D8E9FF"
-FALSE_TYPE = "FFDDB8"
+FALSE_FEEDER = "F7D7D7"
+FALSE_SMART = "F7D7D7"
+FALSE_TYPE = "F7D7D7"
 
 REVIEWED = "EAF7F0"
 NEEDS_ACTION = "FFF0E0"
@@ -192,22 +192,18 @@ def _add_rmu_color_explanation(ws) -> None:
     """Keep the export compact while embedding the App color meaning in Excel."""
     explanation = (
         "RMU Data Review color rules:\n"
-        "Row status: Pass = pale green; 1 Issue = pale yellow; 2 Issues = pale orange; "
-        "Critical = pale red. NAME=FALSE is always Critical; 3+ FALSE fields are also Critical.\n"
-        "FALSE field colors: NAME = red, FEEDER = yellow, SMART = blue, TYPE = orange, IP = violet, LINK = rose.\n"
-        "Analysis / Remarks / Comments stay neutral; row status color starts at Index and continues through source data."
+        "Pass = pale green; any non-critical issue row = pale yellow; Critical = pale red. "
+        "NAME=FALSE is always Critical; 3+ FALSE fields are also Critical.\n"
+        "Every FALSE Analysis cell uses the same pale-red mismatch highlight. The column name identifies the failed field.\n"
+        "Analysis / Remarks / Resolution stay neutral; row status color starts at Index and continues through source data."
     )
     ws["A1"].comment = Comment(explanation, "NARI Saudi ADMS Migration Report")
     # Add field-specific comments to the four Analysis subheaders when present.
     for cell in ws[2]:
         label = str(cell.value or "").strip().upper()
         if label in {"NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK"}:
-            color_name = {
-                "NAME": "red", "FEEDER": "yellow", "SMART": "blue", "TYPE": "orange",
-                "IP": "violet", "LINK": "rose",
-            }[label]
             cell.comment = Comment(
-                f"FALSE means {label} is inconsistent across available sources and is highlighted {color_name}.",
+                f"FALSE means {label} is inconsistent across available sources. All FALSE cells use the same mismatch highlight.",
                 "NARI Saudi ADMS Migration Report",
             )
 
@@ -228,7 +224,7 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
     columns = _write_grouped_headers(
         ws,
         rmu_groups,
-        vertical_merge_groups={"Remarks", "Comments"},
+        vertical_merge_groups={"Remarks", "Resolution"},
     )
     _add_rmu_color_explanation(ws)
     analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "analysis_link"}
@@ -241,12 +237,16 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
         rmu = str(data.get("rmu", "") or "").strip()
         review_status = str(review_map.get(rmu, {}).get("review_status") or "UNREVIEWED").strip().upper()
         for col_idx, (key, _label, _width) in enumerate(columns, 1):
-            value = review_status if key == "rmu_review_status" else data.get(key, "")
+            value = (
+                review_status if key == "rmu_review_status"
+                else store.rmu_resolution_summary(rmu) if key == "comments"
+                else data.get(key, "")
+            )
             if value is None:
                 value = ""
             cell = ws.cell(row_idx, col_idx, value)
 
-            # App contract: Analysis / Remarks / Comments stay neutral. Only a
+            # App contract: Analysis / Remarks / Resolution stay neutral. Only a
             # FALSE Analysis cell is emphasized. Index + source data carry the
             # row-level business status color.
             fill = WHITE if key in neutral_review_keys else row_fill
@@ -261,8 +261,8 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
             _body_cell(cell, fill=fill, bold=bold, center=center, wrap=wrap)
         ws.row_dimensions[row_idx].height = 22
 
-    # Freeze the full App review block (Review + Analysis + Remarks + Comments + Index).
-    review_width = sum(len(cols) for group, _color, cols in rmu_groups if group in {"Review", "Analysis", "Remarks", "Comments", "Index"})
+    # Freeze the full App review block (Review + Analysis + Remarks + Resolution + Index).
+    review_width = sum(len(cols) for group, _color, cols in rmu_groups if group in {"Review", "Analysis", "Remarks", "Resolution", "Index"})
     ws.freeze_panes = f"{get_column_letter(review_width + 1)}3"
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.pageSetUpPr.fitToPage = True

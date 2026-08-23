@@ -73,7 +73,7 @@ from ..core import (
     import_source,
 )
 from ..db_smart import DBSmartReport, build_signal_mapping_report
-from ..review_status import analysis_review_state, field_false_color
+from ..review_status import analysis_review_state
 
 from ..config.sources import schema_for
 from ..config.source_modules import MODULE_SOURCE_GROUPS
@@ -266,6 +266,7 @@ REPORT_HEADER_COLORS = {
     "Analysis": ("#E8EDF3", "#F4F6F8", "#24364B"),
     "Remarks": ("#E8EDF3", "#F4F6F8", "#24364B"),
     "Comments": ("#E8EDF3", "#F4F6F8", "#24364B"),
+    "Resolution": ("#E8EDF3", "#F4F6F8", "#24364B"),
     "Review": ("#E8EDF3", "#F4F6F8", "#24364B"),
     "ZENON": ("#E8EDF3", "#F4F6F8", "#24364B"),
     "ADMS": ("#E8EDF3", "#F4F6F8", "#24364B"),
@@ -353,7 +354,7 @@ class GroupedReportHeader(QHeaderView):
             top_color, bottom_color, text_color = REPORT_HEADER_COLORS.get(
                 group, ("#E5E7EB", "#F3F4F6", "#18212F")
             )
-            if group in {"Remarks", "Comments"}:
+            if group in {"Remarks", "Comments", "Resolution"}:
                 continue
 
             bottom_rect = self._section_rect(index, self.TOP_HEIGHT, self.BOTTOM_HEIGHT)
@@ -378,7 +379,7 @@ class GroupedReportHeader(QHeaderView):
             top_color, bottom_color, text_color = REPORT_HEADER_COLORS.get(
                 group, ("#E5E7EB", "#F3F4F6", "#18212F")
             )
-            if group in {"Remarks", "Comments"}:
+            if group in {"Remarks", "Comments", "Resolution"}:
                 rect = QRect(left, 0, right - left, self.TOP_HEIGHT + self.BOTTOM_HEIGHT)
             else:
                 rect = QRect(left, 0, right - left, self.TOP_HEIGHT)
@@ -670,6 +671,138 @@ class EditValueDialog(QDialog):
         reason = self.reason_edit.toPlainText().strip() or "Manual correction"
         value = self.value_edit.toPlainText() if self.multiline else self.value_edit.text()
         return value.strip(), reason
+
+
+class RMUResolutionDialog(QDialog):
+    """One structured decision row for every active RMU Analysis error.
+
+    A reviewer never types free-form Comments here.  Each FALSE field receives
+    its own decision selector, so N automatic errors always require N explicit
+    Resolution decisions before Review can become Reviewed.
+    """
+
+    FIELD_ORDER = ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK")
+
+    def __init__(self, rmu: str, row_data: dict, current_resolutions: dict, parent=None):
+        super().__init__(parent)
+        self.rmu = clean(rmu)
+        self.row_data = row_data or {}
+        self.current_resolutions = current_resolutions or {}
+        self.issue_fields = [
+            field for field in self.FIELD_ORDER
+            if clean(self.row_data.get(f"analysis_{field.lower()}" )).upper() == "FALSE"
+        ]
+        self.combos: dict[str, QComboBox] = {}
+
+        self.setWindowTitle(f"Resolve RMU {self.rmu} Issues")
+        self.resize(980, min(760, 300 + max(1, len(self.issue_fields)) * 95))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(10)
+
+        title = QLabel(f"RMU {self.rmu} · {len(self.issue_fields)} issue{'s' if len(self.issue_fields) != 1 else ''} require {len(self.issue_fields)} Resolution decision{'s' if len(self.issue_fields) != 1 else ''}")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+        desc = QLabel(
+            "Choose one decision for every FALSE Analysis field. Source choices use the exact values found during the latest Validation. "
+            "If any issue remains Unresolved, Review stays Unreviewed. If any issue is marked Needs Action, Review becomes Needs Action."
+        )
+        desc.setObjectName("Muted")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        table = QTableWidget(len(self.issue_fields), 3)
+        table.setHorizontalHeaderLabels(["Issue", "Source Values from Validation", "Resolution Decision"] )
+        table.verticalHeader().setVisible(False)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setWordWrap(True)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        table.setColumnWidth(0, 115)
+        table.setColumnWidth(2, 330)
+        table.horizontalHeader().setMinimumHeight(38)
+
+        candidates_by_field = self.row_data.get("resolution_candidates") or {}
+        for row_index, field in enumerate(self.issue_fields):
+            issue_item = QTableWidgetItem(field)
+            font = issue_item.font(); font.setBold(True); issue_item.setFont(font)
+            issue_item.setTextAlignment(Qt.AlignCenter)
+            issue_item.setBackground(QColor("#F7D7D7"))
+            issue_item.setToolTip(clean(self.row_data.get(f"analysis_{field.lower()}_detail")))
+            table.setItem(row_index, 0, issue_item)
+
+            candidates = list(candidates_by_field.get(field, []) or [])
+            source_lines = []
+            for candidate in candidates:
+                source = clean(candidate.get("source"))
+                raw = clean(candidate.get("value"))
+                normalized = clean(candidate.get("normalized"))
+                line = f"{source}: {raw or '<blank>'}"
+                if normalized and normalized != raw:
+                    line += f"  →  {normalized}"
+                source_lines.append(line)
+            if field == "LINK" and not source_lines:
+                source_lines.append("ADMS SLD LINK: <missing>")
+            values_item = QTableWidgetItem("\n".join(source_lines) or "No selectable source value is available")
+            values_item.setToolTip(clean(self.row_data.get(f"analysis_{field.lower()}_detail")))
+            table.setItem(row_index, 1, values_item)
+
+            combo = QComboBox()
+            combo.setToolTip(f"Select exactly one Resolution for {field}")
+            combo.addItem("Unresolved", None)
+            # Cross-source mismatches allow the reviewer to choose which source
+            # is authoritative. LINK is an ADMS association flag rather than a
+            # multi-source value, so it uses action decisions only.
+            if field != "LINK":
+                for candidate in candidates:
+                    source = clean(candidate.get("source"))
+                    raw = clean(candidate.get("value"))
+                    normalized = clean(candidate.get("normalized"))
+                    label = f"Use {source} — {raw or normalized or '<blank>'}"
+                    if normalized and raw and normalized != raw:
+                        label += f"  → {normalized}"
+                    combo.addItem(label, {
+                        "decision_type": "USE_SOURCE",
+                        "selected_source": source,
+                        "selected_value": raw,
+                        "normalized_value": normalized,
+                    })
+            combo.addItem("Needs Action — correction required", {"decision_type": "NEEDS_ACTION"})
+            combo.addItem("Accept Exception — no source correction", {"decision_type": "ACCEPT_EXCEPTION"})
+
+            current = self.current_resolutions.get(field) or {}
+            if current:
+                decision = clean(current.get("decision_type")).upper()
+                source = clean(current.get("selected_source"))
+                for index in range(combo.count()):
+                    data = combo.itemData(index)
+                    if not isinstance(data, dict):
+                        continue
+                    if clean(data.get("decision_type")).upper() != decision:
+                        continue
+                    if decision != "USE_SOURCE" or clean(data.get("selected_source")) == source:
+                        combo.setCurrentIndex(index)
+                        break
+            self.combos[field] = combo
+            table.setCellWidget(row_index, 2, combo)
+            table.setRowHeight(row_index, max(56, 24 + 18 * max(1, len(source_lines))))
+
+        layout.addWidget(table, 1)
+        footer = QLabel("Review is derived automatically: all issues resolved → Reviewed; any Needs Action → Needs Action; any Unresolved → Unreviewed.")
+        footer.setObjectName("Muted")
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.button(QDialogButtonBox.Save).setText("Save Resolutions")
+        buttons.button(QDialogButtonBox.Save).setObjectName("Primary")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def decisions(self) -> dict[str, dict | None]:
+        return {field: combo.currentData() for field, combo in self.combos.items()}
 
 
 class ColumnVisibilityDialog(QDialog):
@@ -1651,7 +1784,7 @@ class MainWindow(QMainWindow):
         cbox = QHBoxLayout(controls)
         cbox.setContentsMargins(14, 10, 14, 10)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search RMU, feeder, IP, type, remarks, comments...")
+        self.search_edit.setPlaceholderText("Search RMU, feeder, IP, type, remarks, resolution...")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self.refresh_comparison)
         self.search_edit.setMinimumWidth(330)
@@ -1700,32 +1833,31 @@ class MainWindow(QMainWindow):
         summary_box.setContentsMargins(12, 9, 12, 9)
         summary_box.setSpacing(3)
         summary_box.addWidget(self.comparison_summary)
-        rmu_review_guide = QLabel(
-            "Review workflow: Analysis is automatic. Mark Reviewed after verification; use Needs Action when correction is required. "
-            "If a later source refresh changes this RMU's validation result, Review automatically returns to Unreviewed; Comments and Audit history are preserved."
+        self.comparison_review_progress = QLabel("Review 0 / 0 · Resolution 0 / 0 issues")
+        self.comparison_review_progress.setObjectName("Muted")
+        self.comparison_review_progress.setWordWrap(True)
+        self.comparison_review_progress.setToolTip(
+            "Review is the human workflow state. Resolution counts structured decisions for active FALSE Analysis fields."
         )
-        rmu_review_guide.setObjectName("Muted")
-        rmu_review_guide.setWordWrap(True)
-        summary_box.addWidget(rmu_review_guide)
+        summary_box.addWidget(self.comparison_review_progress)
         layout.addWidget(summary_card)
 
-        # Business-color legend.  The review block (Analysis / Remarks /
-        # Comments) deliberately stays neutral; only FALSE Analysis cells are
-        # highlighted.  Row colors start at No./RMU and continue across the
-        # source-data columns.
+        # Minimal review legend: three row severities plus one universal FALSE
+        # mismatch highlight. The field name itself identifies the issue, so
+        # NAME/FEEDER/SMART/TYPE/IP/LINK do not need separate colors.
         legend = QFrame()
         legend.setObjectName("SoftCard")
         legend_box = QHBoxLayout(legend)
         legend_box.setContentsMargins(12, 7, 12, 7)
         legend_box.setSpacing(10)
-        legend_title = QLabel("Row status")
+        legend_title = QLabel("Analysis")
         legend_title.setStyleSheet("font-weight:700;")
         legend_box.addWidget(legend_title)
         for color, label, tip in [
             ("#EAF7F0", "Pass", "No Analysis field is FALSE"),
-            ("#FFF8D8", "1 Issue", "Exactly one Analysis field is FALSE"),
-            ("#FFF0E0", "2 Issues", "Exactly two Analysis fields are FALSE"),
-            ("#FDECEC", "Critical / NAME", "Three or more issues, or NAME is FALSE"),
+            ("#FFF8D8", "Has Issues", "One or two Analysis fields are FALSE"),
+            ("#FDECEC", "Critical", "NAME is FALSE or three or more Analysis fields are FALSE"),
+            ("#F7D7D7", "FALSE = mismatch", "All FALSE Analysis cells use the same mismatch highlight"),
         ]:
             swatch = QLabel()
             swatch.setFixedSize(13, 13)
@@ -1736,32 +1868,9 @@ class MainWindow(QMainWindow):
             text.setToolTip(tip)
             legend_box.addWidget(swatch)
             legend_box.addWidget(text)
-
-        field_title = QLabel("FALSE field")
-        field_title.setStyleSheet("font-weight:700;")
-        legend_box.addSpacing(8)
-        legend_box.addWidget(field_title)
-        for color, label, tip in [
-            ("#F7D7D7", "NAME", "RMU / cabinet name mismatch; row is Critical"),
-            ("#FFF0A8", "FEEDER", "Feeder mismatch"),
-            ("#D8E9FF", "SMART", "SMART / NORMAL mismatch"),
-            ("#FFDDB8", "TYPE", "RMU cabinet type mismatch"),
-            ("#E6DEFF", "IP", "Driver info IP and ADMS Channel IP mismatch"),
-            ("#F5DCEE", "LINK", "ADMS SLD reports that the RMU is not linked"),
-        ]:
-            swatch = QLabel()
-            swatch.setFixedSize(13, 13)
-            swatch.setStyleSheet(f"background:{color};border:1px solid #C9D2DC;border-radius:3px;")
-            swatch.setToolTip(tip)
-            text = QLabel(label)
-            text.setObjectName("Muted")
-            text.setToolTip(tip)
-            legend_box.addWidget(swatch)
-            legend_box.addWidget(text)
-
-        note = QLabel("Row color = severity; FALSE cell color = exact mismatch. Review fields stay neutral.")
+        note = QLabel("The column name identifies which field failed; Review and Resolution stay neutral.")
         note.setObjectName("Muted")
-        legend_box.addSpacing(6)
+        legend_box.addSpacing(8)
         legend_box.addWidget(note)
         legend_box.addStretch()
         layout.addWidget(legend)
@@ -1882,7 +1991,7 @@ class MainWindow(QMainWindow):
                     (f" · Mismatch: {', '.join(state.false_fields)}" if state.false_fields else "")
                 )
                 if c == 3:
-                    tooltip += " · Double-click Review to change the human review state"
+                    tooltip += " · Double-click: pass rows set Review directly; issue rows open structured Resolution"
                 item.setToolTip(tooltip)
                 if c < 2:
                     item.setBackground(QColor("#FFFFFF"))
@@ -2457,14 +2566,14 @@ class MainWindow(QMainWindow):
     # ------------------------- manual changes -------------------------
     def _build_changes_page(self):
         page, layout = self._page_container()
-        layout.addWidget(PageHeader("Change Audit", "Read-only trace of migration-review corrections, display-name changes and SE comments saved for project handover and traceability."))
+        layout.addWidget(PageHeader("Change Audit", "Read-only trace of migration-review corrections, structured RMU Resolutions, display-name changes and Signal Mapping comments saved for project handover and traceability."))
         info = QFrame()
         info.setObjectName("SoftCard")
         ibox = QVBoxLayout(info)
         ibox.setContentsMargins(16, 12, 16, 12)
         ititle = QLabel("What is the Audit Log?")
         ititle.setObjectName("SectionTitle")
-        idesc = QLabel("Whenever a reviewer changes an RMU Data Review value, edits SE Comments, or reviews a Signal Mapping Review row, the application stores the record, field, original value, new value, reason, Windows user and timestamp. This page is intentionally read-only and is used for traceability, review handover and version auditing.")
+        idesc = QLabel("Whenever a reviewer changes an RMU Data Review value, selects a structured RMU Resolution, or reviews a Signal Mapping row, the application stores the record, field, original value, new value, reason, Windows user and timestamp. This page is intentionally read-only and is used for traceability, review handover and version auditing.")
         idesc.setWordWrap(True)
         idesc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         idesc.setObjectName("Muted")
@@ -2519,7 +2628,7 @@ class MainWindow(QMainWindow):
         self.versions_stack.addWidget(self.versions_table)
         self.versions_empty = EmptyState(
             "No saved versions yet",
-            "Save a named version before handover or another migration cycle. Version snapshots preserve RMU Data Review state, SE Comments and Signal Mapping review metadata.",
+            "Save a named version before handover or another migration cycle. Version snapshots preserve RMU Data Review state, structured Resolutions and Signal Mapping review metadata.",
         )
         self.versions_stack.addWidget(self.versions_empty)
         layout.addWidget(self.versions_stack, 1)
@@ -3315,13 +3424,78 @@ class MainWindow(QMainWindow):
                 result.append(rmu)
         return result
 
+    def _comparison_row_by_rmu(self, rmu: str) -> dict | None:
+        if not self.store:
+            return None
+        target = clean(rmu)
+        return next((row for row in self.store.rows() if clean(row.get("rmu")) == target), None)
+
+    def open_rmu_resolution_dialog(self, rmu: str) -> None:
+        if not self.store:
+            return
+        data = self._comparison_row_by_rmu(rmu)
+        if not data:
+            return
+        state = analysis_review_state(data)
+        if state.issue_count <= 0:
+            QMessageBox.information(
+                self, "RMU Resolution",
+                f"RMU {rmu} has no active Analysis mismatch. No Resolution decision is required."
+            )
+            return
+        current = self.store.rmu_resolution_map(rmu)
+        dialog = RMUResolutionDialog(rmu, data, current, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        decisions = dialog.decisions()
+        for field in state.false_fields:
+            payload = decisions.get(field)
+            if not payload:
+                self.store.clear_rmu_resolution(
+                    rmu, field, self.user_name, reason="RMU Resolution set to Unresolved"
+                )
+                continue
+            self.store.set_rmu_resolution(
+                rmu=rmu, analysis_field=field, decision_type=payload.get("decision_type", ""),
+                selected_source=payload.get("selected_source", ""),
+                selected_value=payload.get("selected_value", ""),
+                normalized_value=payload.get("normalized_value", ""),
+                analysis_fingerprint=self.store._rmu_field_fingerprint(data, field),
+                modified_by=self.user_name,
+                reason="Structured RMU Resolution decision",
+            )
+        review_status = self.store.sync_rmu_review_from_resolutions(rmu, data, self.user_name)
+        summary = self.store.rmu_resolution_summary(rmu) or "Unresolved"
+        self.refresh_all()
+        self._select_comparison_rmu(rmu)
+        self.statusBar().showMessage(
+            f"RMU {rmu} Resolution saved · Review: {review_status} · {summary}", 7000
+        )
+
     def set_comparison_review_status(self):
         if not self.store:
             return
         rmus = self._selected_comparison_rmus()
         if not rmus:
-            QMessageBox.information(self, "RMU Review Status", "Select one or more RMU rows first.")
+            QMessageBox.information(self, "RMU Review", "Select one or more RMU rows first.")
             return
+        issue_rmus = []
+        for rmu in rmus:
+            data = self._comparison_row_by_rmu(rmu)
+            if data and analysis_review_state(data).issue_count > 0:
+                issue_rmus.append(rmu)
+        if issue_rmus:
+            if len(rmus) == 1:
+                self.open_rmu_resolution_dialog(rmus[0])
+            else:
+                QMessageBox.information(
+                    self, "Structured Resolution required",
+                    f"{len(issue_rmus)} selected RMU(s) contain Analysis errors.\n\n"
+                    "Each error requires its own Resolution decision, so issue rows cannot be bulk-marked Reviewed. "
+                    "Open each issue RMU and resolve every FALSE field. Pass rows can still be reviewed in bulk."
+                )
+            return
+
         review_map = self.store.rmu_review_map()
         statuses = ["UNREVIEWED", "REVIEWED", "NEEDS ACTION"]
         display_options = ["Unreviewed", "Reviewed", "Needs Action"]
@@ -3330,8 +3504,8 @@ class MainWindow(QMainWindow):
         selected_label, ok = QInputDialog.getItem(
             self,
             "Set RMU Review",
-            (f"RMU {rmus[0]}" if len(rmus) == 1 else f"{len(rmus)} selected RMUs") +
-            "\nReviewed = verified/accepted · Needs Action = correction required",
+            (f"RMU {rmus[0]}" if len(rmus) == 1 else f"{len(rmus)} selected pass RMUs") +
+            "\nPass rows have no mismatch Resolution requirement.",
             display_options,
             index,
             False,
@@ -3342,7 +3516,7 @@ class MainWindow(QMainWindow):
         for rmu in rmus:
             self.store.update_rmu_review_status(
                 rmu=rmu, review_status=value, modified_by=self.user_name,
-                reason="RMU Data Review status changed",
+                reason="RMU Data Review status changed for pass row",
             )
         self.refresh_all()
         if len(rmus) == 1:
@@ -3353,22 +3527,37 @@ class MainWindow(QMainWindow):
         if not self.store:
             return
         field, label, _ = COMPARISON_COLUMNS[column_index]
-        if field not in EDITABLE_COLUMNS:
-            QMessageBox.information(self, "Read-only field", f"{label} is generated as a protected key and cannot be edited here.")
-            return
         rmu_col = next((i for i, (key, _label, _width) in enumerate(COMPARISON_COLUMNS) if key == "rmu"), -1)
         rmu_item = self.comparison_table.item(row_index, rmu_col) if rmu_col >= 0 else None
         value_item = self.comparison_table.item(row_index, column_index)
         if not rmu_item:
             return
         rmu = rmu_item.text()
-        old_value = value_item.text() if value_item else ""
-        dialog = EditValueDialog(rmu, label, old_value, self, multiline=field in {"remarks", "comments"})
+        value = value_item.text() if value_item else ""
+        analysis_fields = {
+            "analysis_name", "analysis_feeder", "analysis_smart",
+            "analysis_type", "analysis_ip", "analysis_link",
+        }
+        if field == "comments":
+            self.open_rmu_resolution_dialog(rmu)
+            return
+        if field in analysis_fields:
+            if clean(value).upper() == "FALSE":
+                self.open_rmu_resolution_dialog(rmu)
+            else:
+                QMessageBox.information(
+                    self, "Automatic Analysis",
+                    f"{label} is calculated automatically. Resolution is required only when the Analysis result is FALSE."
+                )
+            return
+        if field not in EDITABLE_COLUMNS:
+            QMessageBox.information(self, "Read-only field", f"{label} is generated as a protected key and cannot be edited here.")
+            return
+        old_value = value
+        dialog = EditValueDialog(rmu, label, old_value, self, multiline=field in {"remarks"})
         if dialog.exec() != QDialog.Accepted:
             return
         new_value, reason = dialog.values()
-        if field == "comments" and reason == "Manual correction":
-            reason = "SE user comment / modification advice"
         if clean(new_value) == clean(old_value):
             return
         self.store.update_value(rmu, field, new_value, self.user_name, reason)
@@ -3487,20 +3676,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _analysis_cell_fill(key: str, value: str) -> QColor | None:
-        # TRUE stays neutral in the review block. Only FALSE identifies the
-        # exact business field using its stable field color.
-        if value.upper() != "FALSE":
-            return None
-        labels = {
-            "analysis_name": "NAME",
-            "analysis_feeder": "FEEDER",
-            "analysis_smart": "SMART",
-            "analysis_type": "TYPE",
-            "analysis_ip": "IP",
-            "analysis_link": "LINK",
-        }
-        color = field_false_color(labels.get(key, ""))
-        return QColor("#" + color) if color else QColor("#F5E1E1")
+        # One universal FALSE highlight keeps the Analysis grid readable. The
+        # column header already identifies NAME / FEEDER / SMART / TYPE / IP / LINK.
+        return QColor("#F7D7D7") if value.upper() == "FALSE" else None
 
     def refresh_comparison(self):
         if not hasattr(self, "comparison_table"):
@@ -3508,6 +3686,8 @@ class MainWindow(QMainWindow):
         self.comparison_table.setRowCount(0)
         if not self.store:
             self.comparison_summary.setText("No site selected")
+            if hasattr(self, "comparison_review_progress"):
+                self.comparison_review_progress.setText("Review 0 / 0 · Resolution 0 / 0 issues")
             if hasattr(self, "comparison_locator"):
                 self.comparison_locator.setRowCount(0)
             return
@@ -3524,7 +3704,9 @@ class MainWindow(QMainWindow):
                 continue
             if not self._analysis_filter_match(data, analysis_filter):
                 continue
-            if term and term not in " | ".join(clean(data.get(k)) for k, _, _ in COLUMNS).lower():
+            resolution_summary = self.store.rmu_resolution_summary(rmu)
+            searchable = " | ".join(clean(data.get(k)) for k, _, _ in COLUMNS) + " | " + resolution_summary
+            if term and term not in searchable.lower():
                 continue
             shown.append((data, review_status))
 
@@ -3533,8 +3715,10 @@ class MainWindow(QMainWindow):
         neutral_review_keys = analysis_keys | {"remarks", "comments"}
         for r, (data, tag) in enumerate(shown):
             row_fill = self._analysis_row_fill(data)
+            rmu = clean(data.get("rmu"))
+            resolution_summary = self.store.rmu_resolution_summary(rmu)
             for c, (key, _label, _) in enumerate(COMPARISON_COLUMNS):
-                value = clean(data.get(key, ""))
+                value = resolution_summary if key == "comments" else clean(data.get(key, ""))
                 item = QTableWidgetItem(value)
                 # The review block stays visually neutral.  Starting with
                 # No./RMU, all actual source-data columns carry the row-level
@@ -3551,7 +3735,14 @@ class MainWindow(QMainWindow):
                     item.setFont(font)
                     item.setTextAlignment(Qt.AlignCenter)
                 else:
-                    item.setToolTip(value)
+                    if key == "comments":
+                        tooltip = self.store.rmu_resolution_tooltip(rmu)
+                        state = analysis_review_state(data)
+                        if state.issue_count > 0:
+                            tooltip += "\n\nDouble-click to resolve every active FALSE Analysis field."
+                        item.setToolTip(tooltip)
+                    else:
+                        item.setToolTip(value)
                 if key in {"no", "rmu"}:
                     font = item.font()
                     font.setBold(True)
@@ -3592,6 +3783,30 @@ class MainWindow(QMainWindow):
         self.comparison_summary.setText(
             f"Total {len(rows)} · Shown {len(shown)} · {issue_text}"
         )
+
+        active_rmus = [clean(row.get("rmu")) for row in rows if clean(row.get("rmu"))]
+        active_rmus = list(dict.fromkeys(active_rmus))
+        review_counts = Counter(
+            clean(review_map.get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
+            for rmu in active_rmus
+        )
+        reviewed_or_action = review_counts["REVIEWED"] + review_counts["NEEDS ACTION"]
+        review_pct = int(round((reviewed_or_action / len(active_rmus) * 100.0) if active_rmus else 0.0))
+        all_resolutions = self.store.rmu_resolution_map()
+        total_issue_decisions = 0
+        resolved_issue_decisions = 0
+        for row in rows:
+            rmu = clean(row.get("rmu"))
+            state = analysis_review_state(row)
+            total_issue_decisions += state.issue_count
+            saved = all_resolutions.get(rmu, {}) if isinstance(all_resolutions, dict) else {}
+            resolved_issue_decisions += sum(1 for field in state.false_fields if field in saved)
+        if hasattr(self, "comparison_review_progress"):
+            self.comparison_review_progress.setText(
+                f"Review {reviewed_or_action} / {len(active_rmus)} · {review_pct}% · "
+                f"Resolution {resolved_issue_decisions} / {total_issue_decisions} issues · "
+                f"Needs Action {review_counts['NEEDS ACTION']}"
+            )
 
 
     def _select_comparison_rmu(self, rmu: str):
@@ -3659,33 +3874,48 @@ class MainWindow(QMainWindow):
         self, *, sources_complete: bool, validation_complete: bool,
         review_total: int, reviewed: int, needs_action: int, report_exported: bool,
     ) -> None:
+        """Refresh the current delivery stage from live validation/review state.
+
+        Validation completion is a technical milestone, not the final project
+        status. Once validation exists, the top-right status represents the
+        human Review stage until every active RMU and signal record has been
+        processed and no Needs Action remains.
+        """
         processed = reviewed + needs_action
         unreviewed = max(0, review_total - processed)
+        review_pct = int(round((processed / review_total * 100.0) if review_total else 0.0))
         review_complete = bool(review_total) and unreviewed == 0 and needs_action == 0
 
         if not sources_complete:
             state = "SOURCES INCOMPLETE"
+            display_state = state
         elif not validation_complete:
-            state = "READY FOR VALIDATION"
+            state = "VALIDATION REQUIRED"
+            display_state = state
         elif needs_action:
             state = "ACTION REQUIRED"
+            display_state = f"ACTION REQUIRED · {needs_action}"
         elif review_complete:
             state = "READY FOR EXPORT"
-        elif processed:
-            state = "REVIEW IN PROGRESS"
+            display_state = state
         else:
-            state = "VALIDATION COMPLETE"
+            state = "REVIEW PENDING"
+            display_state = f"REVIEW PENDING · {review_pct}%"
 
         self.project_delivery_state = state
         if hasattr(self, "project_state_label"):
-            self.project_state_label.setText(f"STATUS · {state}")
+            self.project_state_label.setText(f"STATUS · {display_state}")
             if state in {"ACTION REQUIRED", "SOURCES INCOMPLETE"}:
                 self.project_state_label.setStyleSheet(
                     "color:#8B3A2B;background:#FFF1EF;border:1px solid #F0C3BC;border-radius:9px;padding:4px 9px;font-size:8.5pt;font-weight:700;"
                 )
-            elif state in {"READY FOR EXPORT", "VALIDATION COMPLETE"}:
+            elif state == "READY FOR EXPORT":
                 self.project_state_label.setStyleSheet(
                     "color:#087C80;background:#E7F7F6;border:1px solid #BFE9E6;border-radius:9px;padding:4px 9px;font-size:8.5pt;font-weight:700;"
+                )
+            elif state == "REVIEW PENDING":
+                self.project_state_label.setStyleSheet(
+                    "color:#805B12;background:#FFF8E6;border:1px solid #F1D493;border-radius:9px;padding:4px 9px;font-size:8.5pt;font-weight:700;"
                 )
             else:
                 self.project_state_label.setStyleSheet(
@@ -3707,18 +3937,22 @@ class MainWindow(QMainWindow):
             self.workflow_step_labels["report"],
             "done" if (report_exported and review_complete) else ("current" if review_complete else "pending"),
         )
+
         if not sources_complete:
             detail = "Complete the required RMU and Signal Mapping source tables."
         elif not validation_complete:
             detail = "Sources are ready. Run Validation to calculate RMU and Signal Mapping results."
         elif needs_action:
-            detail = f"{needs_action} reviewed record(s) require action before report handover."
+            detail = (
+                f"Human Review {processed}/{review_total} · {review_pct}% · "
+                f"{needs_action} Needs Action · {unreviewed} Unreviewed"
+            )
         elif review_complete and report_exported:
-            detail = "Human Review is complete. The current Migration Report export is up to date."
+            detail = "Human Review 100% complete · current Migration Report export is up to date."
         elif review_complete:
-            detail = "Human Review is complete. The Migration Report is ready for export."
+            detail = "Human Review 100% complete · Migration Report is ready for export."
         else:
-            detail = f"Human Review: {processed}/{review_total} processed · {unreviewed} unreviewed · {needs_action} needs action."
+            detail = f"Human Review {processed}/{review_total} · {review_pct}% · {unreviewed} Unreviewed"
         self.workflow_detail.setText(detail)
 
     def refresh_dashboard(self):
