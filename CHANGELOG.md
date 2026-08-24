@@ -1,3 +1,19 @@
+## v0.8.35 - Signal Name + DOT STANDARD Match Rule
+
+- Changed Signal Mapping `ADMS/STANDARD` validation so normalized ADMS signal name + ADMS DOT number matching STANDARD name + IOA is sufficient for `TRUE`.
+- RMU Type is now supporting lookup/context only; a Type mismatch or missing Type no longer turns an exact name+DOT match into `FALSE`.
+- Type+IOA is retained as a fallback to select the expected STANDARD row and explain mismatches when no exact name+DOT match exists.
+- Added regression coverage for exact name+DOT matches across different RMU Types and for same-DOT/different-name mismatches.
+
+## v0.8.34 - Business-Object Review Progress
+
+- Simplified Project Overview RMU review metrics so Dashboard counts affected RMUs instead of mixing RMU counts with per-field Resolution decision counts.
+- `Reviewed RMUs` now reports fully processed affected RMUs (all active FALSE fields have decisions) over `RMUs with Issues`.
+- Kept per-field Resolution decision totals inside RMU Data Review, where FEEDER / SMART / TYPE / LINK decisions are actually resolved.
+- Migration Workflow now shows module-level progress such as `RMU 8/118 · Signal 0/537` instead of a combined low-level exception-decision count.
+- Signal dashboard review wording is aligned to mismatched signal records.
+- Project readiness still requires all affected RMUs and mismatched signals to be processed, no Needs Action blockers, and complete Signal validation coverage.
+
 ## v0.8.33 - Preserve Review Grid Viewport After Edits
 
 - Fixed RMU Data Review horizontally jumping toward the Index/source columns after saving a structured Resolution or optional manual Review comment.
@@ -304,7 +320,7 @@
 
 - `resources/templates` now contains only `IOA STANDARD.xlsx`.
 - Signal Mapping Review no longer reads any REPORT workbook from Site Repository.
-- STANDARD lookup is always `Type + IOA -> name` from the bundled reference workbook.
+- At v0.8.2, STANDARD lookup used `Type + IOA -> name`; v0.8.35 supersedes this validation rule with exact normalized `signal name + DOT/IOA` matching while retaining Type+IOA as fallback context.
 - Formal export copies the bundled STANDARD worksheet into the five-sheet delivery workbook.
 - Site Repository no longer discovers or displays REPORT.xlsx as an input source.
 - ABH feeder normalization now self-detects the confirmed ABH token when repository site labels differ, so `ABH-03`, `JED-NTH-ABH-3`, and `JED-NTH-ABH-AH303` compare equal.

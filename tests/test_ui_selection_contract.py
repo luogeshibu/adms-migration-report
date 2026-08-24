@@ -118,12 +118,21 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertIn('validation_unchecked=signal_unchecked', self.ui)
 
     def test_human_review_counts_exceptions_only(self):
-        self.assertIn('MetricCard("Resolved Issues"', self.ui)
-        self.assertIn('each RMU FALSE field + each Signal mismatch', self.ui)
+        self.assertIn('MetricCard("Reviewed RMUs"', self.ui)
+        self.assertIn('one affected RMU + one mismatched signal', self.ui)
         self.assertIn('mismatch_keys = {', self.ui)
         self.assertIn('signal_review_total = len(mismatch_keys)', self.ui)
-        self.assertIn('Pass RMUs do not require Human Review', self.ui)
+        self.assertIn('per-field decisions remain an implementation/detail view inside the RMU', self.ui)
         self.assertIn('Unchecked signals are a Validation Coverage gap', self.ui)
+
+    def test_dashboard_review_progress_uses_business_objects(self):
+        self.assertIn('MetricCard("Reviewed RMUs"', self.ui)
+        self.assertIn('rmu_review_total = rmu_issues', self.ui)
+        self.assertIn('if decisions and all(decisions):', self.ui)
+        self.assertIn('f"RMU Review: {rmu_reviewed} / {rmu_review_total}', self.ui)
+        self.assertIn('f"Human Review · RMU {rmu_reviewed}/{rmu_review_total} · "', self.ui)
+        self.assertIn('f"Signal {signal_reviewed}/{signal_review_total}"', self.ui)
+        self.assertIn('signal_processed_total = signal_reviewed + signal_required_needs', self.ui)
 
     def test_non_exception_rows_default_to_not_required_but_manual_review_is_optional(self):
         self.assertIn('"NOT REQUIRED": ("Not Required"', self.ui)

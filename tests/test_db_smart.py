@@ -12,7 +12,7 @@ from migration_report_tool.paths import resource_root
 
 
 class SignalMappingReviewTests(unittest.TestCase):
-    def _write_ioa(self, path: Path):
+    def _write_ioa(self, path: Path, *, adms_signal="26859 Y1 CMD", adms_dot="1"):
         with path.open("w", encoding="utf-8-sig", newline="") as f:
             w = csv.DictWriter(f, fieldnames=[
                 "RMU_NO", "ZENON_GSS-FID", "ZENON_signal_name", "ZENON_DOT_NO",
@@ -22,8 +22,8 @@ class SignalMappingReviewTests(unittest.TestCase):
             w.writerow({
                 "RMU_NO": "26859", "ZENON_GSS-FID": "JED-CTL-RDS-09",
                 "ZENON_signal_name": "26859_Y1-RMURDS09_CMD", "ZENON_DOT_NO": "1",
-                "ADMS_GSS-FID": "JED CTL ADF 16", "ADMS_signal_name": "26859 Y1 CMD",
-                "ADMS_DOT_NO": "1",
+                "ADMS_GSS-FID": "JED CTL ADF 16", "ADMS_signal_name": adms_signal,
+                "ADMS_DOT_NO": adms_dot,
             })
 
     def _write_adms_sld(self, path: Path, cabinet_type="3L1T"):
@@ -52,7 +52,7 @@ class SignalMappingReviewTests(unittest.TestCase):
             self.assertIn("Type (from ADMS SLD): 3L1T", row.analysis_detail)
             self.assertIn("STANDARD", [g[0] for g in report.group_definitions][3])
 
-    def test_missing_standard_key_is_false_with_reason(self):
+    def test_name_and_dot_match_is_true_even_when_rmu_type_differs(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             ioa = root / "ZENON-ADMS-IOA.csv"
@@ -61,8 +61,21 @@ class SignalMappingReviewTests(unittest.TestCase):
             self._write_adms_sld(adms_sld, cabinet_type="99L99T")
             standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
             report = build_signal_mapping_report(ioa, adms_sld, standard)
+            self.assertEqual(report.rows[0].values[10], "TRUE")
+            self.assertIn("name and DOT number match", report.rows[0].analysis_detail)
+            self.assertIn("supporting context", report.rows[0].analysis_detail)
+
+    def test_same_dot_but_different_signal_name_is_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ioa = root / "ZENON-ADMS-IOA.csv"
+            adms_sld = root / "ADMS-SLD.csv"
+            self._write_ioa(ioa, adms_signal="26859 DEFINITELY WRONG SIGNAL")
+            self._write_adms_sld(adms_sld, cabinet_type="99L99T")
+            standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
+            report = build_signal_mapping_report(ioa, adms_sld, standard)
             self.assertEqual(report.rows[0].values[10], "FALSE")
-            self.assertIn("STANDARD mapping not found", report.rows[0].analysis_detail)
+            self.assertIn("signal name mismatch", report.rows[0].analysis_detail)
 
     def test_legacy_db_smart_sheet_is_not_a_source_anymore(self):
         with self.assertRaises(RuntimeError):

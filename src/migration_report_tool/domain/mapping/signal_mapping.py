@@ -8,10 +8,12 @@ Inputs:
 * ADMS-SLD.csv: cabinet type for each RMU;
 * active application IOA STANDARD.xlsx: STANDARD reference worksheet (user override or bundled default).
 
-STANDARD is intentionally treated as a reference dictionary.  Only the
-``Type``, ``IOA`` and ``name`` columns are used.  ``(RMU type, ADMS_DOT_NO)``
-is the lookup key for the standard signal and must resolve to one unique row.
-Duplicate exact keys are treated as an explicit data-quality failure.
+STANDARD is intentionally treated as a reference dictionary. Only the
+``Type``, ``IOA`` and ``name`` columns are used. ADMS/STANDARD validation is
+primarily value-based: a normalized ADMS signal name plus ADMS point number
+matching a STANDARD name plus IOA is sufficient for TRUE. RMU Type remains
+supporting lookup/context so the UI can show the expected STANDARD row when an
+exact name+IOA match is not available.
 """
 from __future__ import annotations
 
@@ -199,18 +201,30 @@ def _standard_header_columns(ws) -> tuple[int, int, int, int]:
 
 
 def _read_standard_index(path: Path, overrides: dict[str, str] | None = None):
+    """Return STANDARD indexes for exact value matching and type-assisted lookup.
+
+    ``by_ioa`` intentionally contains rows across all RMU types. This lets the
+    validation rule accept an ADMS signal when *name + DOT/IOA* exactly matches
+    the STANDARD reference even if the ADMS-SLD Type is missing or different.
+    ``by_type_ioa`` is retained as supporting context/fallback for explaining
+    mismatches and selecting the expected STANDARD row.
+    """
     mapped = read_mapped_rows("standard_reference", path, overrides or {}, strict=True)
-    index: dict[tuple[str, str], list[dict[str, str]]] = {}
+    by_type_ioa: dict[tuple[str, str], list[dict[str, str]]] = {}
+    by_ioa: dict[str, list[dict[str, str]]] = {}
     for row_number, row in enumerate(mapped.rows, 1):
         type_value = _norm_type_key(row.get("type"))
         ioa_value = _norm_ioa(row.get("ioa"))
         name_value = _display_value(row.get("name"))
-        if not type_value or not ioa_value:
+        if not ioa_value:
             continue
-        index.setdefault((type_value, ioa_value), []).append({
+        item = {
             "type": type_value, "ioa": ioa_value, "name": name_value, "row": str(row_number),
-        })
-    return index
+        }
+        by_ioa.setdefault(ioa_value, []).append(item)
+        if type_value:
+            by_type_ioa.setdefault((type_value, ioa_value), []).append(item)
+    return by_type_ioa, by_ioa
 
 
 def _first_value(row: dict, *keys: str) -> str:
@@ -265,68 +279,123 @@ def _row_key(source: dict, row_number: int) -> str:
 
 def _analysis_for_row(
     *, rmu: str, rmu_type: str, type_reason: str, adms_signal: str,
-    adms_dot: str, standard_candidates: list[dict[str, str]],
+    adms_dot: str, type_candidates: list[dict[str, str]],
+    ioa_candidates: list[dict[str, str]],
 ) -> tuple[str, str, str, str]:
-    """Return analysis, standard name, standard dot, human-readable reason."""
+    """Return analysis, STANDARD name/DOT and human-readable reason.
+
+    Business rule:
+      ADMS signal name + ADMS DOT number == STANDARD name + IOA  -> TRUE
+
+    RMU Type is supporting context only. It is used to choose the most useful
+    STANDARD row for mismatch explanation, but a Type mismatch must not turn an
+    otherwise exact name+DOT match into FALSE.
+    """
     if not adms_dot and not clean(adms_signal):
         return "", "", "", "ADMS signal and ADMS point number are blank; no STANDARD check was performed."
-    if not rmu_type:
-        reason = type_reason or f"RMU {rmu or '—'} type was not found in ADMS SLD."
-        return "FALSE", "", "", reason
     if not adms_dot:
-        return "FALSE", "", "", f"ADMS_DOT_NO is blank for RMU {rmu or '—'}; STANDARD lookup requires Type + ADMS_DOT_NO."
-    if not standard_candidates:
-        return "FALSE", "", "", f"STANDARD mapping not found for Type={rmu_type}, IOA={adms_dot}."
-    if len(standard_candidates) > 1:
-        rows = ", ".join(item.get("row", "?") for item in standard_candidates)
-        names = ", ".join(sorted({item.get("name", "") or "<blank>" for item in standard_candidates}))
-        return "FALSE", "", "", (
-            f"STANDARD key is not unique for Type={rmu_type}, IOA={adms_dot}: "
-            f"{len(standard_candidates)} rows ({rows}), names=({names}). "
-            "Type + IOA must resolve to one unique signal."
-        )
-
-    standard = standard_candidates[0]
-    standard_name = clean(standard.get("name"))
-    standard_dot = _norm_ioa(standard.get("ioa"))
-    if not standard_name:
-        return "FALSE", "", standard_dot, (
-            f"STANDARD row {standard.get('row', '?')} matched Type={rmu_type}, IOA={adms_dot}, "
-            "but its name is blank."
-        )
+        return "FALSE", "", "", f"ADMS_DOT_NO is blank for RMU {rmu or '—'}; signal name + DOT are required for STANDARD validation."
 
     adms_norm = normalize_signal_name(adms_signal, strip_rmu=rmu)
+    ioa_norm = _norm_ioa(adms_dot)
+
+    # Primary rule: name + DOT/IOA equality is sufficient, across RMU types.
+    exact_value_matches = [
+        item for item in ioa_candidates
+        if adms_norm
+        and normalize_signal_name(item.get("name"))
+        and normalize_signal_name(item.get("name")) == adms_norm
+        and _norm_ioa(item.get("ioa")) == ioa_norm
+    ]
+    if exact_value_matches:
+        # Prefer the same Type for presentation when one exists, but do not
+        # require Type equality for the TRUE result.
+        same_type = [item for item in exact_value_matches if rmu_type and item.get("type") == _norm_type_key(rmu_type)]
+        standard = (same_type or exact_value_matches)[0]
+        standard_name = clean(standard.get("name"))
+        standard_dot = _norm_ioa(standard.get("ioa"))
+        detail = [
+            "ADMS/STANDARD consistency check",
+            "",
+            "Rule: normalized ADMS signal name + ADMS DOT number must match STANDARD name + IOA.",
+            "RMU Type is supporting context and is not required when name + DOT already match.",
+            "",
+            f"RMU: {rmu or '—'}",
+            f"Type (from ADMS SLD): {rmu_type or '<missing>'}",
+            f"STANDARD Type: {standard.get('type') or '<blank>'}",
+            f"ADMS_DOT_NO: {adms_dot}",
+            f"STANDARD IOA: {standard_dot}",
+            f"ADMS signal: {adms_signal or '<blank>'}",
+            f"STANDARD name: {standard_name}",
+            "",
+            f"Normalized ADMS signal: {adms_norm or '<blank>'}",
+            f"Normalized STANDARD name: {normalize_signal_name(standard_name) or '<blank>'}",
+            "",
+            "Result: TRUE",
+            "Reason: ADMS signal name and DOT number match the STANDARD reference.",
+        ]
+        return "TRUE", standard_name, standard_dot, "\n".join(detail)
+
+    # No exact name+DOT match. Use Type+IOA (when available) to show the
+    # expected STANDARD row and explain the mismatch. If Type is unavailable or
+    # wrong, a unique IOA row can still provide useful context.
+    candidates = list(type_candidates)
+    lookup_reason = "Type + IOA"
+    if not candidates:
+        candidates = list(ioa_candidates)
+        lookup_reason = "IOA"
+
+    if not candidates:
+        type_text = rmu_type or "<missing>"
+        return "FALSE", "", "", (
+            f"STANDARD mapping not found for ADMS signal={adms_signal or '<blank>'}, "
+            f"IOA={adms_dot}, Type={type_text}. No STANDARD row has the same DOT number."
+        )
+
+    # If several candidates share the IOA, choose a same-Type candidate first
+    # for display. Multiple rows are not an automatic failure anymore because
+    # the business truth condition is name+DOT; at this point none matched the
+    # ADMS signal name, so the result is FALSE regardless.
+    same_type = [item for item in candidates if rmu_type and item.get("type") == _norm_type_key(rmu_type)]
+    standard = (same_type or candidates)[0]
+    standard_name = clean(standard.get("name"))
+    standard_dot = _norm_ioa(standard.get("ioa"))
     standard_norm = normalize_signal_name(standard_name)
+    dot_match = ioa_norm == standard_dot
     name_match = bool(adms_norm and standard_norm and adms_norm == standard_norm)
-    dot_match = _norm_ioa(adms_dot) == standard_dot
-    passed = name_match and dot_match
+
     detail = [
         "ADMS/STANDARD consistency check",
         "",
+        "Rule: normalized ADMS signal name + ADMS DOT number must match STANDARD name + IOA.",
+        "RMU Type is supporting context only.",
+        "",
         f"RMU: {rmu or '—'}",
-        f"Type (from ADMS SLD): {rmu_type}",
+        f"Type (from ADMS SLD): {rmu_type or '<missing>'}",
+        f"STANDARD Type: {standard.get('type') or '<blank>'}",
+        f"Fallback lookup: {lookup_reason}",
         f"ADMS_DOT_NO: {adms_dot}",
         f"STANDARD IOA: {standard_dot}",
         f"ADMS signal: {adms_signal or '<blank>'}",
-        f"STANDARD name: {standard_name}",
+        f"STANDARD name: {standard_name or '<blank>'}",
         "",
         f"Normalized ADMS signal: {adms_norm or '<blank>'}",
         f"Normalized STANDARD name: {standard_norm or '<blank>'}",
-    ]
-    detail += [
         "",
-        f"Result: {'TRUE' if passed else 'FALSE'}",
+        "Result: FALSE",
     ]
-    if not passed:
-        problems = []
-        if not name_match:
-            problems.append("signal name mismatch")
-        if not dot_match:
-            problems.append("point number mismatch")
-        detail.append("Reason: " + " / ".join(problems))
-    else:
-        detail.append("Reason: unique STANDARD mapping found and normalized ADMS signal matches STANDARD name.")
-    return ("TRUE" if passed else "FALSE"), standard_name, standard_dot, "\n".join(detail)
+    problems = []
+    if not name_match:
+        problems.append("signal name mismatch")
+    if not dot_match:
+        problems.append("point number mismatch")
+    if not problems:
+        # Defensive only: exact name+DOT would already have returned TRUE.
+        problems.append("STANDARD value mismatch")
+    detail.append("Reason: " + " / ".join(problems))
+    if type_reason:
+        detail.append("Type context: " + type_reason)
+    return "FALSE", standard_name, standard_dot, "\n".join(detail)
 
 
 def _zenon_standard_match(rmu: str, zenon_signal: str, zenon_dot: str, standard_name: str, standard_dot: str) -> bool | None:
@@ -354,7 +423,7 @@ def build_signal_mapping_report(ioa_path: Path, adms_sld_path: Path, standard_wo
 
     ioa_rows = read_mapped_rows("ioa", ioa_path, ioa_overrides or {}, strict=True).rows
     adms_types = _read_adms_sld_types(adms_sld_path, adms_sld_overrides)
-    standard_index = _read_standard_index(standard_workbook_path, standard_overrides)
+    standard_type_index, standard_ioa_index = _read_standard_index(standard_workbook_path, standard_overrides)
 
     detail_rows: list[dict] = []
     adms_results: list[bool] = []
@@ -370,11 +439,13 @@ def build_signal_mapping_report(ioa_path: Path, adms_sld_path: Path, standard_wo
         adms_gss = clean(source.get("adms_gss_fid"))
         adms_signal = clean(source.get("adms_signal_name"))
         adms_dot = _norm_ioa(source.get("adms_dot_no"))
-        candidates = standard_index.get((_norm_type_key(rmu_type), adms_dot), []) if rmu_type and adms_dot else []
+        type_candidates = standard_type_index.get((_norm_type_key(rmu_type), adms_dot), []) if rmu_type and adms_dot else []
+        ioa_candidates = standard_ioa_index.get(adms_dot, []) if adms_dot else []
         analysis, standard_name, standard_dot, analysis_detail = _analysis_for_row(
             rmu=rmu, rmu_type=rmu_type, type_reason=type_reason,
             adms_signal=adms_signal, adms_dot=adms_dot,
-            standard_candidates=candidates,
+            type_candidates=type_candidates,
+            ioa_candidates=ioa_candidates,
         )
         if analysis in {"TRUE", "FALSE"}:
             adms_results.append(analysis == "TRUE")

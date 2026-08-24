@@ -6,8 +6,9 @@ Professional Windows desktop review tool for SE / ZENON / ADMS migration verific
 
 - **RMU Data Review** — automatic NAME / FEEDER / SMART / TYPE / IP / LINK validation plus structured per-issue Resolution decisions. Every FALSE Analysis field requires one explicit decision; Review is derived as `Unreviewed`, `Reviewed`, or `Needs Action`.
 - **Signal Mapping Review** — automatic Matched / Mismatched / Unchecked validation from `ZENON-ADMS-IOA.csv`, `ADMS-SLD.csv` and the active application `IOA STANDARD.xlsx`, with independent human Review.
+  `ADMS/STANDARD` is TRUE when normalized ADMS signal name + ADMS DOT number match STANDARD name + IOA. RMU Type is supporting context/fallback rather than a mandatory TRUE condition.
 - **Project Overview** — formal migration workflow (`Data Sources -> Validation -> Human Review -> Migration Report`), RMU/Signal KPIs, review progress and delivery readiness.
-  Human Review is exception-based: one decision per RMU FALSE field plus one decision per Signal mismatch. Pass/Matched records are Auto Validated; Unchecked signals are Validation Coverage gaps and block formal export.
+  Project Overview tracks Human Review by business object: one affected RMU and one mismatched Signal. Inside RMU Data Review, each FALSE field still requires its own structured Resolution decision. Pass/Matched records do not require review by default; Unchecked signals are Validation Coverage gaps and block formal export.
 - **Site Data Sources** — repository-first source discovery, fingerprints/snapshots, module dependency tables and explicit Source Schema Mapping.
 
 ## Source schema safety

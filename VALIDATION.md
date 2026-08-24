@@ -375,3 +375,18 @@ The source package has one authoritative production build/release entry point: r
 - Issue RMUs still require per-field structured Resolution; incomplete automatic Analysis remains Validation Required.
 - Optional Pass review does not inflate the required exception Human Review denominator; optional Needs Action remains an export blocker.
 - RMU Review filters and Excel export preserve the full displayed Review state.
+
+## v0.8.34 validation additions
+
+- Project Overview RMU progress uses affected-RMU objects, not per-field Resolution counts.
+- One affected RMU becomes reviewed only when all current FALSE fields have saved decisions.
+- Workflow detail reports RMU and Signal module progress separately.
+- RMU Data Review continues to expose per-field issue-decision progress for operational resolution work.
+## v0.8.35 validation additions
+
+- ADMS/STANDARD TRUE is driven by normalized ADMS signal name + DOT matching STANDARD name + IOA.
+- Exact name+DOT remains TRUE even when ADMS-SLD RMU Type differs or is missing.
+- Same DOT with a different signal name remains FALSE.
+- Type+IOA remains a mismatch-explanation fallback and does not override an exact name+DOT match.
+- Windows formal unittest entry point and full pytest suite cover the new matching contract.
+

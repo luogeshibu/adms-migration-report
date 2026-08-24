@@ -1457,7 +1457,7 @@ class MainWindow(QMainWindow):
         self.metric_rmu_total = MetricCard("Total RMUs", "0", "#2365A8")
         self.metric_rmu_pass = MetricCard("Pass", "0", "#12805C")
         self.metric_rmu_issues = MetricCard("With Issues", "0", "#C9871A")
-        self.metric_rmu_reviewed = MetricCard("Resolved Issues", "0 / 0", "#6F4DA5")
+        self.metric_rmu_reviewed = MetricCard("Reviewed RMUs", "0 / 0", "#6F4DA5")
         self.metric_rmu_needs_action = MetricCard("Needs Action", "0", "#B42318")
         for i, card in enumerate((
             self.metric_rmu_total, self.metric_rmu_pass, self.metric_rmu_issues,
@@ -4154,13 +4154,17 @@ class MainWindow(QMainWindow):
     def _update_delivery_workflow(
         self, *, sources_complete: bool, validation_complete: bool, validation_unchecked: int,
         review_total: int, reviewed: int, needs_action: int, report_exported: bool,
+        rmu_reviewed: int = 0, rmu_review_total: int = 0,
+        signal_reviewed: int = 0, signal_review_total: int = 0,
     ) -> None:
-        """Refresh delivery stage from validation coverage and exception review.
+        """Refresh delivery stage using business-record Human Review progress.
 
-        Human Review counts only exception decisions that actually require a
-        person: one item for every active RMU FALSE field plus one item for
-        every Signal Mapping mismatch. Pass RMUs and matched signals are
-        automatically validated and never inflate Human Review progress.
+        Project Overview deliberately counts review *objects*, not low-level
+        Resolution decisions: one affected RMU is one RMU review object, and one
+        mismatched signal is one Signal review object.  A multi-issue RMU counts
+        as reviewed only after every active FALSE field has a Resolution decision.
+        Per-field decision counts stay inside RMU Data Review where they are useful.
+        Pass RMUs and matched signals do not inflate required Human Review progress.
         Unchecked signals are a Validation Coverage gap and block formal export.
         """
         processed = min(review_total, max(0, reviewed))
@@ -4224,26 +4228,24 @@ class MainWindow(QMainWindow):
             "done" if (report_exported and review_complete and validation_coverage_complete) else ("current" if review_complete and validation_coverage_complete else "pending"),
         )
 
+        module_review = (
+            f"Human Review · RMU {rmu_reviewed}/{rmu_review_total} · "
+            f"Signal {signal_reviewed}/{signal_review_total}"
+        )
         if not sources_complete:
             detail = "Complete the required RMU and Signal Mapping source tables."
         elif not validation_complete:
             detail = "Sources are ready. Run Validation to calculate RMU and Signal Mapping results."
         elif validation_unchecked:
-            detail = (
-                f"Validation coverage incomplete · {validation_unchecked} signal(s) unchecked · "
-                f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}%"
-            )
+            detail = f"Validation coverage incomplete · {validation_unchecked} signal(s) unchecked · {module_review}"
         elif needs_action:
-            detail = (
-                f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}% · "
-                f"{needs_action} Needs Action · {unreviewed} unresolved"
-            )
+            detail = f"{module_review} · {review_pct}% · {needs_action} Needs Action"
         elif review_complete and report_exported:
-            detail = "Validation coverage complete · all exception decisions resolved · current Migration Report export is up to date."
+            detail = f"{module_review} · Review complete · current Migration Report export is up to date."
         elif review_complete:
-            detail = "Validation coverage complete · all exception decisions resolved · Migration Report is ready for export."
+            detail = f"{module_review} · Review complete · Migration Report is ready for export."
         else:
-            detail = f"Human Review {processed}/{review_total} exception decision(s) · {review_pct}% · {unreviewed} unresolved"
+            detail = f"{module_review} · {review_pct}% · {unreviewed} review object(s) remaining"
         self.workflow_detail.setText(detail)
 
     def refresh_dashboard(self):
@@ -4285,6 +4287,7 @@ class MainWindow(QMainWindow):
             self._update_delivery_workflow(
                 sources_complete=False, validation_complete=False, validation_unchecked=0, review_total=0,
                 reviewed=0, needs_action=0, report_exported=False,
+                rmu_reviewed=0, rmu_review_total=0, signal_reviewed=0, signal_review_total=0,
             )
             return
 
@@ -4294,27 +4297,28 @@ class MainWindow(QMainWindow):
         rmu_pass = sum(state.is_pass for state in rmu_states)
         rmu_issues = sum(state.issue_count > 0 for state in rmu_states)
         rmu_no_analysis = sum(not state.has_result for state in rmu_states)
-        # Human Review is exception-based: every active FALSE field is one
-        # required Resolution decision. Pass RMUs do not require Human Review and do not
-        # increase the Human Review denominator.
+        # Project Overview counts affected RMUs, not their individual FALSE
+        # fields.  The per-field Resolution decision count remains visible only
+        # inside RMU Data Review.  One issue RMU is considered reviewed after
+        # every active FALSE field has a saved decision (including Needs Action).
         rmu_total = len(rows)
         all_resolutions = self.store.rmu_resolution_map()
-        rmu_review_total = 0
+        rmu_review_total = rmu_issues
         rmu_reviewed = 0
-        rmu_needs = 0
+        rmu_required_needs = 0
         for row, state in zip(rows, rmu_states):
+            if state.issue_count <= 0:
+                continue
             rmu = clean(row.get("rmu"))
             saved = all_resolutions.get(rmu, {}) if isinstance(all_resolutions, dict) else {}
-            for field in state.false_fields:
-                rmu_review_total += 1
-                decision = clean((saved.get(field) or {}).get("decision_type")).upper()
-                if decision:
-                    rmu_reviewed += 1
-                    if decision == "NEEDS_ACTION":
-                        rmu_needs += 1
+            decisions = [clean((saved.get(field) or {}).get("decision_type")).upper() for field in state.false_fields]
+            if decisions and all(decisions):
+                rmu_reviewed += 1
+            if any(decision == "NEEDS_ACTION" for decision in decisions):
+                rmu_required_needs += 1
+
         # Optional human Review on automatic Pass rows does not inflate the
-        # required exception-review denominator, but an explicit Needs Action is
-        # still a real delivery blocker and is visible in dashboard/project state.
+        # required RMU denominator, but a manual Needs Action is a real blocker.
         rmu_review_map = self.store.rmu_review_map()
         rmu_optional_needs = sum(
             1
@@ -4322,7 +4326,7 @@ class MainWindow(QMainWindow):
             if state.is_pass
             and (clean(rmu_review_map.get(clean(row.get("rmu")), {}).get("review_status")).upper() == "NEEDS ACTION")
         )
-        rmu_needs += rmu_optional_needs
+        rmu_needs = rmu_required_needs + rmu_optional_needs
         rmu_unreviewed = max(0, rmu_review_total - rmu_reviewed)
         rmu_review_pct = int(round((rmu_reviewed / rmu_review_total * 100.0) if rmu_review_total else 100.0))
 
@@ -4334,8 +4338,8 @@ class MainWindow(QMainWindow):
         self.dashboard_rmu_review_progress.setValue(rmu_review_pct)
         self.dashboard_rmu_review_progress.setFormat(f"{rmu_review_pct}%")
         self.dashboard_rmu_review_summary.setText(
-            f"Human Review: {rmu_reviewed} / {rmu_review_total} RMU issue decision(s) · {rmu_review_pct}% · "
-            f"Unresolved {rmu_unreviewed} · Needs Action {rmu_needs}"
+            f"RMU Review: {rmu_reviewed} / {rmu_review_total} · {rmu_review_pct}% · "
+            f"Remaining {rmu_unreviewed} · Needs Action {rmu_needs}"
         )
 
         issue_counts = Counter(field for state in rmu_states for field in state.false_fields)
@@ -4441,8 +4445,8 @@ class MainWindow(QMainWindow):
             self.dashboard_signal_review_progress.setValue(signal_review_pct)
             self.dashboard_signal_review_progress.setFormat(f"{signal_review_pct}%")
             self.dashboard_signal_review_summary.setText(
-                f"Human Review: {signal_processed} / {signal_review_total} mismatch decision(s) · {signal_review_pct}% · "
-                f"Unresolved {signal_unreviewed} · Needs Action {signal_needs}"
+                f"Signal Review: {signal_processed} / {signal_review_total} mismatches · {signal_review_pct}% · "
+                f"Remaining {signal_unreviewed} · Needs Action {signal_needs}"
             )
             self.dashboard_signal_summary.setText(
                 f"Matched / Checked = {signal_matched} / {signal_checked} · Match rate {rate:.2f}% · Unchecked {signal_unchecked}"
@@ -4507,12 +4511,14 @@ class MainWindow(QMainWindow):
         )
         sources_complete = base_sources_ready and signal_sources_ready
         validation_complete = bool(rows) and signal_report is not None
-        # Human Review denominator contains exception decisions only:
-        # each RMU FALSE field + each Signal mismatch. Matched/Pass rows are
-        # auto-validated; signal Unchecked belongs to Validation Coverage.
+        # Project-level Human Review uses business objects so Dashboard totals
+        # stay intuitive: one affected RMU + one mismatched signal.  RMU
+        # per-field decisions remain an implementation/detail view inside the RMU
+        # module and are deliberately not mixed into Overview progress.
         review_total = rmu_review_total + signal_review_total
         signal_required_needs = signal_review_counts["NEEDS ACTION"] if signal_report is not None else 0
-        reviewed_total = rmu_reviewed + signal_reviewed + signal_required_needs
+        signal_processed_total = signal_reviewed + signal_required_needs
+        reviewed_total = rmu_reviewed + signal_processed_total
         needs_total = rmu_needs + signal_needs
         latest_state_ts = 0.0
         for table_name in ("comparison", "rmu_reviews", "rmu_resolutions", "db_smart_reviews"):
@@ -4541,6 +4547,8 @@ class MainWindow(QMainWindow):
             sources_complete=sources_complete, validation_complete=validation_complete,
             validation_unchecked=signal_unchecked, review_total=review_total,
             reviewed=reviewed_total, needs_action=needs_total, report_exported=report_exported,
+            rmu_reviewed=rmu_reviewed, rmu_review_total=rmu_review_total,
+            signal_reviewed=signal_processed_total, signal_review_total=signal_review_total,
         )
 
     def refresh_export_page(self):
