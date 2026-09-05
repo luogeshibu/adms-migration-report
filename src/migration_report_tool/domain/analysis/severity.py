@@ -5,7 +5,7 @@ The review UI intentionally uses a minimal color system:
 * row color = pass / issue / critical severity;
 * every FALSE Analysis cell uses one shared mismatch highlight.
 
-The column header already identifies NAME / FEEDER / SMART / TYPE / IP / LINK,
+The column header already identifies NAME / FEEDER / SMART / TYPE / IP,
 so field-specific colors are deliberately avoided. This keeps the formal review
 grid readable and prevents color meaning from becoming ambiguous.
 """
@@ -19,7 +19,6 @@ ANALYSIS_FIELDS = (
     ("SMART", "analysis_smart"),
     ("TYPE", "analysis_type"),
     ("IP", "analysis_ip"),
-    ("LINK", "analysis_link"),
 )
 
 ROW_COLORS = {
@@ -95,21 +94,70 @@ def field_false_color(field_label: str) -> str | None:
     return FALSE_CELL_COLORS.get(str(field_label).strip().upper())
 
 
-def signal_review_display_status(analysis_result: object, stored_status: object) -> str:
-    """Return the visible Human Review state for one Signal Mapping row.
+def normalize_review_status(stored_status: object) -> str:
+    """Normalize legacy review values to the three-state workflow.
 
-    Automatic validation and Human Review are deliberately separate:
-    * MATCHED/TRUE defaults to ``NOT REQUIRED`` but a reviewer may explicitly
-      mark it ``REVIEWED`` or ``NEEDS ACTION``.
-    * MISMATCHED/FALSE is a required Human Review item and therefore uses the
-      stored ``UNREVIEWED``/``REVIEWED``/``NEEDS ACTION`` state.
-    * unchecked rows remain ``VALIDATION REQUIRED`` even if stale review data
-      exists, because validation coverage must be restored first.
+    v0.8.47 intentionally exposes only UNREVIEWED, CLOSED and NEEDS ACTION.
+    Historical REVIEWED records are semantically completed work and therefore
+    map to CLOSED without discarding their audit history.
     """
+    value = str(stored_status or "").strip().upper() or "UNREVIEWED"
+    if value == "REVIEWED":
+        return "CLOSED"
+    if value in {"UNREVIEWED", "CLOSED", "NEEDS ACTION"}:
+        return value
+    return "UNREVIEWED"
+
+
+def review_record_is_explicit(review_record: object) -> bool:
+    """Return True when a stored review row represents an explicit workflow state."""
+    if not isinstance(review_record, dict):
+        return False
+    raw = str(review_record.get("review_status") or "").strip().upper()
+    # CLOSED / NEEDS ACTION / legacy REVIEWED are always explicit.  UNREVIEWED
+    # is explicit only when reviewer metadata exists; automatically-created RMU
+    # fingerprint rows also store UNREVIEWED but deliberately leave metadata blank.
+    if raw in {"CLOSED", "NEEDS ACTION", "REVIEWED"}:
+        return True
+    return bool(str(review_record.get("reviewed_by") or "").strip() or str(review_record.get("reviewed_at") or "").strip())
+
+
+def rmu_review_display_status(data: dict, review_record: object = None) -> str:
+    """Return one of UNREVIEWED / CLOSED / NEEDS ACTION for an RMU row.
+
+    Automatic Analysis remains unchanged.  A passing RMU defaults to CLOSED;
+    exception or not-yet-analysed rows default to UNREVIEWED.  Any explicit
+    three-state human decision overrides that default.
+    """
+    record = review_record if isinstance(review_record, dict) else {}
+    stored = normalize_review_status(record.get("review_status"))
+    if review_record_is_explicit(record):
+        return stored
+    return "CLOSED" if analysis_review_state(data).is_pass else "UNREVIEWED"
+
+
+def signal_review_display_status(
+    analysis_result: object,
+    stored_status: object = None,
+    *,
+    explicit: bool = False,
+    zenon_only: bool = False,
+) -> str:
+    """Return the visible three-state Signal Mapping review status.
+
+    Rules:
+    * explicit human state wins;
+    * matched/TRUE signals default to CLOSED;
+    * ZENON-only signals also default to CLOSED (accepted legacy-only points);
+    * all remaining rows default to UNREVIEWED.
+
+    Automatic validation values are not rewritten by this display rule.
+    """
+    stored = normalize_review_status(stored_status)
+    raw = str(stored_status or "").strip().upper()
+    if explicit or raw in {"CLOSED", "NEEDS ACTION", "REVIEWED"}:
+        return stored
     result = str(analysis_result or "").strip().upper()
-    stored = str(stored_status or "").strip().upper() or "UNREVIEWED"
-    if result == "FALSE":
-        return stored if stored in {"UNREVIEWED", "REVIEWED", "NEEDS ACTION"} else "UNREVIEWED"
-    if result == "TRUE":
-        return stored if stored in {"REVIEWED", "NEEDS ACTION"} else "NOT REQUIRED"
-    return "VALIDATION REQUIRED"
+    if result == "TRUE" or zenon_only:
+        return "CLOSED"
+    return "UNREVIEWED"

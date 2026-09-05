@@ -1,3 +1,7 @@
+# v0.8.155 source-file and worksheet contract
+
+All site source roles accept `.csv`, `.xlsx`, and `.xlsm`. Physical filenames are not schema contracts; manual assignment plus App Column ↔ Source Field mapping is authoritative. For Excel files, worksheet selection is stored per site/source role. AUTO chooses the first usable sheet in workbook order; an explicit worksheet can be pinned. Global field mappings remain shared by source type across sites.
+
 # Source Schema Mapping
 
 ## Rule
@@ -44,7 +48,7 @@ Actual-column overrides are stored in the site's `project.json`. Display Name ov
 - **System Field**: the application's built-in source field meaning.
 - **Global Display Name**: application-wide presentation label used by App/Excel review headers for every site; editing it never changes the Internal Key or source file.
 - **Required**: `Yes` means the Review is blocked when no unambiguous column can be resolved; `No` produces a warning and the field stays blank.
-- **Actual Column**: `Auto (SS)` / `Auto (FEEDR)` means the current source header was resolved automatically. Selecting another header creates a site-specific override. Mouse-wheel selection changes are disabled to avoid accidental remapping.
+- **Source Field selector**: `Auto` always means declared header-name/alias detection. The currently resolved physical header is shown by Status/tooltips, not inside the Auto label. Selecting a physical header creates an explicit global mapping; `Blank · no source field` intentionally leaves the App field empty. Mouse-wheel selection changes are disabled to avoid accidental remapping.
 - **Status = Exact**: the detected header matches the preferred built-in header after safe syntactic normalization.
 - **Status = Built-in Alias**: the detected header matches another explicitly approved alias.
 - **Status = Missing**: no approved header was found. Required fields block Review; optional fields do not.

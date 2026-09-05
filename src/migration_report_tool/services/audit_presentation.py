@@ -11,6 +11,7 @@ from typing import Mapping
 from ..config.column_schema import DATA_GROUPS
 from ..config.sources import schema_for
 from ..parsers import clean
+from ..domain.schema import BLANK_OVERRIDE_TOKEN, decode_manual_override, is_manual_override
 
 
 _RMU_FIELD_LABELS: dict[str, str] = {}
@@ -29,7 +30,9 @@ for group_name, _color, columns in DATA_GROUPS:
 _SPECIAL_FIELDS = {
     "rmu_review_status": "Review Status",
     "rmu_review_comment": "Manual Review Comment",
+    "rmu_check_passed": "Checked",
     "db_smart_review_status": "Review Status",
+    "db_smart_check_passed": "Checked",
     "db_smart_comments": "Comments",
     "standard_reference": "STANDARD Reference",
 }
@@ -108,16 +111,30 @@ def audit_field_label(item: Mapping[str, object]) -> str:
     return field.replace("_", " ").replace(".", " · ").title() if field else "—"
 
 
+
+def _present_mapping_value(value: object) -> str:
+    text = clean(value)
+    if text == BLANK_OVERRIDE_TOKEN:
+        return "Blank · no source field"
+    if is_manual_override(text):
+        actual = decode_manual_override(text)
+        return f"Manual → {actual}" if actual else "Manual"
+    return text
+
 def present_audit_item(item: Mapping[str, object]) -> dict[str, str]:
     """Return a business-facing view while preserving the immutable raw keys."""
+    field_name = clean(item.get("field_name"))
+    is_source_mapping = field_name.startswith("source_mapping.")
+    old_value = _present_mapping_value(item.get("old_value")) if is_source_mapping else clean(item.get("old_value"))
+    new_value = _present_mapping_value(item.get("new_value")) if is_source_mapping else clean(item.get("new_value"))
     return {
         "id": clean(item.get("id")),
         "module": audit_module(item),
         "record": audit_record_label(item),
         "field": audit_field_label(item),
-        "internal_field": clean(item.get("field_name")),
-        "original_value": clean(item.get("old_value")),
-        "new_value": clean(item.get("new_value")),
+        "internal_field": field_name,
+        "original_value": old_value,
+        "new_value": new_value,
         "reason": clean(item.get("reason")),
         "modified_by": clean(item.get("modified_by")),
         "modified_at": clean(item.get("modified_at")),

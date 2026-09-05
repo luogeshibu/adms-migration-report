@@ -1,15 +1,8 @@
-"""File and zenOn XML parsers. No UI dependencies.
-
-The zenOn XML parser is site-aware. A combined XML may contain graphics from
-multiple sites (for example ABN and ABN2); callers can pass ``site_name`` and
-optional SE feeder values so only the selected site's feeder records are kept.
-"""
+"""Tabular file parsing and feeder-normalization helpers. No UI dependencies."""
 from __future__ import annotations
 
 import csv
 import re
-import xml.etree.ElementTree as ET
-from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -90,11 +83,16 @@ def feeder_matches_site(feeder: str, site_name: str | None, allowed_feeders: Ite
     feeder_tokens = feeder_norm.split("-")
     site_tokens = _feeder_tokens(site_name)
     if site_tokens:
-        # Exact contiguous token sequence. ABN can never match ABN2.
-        n = len(site_tokens)
-        for i in range(0, len(feeder_tokens) - n + 1):
-            if feeder_tokens[i:i+n] == site_tokens:
-                return True
+        # Repository folders may have an ordering prefix such as ``1-ABH``.
+        # Try the full label and each suffix while keeping exact token
+        # boundaries, so ABN still never matches ABN2.
+        site_candidates = [site_tokens[i:] for i in range(len(site_tokens)) if site_tokens[i:]]
+        site_candidates.sort(key=len, reverse=True)
+        for candidate in site_candidates:
+            n = len(candidate)
+            for i in range(0, len(feeder_tokens) - n + 1):
+                if feeder_tokens[i:i+n] == candidate:
+                    return True
 
     for candidate in allowed_feeders or ():
         candidate_norm = normalize_feeder(candidate)
@@ -104,90 +102,6 @@ def feeder_matches_site(feeder: str, site_name: str | None, allowed_feeders: Ite
             return True
     return False
 
-
-def parse_zenon_xml(
-    xml_path: Path,
-    site_name: str | None = None,
-    allowed_feeders: Iterable[str] | None = None,
-) -> list[dict]:
-    """Extract one record per logical RMU from zenOn XML.
-
-    ``Picture/@ShortName`` maps to DATA ``Screen name``. If ``site_name`` is
-    supplied, records are filtered by the parsed feeder before deduplication.
-    This prevents a shared ABN-ABN2.XML from leaking ABN RMUs into an ABN2 run.
-    """
-    allowed_feeders = tuple(clean(x) for x in (allowed_feeders or ()) if clean(x))
-    raw: list[dict] = []
-    current_picture = ""
-    inside_element = 0
-    context = ET.iterparse(str(xml_path), events=("start", "end"))
-    for event, elem in context:
-        tag = local_name(elem.tag)
-        if event == "start":
-            if tag == "Picture":
-                current_picture = clean(elem.attrib.get("ShortName"))
-            if tag.startswith("Elements_"):
-                inside_element += 1
-            continue
-
-        if tag.startswith("Elements_"):
-            link_name = direct_child_text(elem, "LinkName")
-            destination = direct_child_text(elem, "SubstituteDestination")
-            if link_name and "RMU" in link_name.upper() and destination:
-                normalized, feeder, rmu = parse_destination(destination)
-                # Site filtering is based on feeder, not Picture name. Combined
-                # zenOn exports can contain cross-site graphics under one Picture.
-                if site_name and not feeder_matches_site(feeder, site_name, allowed_feeders):
-                    elem.clear()
-                    inside_element = max(0, inside_element - 1)
-                    continue
-                match = CABINET_TYPE_RE.search(link_name)
-                cabinet_type = match.group(1).upper() if match else ""
-                warnings = []
-                if not cabinet_type:
-                    warnings.append("Cabinet type not parsed")
-                if not feeder or not rmu:
-                    warnings.append("SubstituteDestination not parsed")
-                raw.append({
-                    "xml_file": xml_path.name,
-                    "screen_name": current_picture,
-                    "picture": current_picture,  # legacy alias for older project data
-                    "cabinet_type": cabinet_type,
-                    "feeder": feeder,
-                    "rmu": rmu,
-                    "link_name": link_name,
-                    "destination": destination,
-                    "normalized_destination": normalized,
-                    "warning": "; ".join(warnings),
-                })
-            elem.clear()
-            inside_element = max(0, inside_element - 1)
-        elif tag == "Picture":
-            elem.clear()
-            current_picture = ""
-        elif inside_element == 0:
-            elem.clear()
-
-    grouped: dict[tuple[str, str, str], dict] = {}
-    counts: Counter = Counter()
-    for row in raw:
-        key = (row["cabinet_type"], row["feeder"], row["rmu"])
-        counts[key] += 1
-        if key not in grouped:
-            grouped[key] = row
-        elif row["screen_name"] and row["screen_name"] not in grouped[key]["screen_name"].split("; "):
-            grouped[key]["screen_name"] = "; ".join(x for x in [grouped[key]["screen_name"], row["screen_name"]] if x)
-            grouped[key]["picture"] = grouped[key]["screen_name"]
-
-    result = []
-    for key, row in grouped.items():
-        row = dict(row)
-        row["duplicate_count"] = counts[key]
-        if counts[key] > 1:
-            row["warning"] = "; ".join(x for x in [row["warning"], f"Duplicate graphic x{counts[key]}"] if x)
-        result.append(row)
-    result.sort(key=lambda r: (normalize_feeder(r["feeder"]), normalize_key(r["rmu"]), r["cabinet_type"]))
-    return result
 
 
 def read_csv_rows(path: Path) -> list[dict]:

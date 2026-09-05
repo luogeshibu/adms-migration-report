@@ -13,7 +13,7 @@ def main():
     root = Path(a.root).resolve()
     required = [
         root/'setup.bat', root/'build.ps1', root/'pyproject.toml', root/'requirements.lock.txt', root/'packaging/windows/MigrationReportTool.spec',
-        root/'resources/assets/logo.ico', root/'resources/assets/logo.png',
+        root/'resources/assets/logo.ico', root/'resources/assets/logo.png', root/'resources/assets/report_header.png', root/'resources/assets/data_migration_cover.png',
         root/'resources/icons/rmu.svg', root/'resources/icons/signal.svg',
         root/'resources/templates/IOA STANDARD.xlsx',
         root/'src/migration_report_tool/app/application.py',

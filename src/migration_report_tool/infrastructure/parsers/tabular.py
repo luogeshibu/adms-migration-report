@@ -39,13 +39,91 @@ def read_csv_raw(path: Path) -> tuple[list[str], list[dict]]:
     return headers, list(reader)
 
 
-def read_excel_raw(path: Path) -> tuple[list[str], list[dict]]:
-    wb = load_workbook(path, read_only=True, data_only=True)
+@dataclass(frozen=True)
+class ExcelSheetInfo:
+    name: str
+    rows: int
+    columns: int
+    usable: bool
+
+
+def _clean_excel_row(values) -> list[str]:
+    return [str(x or "").replace("\ufeff", "").strip() for x in values]
+
+
+def _sheet_is_usable(ws, scan_rows: int = 12) -> bool:
+    """Return True when a sheet looks like a normal header + data table.
+
+    AUTO intentionally stays conservative: workbook order is respected and the
+    first usable sheet wins.  If none qualifies, the workbook's first sheet is
+    still used so the reviewer can remap its physical fields manually.
+    """
+    nonempty_rows = 0
+    first_nonempty = None
+    for values in ws.iter_rows(min_row=1, max_row=min(max(1, ws.max_row), scan_rows), values_only=True):
+        cleaned = _clean_excel_row(values)
+        if not any(cleaned):
+            continue
+        nonempty_rows += 1
+        if first_nonempty is None:
+            first_nonempty = cleaned
+        if nonempty_rows >= 2:
+            break
+    return bool(first_nonempty and any(first_nonempty) and nonempty_rows >= 2)
+
+
+def list_excel_sheets(path: Path) -> tuple[ExcelSheetInfo, ...]:
+    """Return workbook sheet metadata in physical workbook order."""
+    wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
-        ws = wb.active
+        result = []
+        for name in wb.sheetnames:
+            ws = wb[name]
+            result.append(ExcelSheetInfo(name, int(ws.max_row or 0), int(ws.max_column or 0), _sheet_is_usable(ws)))
+        return tuple(result)
+    finally:
+        wb.close()
+
+
+def resolve_excel_sheet_name(path: Path, preferred_sheet: str | None = None) -> str:
+    """Resolve a site-level sheet selection.
+
+    A saved manual sheet wins when it still exists. AUTO otherwise selects the
+    first usable sheet in workbook order, falling back to the first physical
+    sheet for intentionally unusual workbooks that will be mapped manually.
+    """
+    wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    try:
+        names = list(wb.sheetnames)
+        if not names:
+            raise ValueError(f"Workbook contains no sheets: {Path(path).name}")
+        wanted = str(preferred_sheet or "").strip()
+        if wanted:
+            exact = next((name for name in names if name.casefold() == wanted.casefold()), None)
+            if exact:
+                return exact
+        for name in names:
+            if _sheet_is_usable(wb[name]):
+                return name
+        return names[0]
+    finally:
+        wb.close()
+
+
+def read_excel_raw(path: Path, *, sheet_name: str | None = None) -> tuple[list[str], list[dict]]:
+    wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    try:
+        names = list(wb.sheetnames)
+        if not names:
+            return [], []
+        wanted = str(sheet_name or "").strip()
+        selected = next((name for name in names if wanted and name.casefold() == wanted.casefold()), None)
+        if selected is None:
+            selected = next((name for name in names if _sheet_is_usable(wb[name])), names[0])
+        ws = wb[selected]
         iterator = ws.iter_rows(values_only=True)
         try:
-            headers = [str(x or "").replace("\ufeff", "").strip() for x in next(iterator)]
+            headers = _clean_excel_row(next(iterator))
         except StopIteration:
             return [], []
         rows: list[dict] = []
@@ -94,7 +172,7 @@ def read_standard_raw(path: Path, *, sheet_name: str = "STANDARD", scan_rows: in
         wb.close()
 
 
-def validate_source_file(source_type: str, path: Path, overrides: Mapping[str, str] | None = None) -> SchemaValidationResult | None:
+def validate_source_file(source_type: str, path: Path, overrides: Mapping[str, str] | None = None, *, sheet_name: str | None = None) -> SchemaValidationResult | None:
     schema = schema_for(source_type)
     if schema is None:
         return None
@@ -104,7 +182,7 @@ def validate_source_file(source_type: str, path: Path, overrides: Mapping[str, s
     elif path.suffix.lower() == ".csv":
         headers, _ = read_csv_raw(path)
     elif path.suffix.lower() in {".xlsx", ".xlsm"}:
-        headers, _ = read_excel_raw(path)
+        headers, _ = read_excel_raw(path, sheet_name=sheet_name)
     else:
         return None
     return resolve_schema(schema, headers, overrides)
@@ -116,6 +194,7 @@ def read_mapped_rows(
     overrides: Mapping[str, str] | None = None,
     *,
     strict: bool = True,
+    sheet_name: str | None = None,
 ) -> MappedRows:
     schema = schema_for(source_type)
     if schema is None:
@@ -126,7 +205,7 @@ def read_mapped_rows(
     elif path.suffix.lower() == ".csv":
         headers, rows = read_csv_raw(path)
     elif path.suffix.lower() in {".xlsx", ".xlsm"}:
-        headers, rows = read_excel_raw(path)
+        headers, rows = read_excel_raw(path, sheet_name=sheet_name)
     else:
         raise ValueError(f"Unsupported tabular source format: {path.name}")
     validation = resolve_schema(schema, headers, overrides)

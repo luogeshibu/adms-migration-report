@@ -22,7 +22,7 @@ MigrationReportApp/
 │  │  ├─ database/                   # SQLite persistence
 │  │  ├─ export/                     # formal Excel generation
 │  │  ├─ filesystem/                 # Site Repository
-│  │  └─ parsers/                    # CSV/XLSX/XML I/O
+│  │  └─ parsers/                    # CSV/XLSX I/O
 │  ├─ config/                        # table/source schema definitions
 │  ├─ ui/                            # PySide6 desktop UI
 │  └─ utils/                         # paths/logging/helpers
@@ -33,7 +33,6 @@ MigrationReportApp/
 ├─ resources/                        # icon/splash/IOA STANDARD.xlsx
 ├─ docs/
 ├─ examples/
-├─ sql/
 ├─ workspace/                        # runtime site data, gitignored
 ├─ build/                            # disposable staging, gitignored
 └─ release/                          # formal artifacts, gitignored

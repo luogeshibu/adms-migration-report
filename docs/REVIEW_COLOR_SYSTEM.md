@@ -33,3 +33,17 @@ Four Boolean Analysis fields already allow 15 non-empty mismatch combinations. A
 ## Excel export
 
 `RMU Data Review` uses the same severity and FALSE-field colors as the desktop App. The Analysis header also contains an Excel comment explaining the color rules.
+
+## Human Review status layer (v0.8.41)
+
+Automatic Analysis colors and manual Human Review colors are separate visual channels. System Pass/Matched remains pale green. Manual status is shown only in Review status cells (including the frozen Row Locator) so it never hides a mismatch or Validation Required row color.
+
+| Human status | Color | Text | Meaning |
+|---|---|---|---|
+| Not Required | `#EEF4F8` | dark blue-gray | automatic result does not require human review |
+| Reviewed | `#2E7D32` | white | explicitly reviewed by a person |
+| Closed | `#00796B` | white | manually confirmed and closed |
+| Needs Action | pale red | dark red | human action/correction is required |
+| Validation Required | pale yellow | amber | automatic validation coverage is incomplete |
+
+Comments and Resolution content remain neutral rather than inheriting the dark human status colors. Excel export uses the same Reviewed/Closed fills and white status text.

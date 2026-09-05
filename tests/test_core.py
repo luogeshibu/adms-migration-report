@@ -5,7 +5,7 @@ try:
     from .selftest_core import run_selftest
 except ImportError:  # unittest discover -s tests loads test_core as a top-level module
     from selftest_core import run_selftest
-from migration_report_tool.parsers import parse_zenon_xml, feeder_matches_site
+from migration_report_tool.parsers import feeder_matches_site
 from migration_report_tool.storage import ProjectStore
 from migration_report_tool.comparison import build_comparison
 from migration_report_tool.importing import import_source
@@ -14,25 +14,6 @@ from openpyxl import Workbook
 class CoreRegressionTest(unittest.TestCase):
     def test_end_to_end_core(self):
         run_selftest()
-
-    def test_zenon_xml_picture_shortname_maps_to_screen_name(self):
-        xml = """<?xml version='1.0' encoding='utf-8'?>
-<Root>
-  <Picture ShortName='ADF110 (JEDDAH)'>
-    <Elements_Test>
-      <LinkName>01_VERT_SRMU_2L1T_01</LinkName>
-      <SubstituteDestination>ADF-15-5</SubstituteDestination>
-    </Elements_Test>
-  </Picture>
-</Root>"""
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'sample.xml'
-            path.write_text(xml, encoding='utf-8')
-            rows = parse_zenon_xml(path)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]['screen_name'], 'ADF110 (JEDDAH)')
-        self.assertEqual(rows[0]['feeder'], 'ADF-15')
-        self.assertEqual(rows[0]['rmu'], '5')
 
     def test_official_se_feeder_header_maps_to_report(self):
         with tempfile.TemporaryDirectory() as td:
@@ -80,24 +61,6 @@ class CoreRegressionTest(unittest.TestCase):
                 self.assertEqual(store.source_path("se_list"), r2.stored_path)
             finally:
                 store.db.close()
-
-    def test_combined_abn_abn2_xml_isolated_by_exact_feeder_token(self):
-        xml = """<?xml version='1.0' encoding='utf-8'?>
-<Root>
-  <Picture ShortName='ABN2-110 (JEDDAH)'>
-    <Elements_0><LinkName>01_VERT_SRMU_2L1T_01</LinkName><SubstituteDestination>JED-NTH-ABN2-16-24668</SubstituteDestination></Elements_0>
-    <Elements_1><LinkName>01_VERT_SRMU_2L1T_01</LinkName><SubstituteDestination>JED-NTH-ABN-22-23953</SubstituteDestination></Elements_1>
-  </Picture>
-</Root>"""
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "ABN-ABN2.XML"
-            path.write_text(xml, encoding="utf-8")
-            abn2 = parse_zenon_xml(path, site_name="ABN2")
-            abn = parse_zenon_xml(path, site_name="ABN")
-        self.assertEqual([(r["feeder"], r["rmu"]) for r in abn2], [("JED-NTH-ABN2-16", "24668")])
-        self.assertEqual([(r["feeder"], r["rmu"]) for r in abn], [("JED-NTH-ABN-22", "23953")])
-        self.assertFalse(feeder_matches_site("JED-NTH-ABN2-16", "ABN"))
-        self.assertTrue(feeder_matches_site("JED-NTH-ABN2-16", "ABN2"))
 
     def test_se_feeder_suffix_is_an_additional_positive_filter(self):
         self.assertTrue(feeder_matches_site("JED-NTH-ABN2-16", "CUSTOM_SITE", ["ABN2-16"]))
@@ -153,13 +116,13 @@ class AnalysisConsistencyTests(unittest.TestCase):
         result_12 = compare_consistency({
             "SE": "ABN-12",
             "ZENON DB": "ABN-12",
-            "ZENON SLD XML": "JED-NTH-ABN-12",
+            "ZENON SLD": "JED-NTH-ABN-12",
             "ADMS DB": "ABN-AH312",
         }, normalizer)
         self.assertTrue(result_12.value)
         result_1 = compare_consistency({
             "SE": "ABN-1",
-            "ZENON SLD XML": "JED-NTH-ABN-1",
+            "ZENON SLD": "JED-NTH-ABN-1",
             "ADMS DB": "ABN-AH301",
         }, normalizer)
         self.assertTrue(result_1.value)
@@ -174,19 +137,19 @@ class AnalysisConsistencyTests(unittest.TestCase):
         normalizer = lambda value: normalize_feeder_for_compare(value, "ABH")
         matching = compare_consistency({
             "SE": "ABH-8",
-            "ZENON SLD XML": "JED-NTH-ABH-8",
+            "ZENON SLD": "JED-NTH-ABH-8",
             "ADMS DB": "JED-NTH-ABH-AH308",
         }, normalizer)
         self.assertTrue(matching.value)
         mismatch = compare_consistency({
             "SE": "ABH-03",
             "ZENON DB": "DHN-40",
-            "ZENON SLD XML": "JED-NTH-ABH-3",
+            "ZENON SLD": "JED-NTH-ABH-3",
             "ADMS DB": "JED-NTH-ABH-AH303",
         }, normalizer)
         self.assertFalse(mismatch.value)
         self.assertEqual(mismatch.normalized_by_source["SE"], "ABH-3")
-        self.assertEqual(mismatch.normalized_by_source["ZENON SLD XML"], "ABH-3")
+        self.assertEqual(mismatch.normalized_by_source["ZENON SLD"], "ABH-3")
         self.assertEqual(mismatch.normalized_by_source["ADMS DB"], "ABH-3")
         self.assertEqual(mismatch.normalized_by_source["ZENON DB"], "DHN-40")
 
@@ -196,13 +159,13 @@ class AnalysisConsistencyTests(unittest.TestCase):
         result = compare_consistency({
             "SE": "ABH-22",
             "ZENON DB": "JED-NTH-ABH-22",
-            "ZENON SLD XML": "JED-NTH-ABH-22",
+            "ZENON SLD": "JED-NTH-ABH-22",
             "ADMS DB": "JED-NTH-ABN-22",
         }, normalizer)
         self.assertFalse(result.value)
         self.assertEqual(result.normalized_by_source["SE"], "ABH-22")
         self.assertEqual(result.normalized_by_source["ZENON DB"], "ABH-22")
-        self.assertEqual(result.normalized_by_source["ZENON SLD XML"], "ABH-22")
+        self.assertEqual(result.normalized_by_source["ZENON SLD"], "ABH-22")
         self.assertEqual(result.normalized_by_source["ADMS DB"], "ABN-22")
 
     def test_numeric_only_feeder_uses_selected_station_hint(self):
@@ -275,7 +238,53 @@ class AnalysisConsistencyTests(unittest.TestCase):
             finally:
                 store.db.close()
 
-    def test_ip_and_link_analysis_keep_reason_details(self):
+    def test_adms_db_optional_smart_participates_only_when_present(self):
+        import csv
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            adb_path = root / "ADMS-DB.csv"
+            with adb_path.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["RMU_NAME", "TYPE", "SMART"])
+                w.writeheader(); w.writerow({"RMU_NAME":"R1", "TYPE":"2L1T", "SMART":"NORMAL"})
+            asld_path = root / "ADMS-SLD.csv"
+            with asld_path.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["RMU", "TYPE", "SMART", "LINK"])
+                w.writeheader(); w.writerow({"RMU":"R1", "TYPE":"2L1T", "SMART":"SMART", "LINK":"YES"})
+            store = ProjectStore(root / "project")
+            try:
+                store.set_source("adms_db", adb_path)
+                store.set_source("adms_sld", asld_path)
+                rows, _ = build_comparison(store)
+                row = next(r for r in rows if r["rmu"] == "R1")
+                self.assertEqual(row["adb_smart"], "NORMAL")
+                self.assertEqual(row["analysis_smart"], "FALSE")
+            finally:
+                store.db.close()
+
+    def test_adms_db_missing_smart_stays_blank_and_does_not_break_smart_analysis(self):
+        import csv
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            adb_path = root / "ADMS-DB.csv"
+            with adb_path.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["RMU_NAME", "TYPE"])
+                w.writeheader(); w.writerow({"RMU_NAME":"R1", "TYPE":"2L1T"})
+            asld_path = root / "ADMS-SLD.csv"
+            with asld_path.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["RMU", "TYPE", "SMART", "LINK"])
+                w.writeheader(); w.writerow({"RMU":"R1", "TYPE":"2L1T", "SMART":"SMART", "LINK":"YES"})
+            store = ProjectStore(root / "project")
+            try:
+                store.set_source("adms_db", adb_path)
+                store.set_source("adms_sld", asld_path)
+                rows, _ = build_comparison(store)
+                row = next(r for r in rows if r["rmu"] == "R1")
+                self.assertEqual(row["adb_smart"], "")
+                self.assertEqual(row["analysis_smart"], "TRUE")
+            finally:
+                store.db.close()
+
+    def test_ip_analysis_keeps_reason_details_and_link_is_retired(self):
         import csv
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -299,11 +308,11 @@ class AnalysisConsistencyTests(unittest.TestCase):
                 rows, _ = build_comparison(store)
                 row = next(r for r in rows if r["rmu"] == "R1")
                 self.assertEqual(row["analysis_ip"], "FALSE")
-                self.assertEqual(row["analysis_link"], "FALSE")
-                self.assertIn("Driver info: 172.16.1.10", row["analysis_ip_detail"])
-                self.assertIn("ADMS SLD LINK: FALSE", row["analysis_link_detail"])
+                self.assertEqual(row["analysis_link"], "")
+                self.assertIn("ZENON DB: 172.16.1.10", row["analysis_ip_detail"])
+                self.assertEqual(row["analysis_link_detail"], "")
                 self.assertIn("IP mismatch", row["remarks"])
-                self.assertIn("RMU not linked", row["remarks"])
+                self.assertNotIn("RMU not linked", row["remarks"])
             finally:
                 store.db.close()
 
@@ -338,8 +347,9 @@ class ComparisonReviewSchemaTests(unittest.TestCase):
         display_keys = [key for key, _label, _width in COMPARISON_COLUMNS]
         report_keys = [key for key, _label, _width in COLUMNS]
         self.assertEqual(
-            display_keys[:10],
-            ["analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "analysis_link", "remarks", "comments", "no", "rmu"],
+            display_keys[:9],
+            ["analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "remarks", "comments", "no", "rmu"],
         )
-        self.assertEqual(report_keys[-8:], ["analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "analysis_link", "remarks", "comments"])
+        self.assertEqual(report_keys[-7:], ["analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "remarks", "comments"])
+        self.assertNotIn("analysis_link", display_keys)
         self.assertEqual(set(display_keys), set(report_keys))

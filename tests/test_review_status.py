@@ -4,7 +4,9 @@ from pathlib import Path
 
 from migration_report_tool.storage import ProjectStore
 
-from migration_report_tool.review_status import analysis_review_state, field_false_color, signal_review_display_status
+from migration_report_tool.review_status import (
+    analysis_review_state, field_false_color, signal_review_display_status, rmu_review_display_status,
+)
 
 
 def row(**updates):
@@ -33,9 +35,10 @@ class ReviewStatusTests(unittest.TestCase):
 
     def test_any_two_issues_share_same_severity(self):
         a = analysis_review_state(row(analysis_feeder="FALSE", analysis_type="FALSE"))
-        b = analysis_review_state(row(analysis_ip="FALSE", analysis_link="FALSE"))
+        b = analysis_review_state(row(analysis_ip="FALSE", analysis_smart="FALSE", analysis_link="FALSE"))
         self.assertEqual(a.row_status, "two_issues")
         self.assertEqual(b.row_status, "two_issues")
+        self.assertNotIn("LINK", b.false_fields)
 
     def test_one_and_two_issue_rows_share_one_visual_issue_color(self):
         one = analysis_review_state(row(analysis_feeder="FALSE"))
@@ -43,8 +46,9 @@ class ReviewStatusTests(unittest.TestCase):
         self.assertEqual(one.row_color, two.row_color)
 
     def test_all_false_fields_share_one_mismatch_color(self):
-        colors = {field_false_color(name) for name in ("NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK")}
+        colors = {field_false_color(name) for name in ("NAME", "FEEDER", "SMART", "TYPE", "IP")}
         self.assertEqual(len(colors), 1)
+        self.assertIsNone(field_false_color("LINK"))
 
     def test_name_is_always_critical(self):
         state = analysis_review_state(row(analysis_name="FALSE"))
@@ -57,19 +61,34 @@ class ReviewStatusTests(unittest.TestCase):
 
     def test_new_field_colors_exist(self):
         self.assertIsNotNone(field_false_color("IP"))
-        self.assertIsNotNone(field_false_color("LINK"))
+        self.assertIsNone(field_false_color("LINK"))
 
-    def test_signal_matched_defaults_not_required_but_allows_explicit_review(self):
-        self.assertEqual(signal_review_display_status("TRUE", "UNREVIEWED"), "NOT REQUIRED")
-        self.assertEqual(signal_review_display_status("TRUE", "REVIEWED"), "REVIEWED")
+    def test_signal_matched_defaults_closed_but_allows_three_explicit_states(self):
+        self.assertEqual(signal_review_display_status("TRUE", "UNREVIEWED"), "CLOSED")
+        self.assertEqual(signal_review_display_status("TRUE", "UNREVIEWED", explicit=True), "UNREVIEWED")
+        self.assertEqual(signal_review_display_status("TRUE", "CLOSED"), "CLOSED")
         self.assertEqual(signal_review_display_status("TRUE", "NEEDS ACTION"), "NEEDS ACTION")
+        # Legacy REVIEWED is normalized on read/migration to CLOSED.
+        self.assertEqual(signal_review_display_status("TRUE", "REVIEWED"), "CLOSED")
 
-    def test_signal_mismatch_uses_required_review_state(self):
+    def test_signal_mismatch_defaults_unreviewed_and_accepts_explicit_states(self):
         self.assertEqual(signal_review_display_status("FALSE", "UNREVIEWED"), "UNREVIEWED")
-        self.assertEqual(signal_review_display_status("FALSE", "REVIEWED"), "REVIEWED")
+        self.assertEqual(signal_review_display_status("FALSE", "CLOSED"), "CLOSED")
+        self.assertEqual(signal_review_display_status("FALSE", "NEEDS ACTION"), "NEEDS ACTION")
 
-    def test_signal_unchecked_cannot_be_overridden_by_review(self):
-        self.assertEqual(signal_review_display_status("", "REVIEWED"), "VALIDATION REQUIRED")
+    def test_signal_unchecked_stays_unreviewed_except_zenon_only_auto_close(self):
+        self.assertEqual(signal_review_display_status("", "UNREVIEWED"), "UNREVIEWED")
+        self.assertEqual(signal_review_display_status("", "UNREVIEWED", zenon_only=True), "CLOSED")
+        self.assertEqual(signal_review_display_status("", "CLOSED"), "CLOSED")
+        self.assertEqual(signal_review_display_status("", "NEEDS ACTION"), "NEEDS ACTION")
+
+    def test_rmu_pass_defaults_closed_and_issue_defaults_unreviewed(self):
+        self.assertEqual(rmu_review_display_status(row(), {}), "CLOSED")
+        self.assertEqual(rmu_review_display_status(row(analysis_feeder="FALSE"), {}), "UNREVIEWED")
+        self.assertEqual(
+            rmu_review_display_status(row(), {"review_status": "UNREVIEWED", "reviewed_by": "tester"}),
+            "UNREVIEWED",
+        )
 
 
 class RmuReviewPersistenceTests(unittest.TestCase):
@@ -78,14 +97,17 @@ class RmuReviewPersistenceTests(unittest.TestCase):
             store = ProjectStore(Path(tmp))
             try:
                 self.assertEqual(store.rmu_review_map(), {})
-                store.update_rmu_review_status("8664", "REVIEWED", "tester")
-                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "REVIEWED")
+                store.update_rmu_review_status("8664", "CLOSED", "tester")
+                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "CLOSED")
                 change = store.changes()[0]
                 self.assertEqual(change["rmu"], "8664")
                 self.assertEqual(change["field_name"], "rmu_review_status")
-                self.assertEqual(change["new_value"], "REVIEWED")
+                self.assertEqual(change["new_value"], "CLOSED")
                 store.update_rmu_review_status("8664", "UNREVIEWED", "tester")
                 self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "UNREVIEWED")
+                self.assertTrue(store.rmu_review_map()["8664"]["reviewed_by"])
+                store.update_rmu_review_status("8664", "NEEDS ACTION", "tester")
+                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "NEEDS ACTION")
             finally:
                 store.db.close()
 
@@ -117,12 +139,18 @@ class RmuReviewPersistenceTests(unittest.TestCase):
                     "analysis_link_detail": "linked",
                 }
                 store.save_comparison([dict(base)])
-                store.update_rmu_review_status("8664", "REVIEWED", "tester")
+                store.update_rmu_review_status("8664", "CLOSED", "tester")
                 store.save_comparison([dict(base, se_station="changed-but-analysis-same")])
-                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "REVIEWED")
+                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "CLOSED")
 
-                changed = dict(base, analysis_link="FALSE", analysis_link_detail="not linked")
-                store.save_comparison([changed])
+                # Retired LINK is no longer part of the active Analysis fingerprint.
+                changed_link = dict(base, analysis_link="FALSE", analysis_link_detail="not linked")
+                store.save_comparison([changed_link])
+                self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "CLOSED")
+
+                # A change to an active Analysis field still resets the review.
+                changed_ip = dict(base, analysis_ip="FALSE")
+                store.save_comparison([changed_ip])
                 self.assertEqual(store.rmu_review_map()["8664"]["review_status"], "UNREVIEWED")
                 audit = [x for x in store.changes() if x["field_name"] == "rmu_review_status"]
                 self.assertTrue(any("Automatic reset" in x["reason"] for x in audit))
@@ -134,13 +162,13 @@ class RmuReviewPersistenceTests(unittest.TestCase):
             store = ProjectStore(Path(tmp))
             try:
                 store.update_db_smart_review(
-                    row_key="signal-1", rmu="8664", field="review_status", value="REVIEWED",
+                    row_key="signal-1", rmu="8664", field="review_status", value="CLOSED",
                     modified_by="tester", source_hash="source-a", row_hash="row-a", site_name="ADF",
                 )
                 store.sync_db_smart_review_fingerprints({
                     "signal-1": {"source_hash": "source-b", "row_hash": "row-a"}
                 })
-                self.assertEqual(store.db_smart_review_map()["signal-1"]["review_status"], "REVIEWED")
+                self.assertEqual(store.db_smart_review_map()["signal-1"]["review_status"], "CLOSED")
 
                 reset = store.sync_db_smart_review_fingerprints({
                     "signal-1": {"source_hash": "source-b", "row_hash": "row-b"}
@@ -155,3 +183,39 @@ class RmuReviewPersistenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_closed_status_is_persisted_for_signal_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ProjectStore(Path(tmp))
+        try:
+            store.update_db_smart_review(
+                row_key="signal-closed", rmu="9001", field="review_status", value="CLOSED",
+                modified_by="tester", source_hash="source-a", row_hash="row-a", site_name="ABH",
+            )
+            assert store.db_smart_review_map()["signal-closed"]["review_status"] == "CLOSED"
+            change = store.changes()[0]
+            assert change["field_name"] == "db_smart_review_status"
+            assert change["new_value"] == "CLOSED"
+        finally:
+            store.db.close()
+
+
+def test_explicit_signal_unreviewed_keeps_reviewer_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ProjectStore(Path(tmp))
+        try:
+            store.update_db_smart_review(
+                row_key="signal-clear", rmu="9002", field="review_status", value="CLOSED",
+                modified_by="tester", source_hash="source-a", row_hash="row-a", site_name="ABH",
+            )
+            store.update_db_smart_review(
+                row_key="signal-clear", rmu="9002", field="review_status", value="UNREVIEWED",
+                modified_by="tester", source_hash="source-a", row_hash="row-a", site_name="ABH",
+            )
+            review = store.db_smart_review_map()["signal-clear"]
+            assert review["review_status"] == "UNREVIEWED"
+            assert review["reviewed_by"] == "tester"
+            assert review["reviewed_at"]
+        finally:
+            store.db.close()

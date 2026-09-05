@@ -116,6 +116,7 @@ try {
     Write-Host '[7/10] Packaged EXE self-test...' -ForegroundColor Cyan
     & $StageExe --self-test
     if ($LASTEXITCODE -ne 0) { throw 'Packaged EXE self-test failed.' }
+    Invoke-Python -Label '  Embedded Windows icon resource check' -PythonArgs @('packaging\tools\verify_windows_icon.py','--exe',$StageExe)
 
     Invoke-Python -Label '[8/10] Creating versioned release + ZIP + SHA256...' -PythonArgs @('packaging\tools\package_release.py','--root',$Root,'--version',$Version,'--dist',$StageApp,'--release',$ReleaseRoot)
 

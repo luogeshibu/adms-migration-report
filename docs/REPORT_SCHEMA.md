@@ -7,27 +7,20 @@ The application no longer uses a customer report template. The only bundled work
 | Columns | Group | Fields |
 |---|---|---|
 | A:B | index | No., RMU |
-| C:G | SE | Station, Feeder, RMU, Device, OH / UG |
-| H:O | ZENON DB | Feeder, RMU, BRAND, Device, NOP, SMART, VIP, Function Location |
-| P:AB | Driver Info | IP, PORT, LINK_ADDRESS, LINK_ADDRESS_SIZE, COT_SIZE, COA_SIZE, IOA_SIZE, T1, T2, T3, K, W, NET_ADDRESS |
-| AC:AF | ZENON SLD XML | Screen Name, Feeder, RMU, TYPE |
-| AG:AO | ADMS DB | RMU, ADMS_GSS-FID, Y1, Y2, Y3, Y4, Q1, Q2, TYPE |
-| ADMS Channel | ADMS Channel | IP, PORT |
-| AS:AV | ADMS SLD | RMU, TYPE, SMART, LINK |
-| AW:AZ | Analysis | NAME, FEEDER, SMART, TYPE |
+| C:G | SE | Station, Feeder, RMU, SMART, OH / UG |
+| H:AB | ZENON DB | Feeder, RMU, BRAND, Device, NOP, SMART, VIP, Function Location, IP, PORT, LINK_ADDRESS, LINK_ADDRESS_SIZE, COT_SIZE, COA_SIZE, IOA_SIZE, T1, T2, T3, K, W, NET_ADDRESS |
+| AC:AF | ZENON SLD | Screen Name, Feeder, RMU, TYPE |
+| AG:AR | ADMS DB | RMU, ADMS_GSS-FID, Y1, Y2, Y3, Y4, Q1, Q2, TYPE, SMART, IP, PORT |
+| AS:AU | ADMS SLD | RMU, TYPE, SMART |
+| AV:AZ | Analysis | NAME, FEEDER, SMART, TYPE, IP |
 | BA | Remarks | Remarks |
-| BB | Comments | SE user review comments |
+| BB | Resolution | Customer resolution / review comment |
 
-## Zenon XML Screen Name
+## ZENON SLD Screen / Picture
 
-`Screen Name` is read from the owning Zenon XML picture node:
+`Screen / Picture` is read from the mapped `Picture` field in the supplied ZENON-SLD device inventory.
 
-```xml
-<Picture ShortName="ADF110 (JEDDAH)">
-```
-
-The canonical internal field is `zsld_screen_name`. Legacy CSV columns named `Picture`, `Picture ShortName`, or `Screen Name` remain accepted.
 
 ## Ownership
 
-Columns A:BA mirror the customer DATA template. BB `Comments` is intentionally appended by Migration Report Tool for SE review feedback and is stored in SQLite, version snapshots, Audit Log changes, and exported reports.
+Each visible source group corresponds to one physical source table. Missing physical fields remain blank. Analysis may normalize/compare values, but source-table cells preserve their own source values. BB stores the structured/manual Resolution text used by the review and sign-off workflow.

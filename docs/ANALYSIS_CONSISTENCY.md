@@ -1,42 +1,40 @@
-# Analysis Consistency Standard — v0.8.21
+# RMU Analysis Consistency Standard — v0.8.143
 
-The DATA `Analysis` group (`NAME / FEEDER / SMART / TYPE`) uses a shared consistency rule.
+The RMU Data Review `Analysis` group uses one shared rule for **NAME / FEEDER / SMART / TYPE / IP**.
 
 ## Decision rule
 
-For each field, values are collected from the applicable sources: SE, ZENON DB, ZENON SLD XML, ADMS DB and ADMS SLD.
+For each field, the App collects the value from every applicable RMU source: **SE, ZENON DB, ZENON SLD, ADMS DB and ADMS SLD**.
 
-1. Blank values do not participate.
-2. If every source is blank, Analysis is blank.
+1. Blank / missing values do not participate in comparison.
+2. If every source is blank, Analysis is blank (`N/A`).
 3. If exactly one source has a value, Analysis is `TRUE`.
-4. If two or more sources have values, Analysis is `TRUE` only when every normalized value is the same.
-5. Any conflicting non-blank value produces `FALSE`.
+4. If two or more sources have values, Analysis is `TRUE` only when all normalized values agree.
+5. Any conflicting non-blank value produces `FALSE` and becomes a customer Resolution decision.
+6. A missing source row is informational only; it does not by itself create an Analysis mismatch.
+
+This means Analysis is availability-driven, not majority-driven. Three equal values and one conflicting value are still `FALSE`; the App never lets a majority vote hide a disagreement.
 
 ## Field normalization
 
 - **NAME**: RMU/cabinet identifier, case-normalized.
-- **FEEDER**: station-aware feeder normalization. The comparison key is `station/site token + feeder number`. For example, `ABH-03`, `JED-NTH-ABH-03` and `JED-NTH-ABH-3` normalize to `ABH-3`, while `ABN-3` remains a different feeder.
-- **SMART**: `SMART`, `SMR`, `YES`, `TRUE`, `1`, and SE values such as `SMART NOP HT` normalize to `SMART`; `NORMAL`, `NO`, `FALSE`, `0`, etc. normalize to `NORMAL`.
-- **TYPE**: cabinet type such as `2L1T` / `3L1T`. Current ZENON DB `DEVICE` is treated as cabinet type. SE `EQUIP. TYPE` is not used as cabinet type because it represents SMART/NORMAL equipment classification in the current SE format.
+- **FEEDER**: station-aware feeder identity. Region/routing prefixes such as `JED-NTH` are ignored, but station identity is retained. `ABH-03`, `JED-NTH-ABH-03` and `JED-NTH-ABH-AH303` normalize to the same logical feeder `ABH-3`; `ABN-3` is different.
+- **SMART**: common SMART/SMR/YES/TRUE/1 representations normalize to `SMART`; NORMAL/NO/FALSE/0 representations normalize to `NORMAL`.
+- **TYPE**: cabinet type such as `2L1T` / `3L1T` is normalized without insignificant spacing/case differences.
+- **IP**: IPv4/IPv6/CIDR values are normalized to the host IP before comparison.
 
-The current ZENON SLD XML schema has no explicit SMART field, so SMART is not inferred from `LinkName`; it remains blank and is ignored unless an explicit SMART field is added later.
+## Source-aware IP
 
-## v0.7.0 additional checks
+IP is no longer a special two-source `ZENON DB ↔ ADMS DB` comparison. It uses the same common five-source engine as the other fields.
 
-### IP
-`IP` compares the Driver info IP with the ADMS Channel IP. Blank values are ignored by the same available-value rule. IP/CIDR text is normalized before comparison. A mismatch remains visible both as a FALSE-cell highlight and as a detailed tooltip/Remarks reason.
+Current files normally provide IP in **ZENON DB** and **ADMS DB**, so those are the only two values that participate today. Optional IP mappings are also defined for **SE / ZENON SLD / ADMS SLD**. If one of those source files later adds an `IP`, `IP_ADDRESS` or `PRIMARY_IP` field and it is mapped, that value automatically joins the same comparison.
 
-### LINK
-`LINK` is not a cross-source consistency comparison. It reads the ADMS-SLD association field for the RMU directly. A true-like value or non-empty association identifier is TRUE; a blank/false-like LINK on an existing ADMS-SLD RMU row is FALSE. If the entire ADMS-SLD RMU row is missing, LINK is N/A/blank so a missing source is not double-counted as an association failure.
+Examples:
 
-## v0.7.1 column-layout migration
+- ZENON DB only has `172.20.13.10` → `TRUE`.
+- ZENON DB + ADMS DB both have `172.20.13.10` → `TRUE`.
+- ZENON DB = `172.20.13.10`, ADMS DB = `172.20.13.11` → `FALSE`.
+- SE / ZENON DB / ZENON SLD / ADMS DB / ADMS SLD all have the same IP → `TRUE`.
+- Four sources agree and one source differs → `FALSE`.
 
-The Analysis model contains six visible checks: NAME, FEEDER, SMART, TYPE, IP and LINK.
-When upgrading from a build that saved a four-column Analysis layout, the application automatically enables IP and LINK once.  Subsequent manual hide/show choices are preserved.
-
-
-## Feeder normalization rules
-
-Feeder comparison uses the complete logical identity `station/site token + feeder number`. Region/routing prefixes such as `JED-NTH` are ignored, but the station token itself is never discarded. Numeric zero padding is ignored (`ABH-03` = `ABH-3`). The confirmed ADMS encoding `AH3xx` is decoded to feeder `xx` while retaining the station token, so `JED-NTH-ABH-AH303` = `ABH-03` = `ABH-3`. Crucially, `ABH-22` and `ABN-22` are different feeders even though the number is the same. Numeric-only values use the selected repository site as a station hint. Unknown encodings are never guessed; they remain visible as mismatches.
-
-The old ADMS Channel source-level `Analysis` column has been removed. IP consistency is represented only by the main Analysis `IP` field.
+The Resolution candidates preserve the contributing source name and raw value so the customer can select the approved value when Analysis is `FALSE`.

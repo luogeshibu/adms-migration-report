@@ -25,28 +25,48 @@ class SourceSchemaMappingTests(unittest.TestCase):
         self.assertTrue(result.errors)
         self.assertIn("RMU", result.error_message("ZENON-DB.csv"))
 
-    def test_adms_db_does_not_define_smart_field(self):
+    def test_adms_db_defines_optional_smart_without_warning_when_missing(self):
         schema = schema_for("adms_db")
         keys = [field.key for field in schema.fields]
-        self.assertNotIn("smart", keys)
+        self.assertIn("smart", keys)
         result = resolve_schema(schema, [
             "RMU_NAME", "ADMS_GSS-FID", "TYPE", "NET_DESCRIPTION1", "port",
             "Y1", "Y2", "Y3", "Y4", "Q1", "Q2",
         ])
         self.assertFalse(result.errors)
         self.assertFalse(result.warnings)
+        self.assertIsNone(result.mapped_column("smart"))
 
-    def test_adms_db_smart_column_is_not_consumed_even_if_present(self):
+    def test_adms_db_smart_column_maps_automatically_when_present(self):
         schema = schema_for("adms_db")
         result = resolve_schema(schema, ["RMU_NAME", "SMART"])
-        self.assertNotIn("smart", result.mapping_by_key)
-        self.assertIn("SMART", result.ignored_columns)
+        self.assertEqual(result.mapped_column("smart"), "SMART")
+        self.assertNotIn("SMART", result.ignored_columns)
 
     def test_alias_priority_is_explicit_and_deterministic(self):
         result = resolve_schema(schema_for("adms_sld"), ["环网柜名称", "环网柜类型", "智能标识", "是否智能", "RMU可关联", "环网柜ID"])
         self.assertFalse(result.errors)
-        self.assertEqual(result.mapped_column("smart"), "智能标识")
+        self.assertEqual(result.mapped_column("smart"), "是否智能")
         self.assertEqual(result.mapped_column("link"), "RMU可关联")
+
+
+    def test_adms_sld_smart_prefers_is_smart_header_over_legacy_smart_marker(self):
+        result = resolve_schema(
+            schema_for("adms_sld"),
+            ["环网柜名称", "环网柜类型", "智能标识", "是否智能"],
+            {"smart": "智能标识"},
+        )
+        self.assertFalse(result.errors)
+        self.assertEqual(result.mapped_column("smart"), "是否智能")
+        self.assertIn("ignored", result.mapping_by_key["smart"].message.lower())
+
+    def test_adms_sld_smart_falls_back_to_legacy_marker_when_is_smart_absent(self):
+        result = resolve_schema(
+            schema_for("adms_sld"),
+            ["环网柜名称", "环网柜类型", "智能标识"],
+        )
+        self.assertFalse(result.errors)
+        self.assertEqual(result.mapped_column("smart"), "智能标识")
 
     def test_site_override_can_map_confirmed_alternate_header(self):
         result = resolve_schema(schema_for("zenon_db"), ["RMU", "CABINET_MODEL"], {"rmu_type": "CABINET_MODEL"})
@@ -66,15 +86,24 @@ class SourceSchemaMappingTests(unittest.TestCase):
             self.assertEqual(row["ip"], "172.20.46.228")
             self.assertEqual(row["port"], "2404")
 
-    def test_se_schema_matches_business_fields_without_duplicate_device_mapping(self):
+    def test_se_schema_keeps_device_type_separate_from_type_and_smart(self):
         schema = schema_for("se_list")
         keys = [field.key for field in schema.fields]
-        self.assertEqual(keys, ["station", "feeder", "rmu", "smart", "oh_ug", "rmu_type"])
+        self.assertEqual(keys, ["station", "feeder", "rmu", "device_type", "smart", "oh_ug", "rmu_type", "ip"])
         self.assertNotIn("device", keys)
         result = resolve_schema(schema, ["SS", "FEEDR", "EQUIPMENT", "EQUIP. TYPE", "OH / UG"])
         self.assertFalse(result.errors)
         self.assertEqual(result.mapped_column("smart"), "EQUIP. TYPE")
+        self.assertIsNone(result.mapped_column("device_type"))
         self.assertIsNone(result.mapped_column("rmu_type"))
+
+        explicit = resolve_schema(
+            schema,
+            ["SS", "FEEDR", "EQUIPMENT", "DEVICE TYPE", "EQUIP. TYPE", "OH / UG", "TYPE"],
+        )
+        self.assertEqual(explicit.mapped_column("device_type"), "DEVICE TYPE")
+        self.assertEqual(explicit.mapped_column("smart"), "EQUIP. TYPE")
+        self.assertEqual(explicit.mapped_column("rmu_type"), "TYPE")
 
     def test_bundled_standard_reference_has_required_named_columns(self):
         from migration_report_tool.paths import resource_root

@@ -6,6 +6,7 @@ import unittest
 from migration_report_tool.db_smart import (
     build_signal_mapping_report,
     read_db_smart_report,
+    SIGNAL_MAPPING_COLUMNS,
 )
 from migration_report_tool.storage import ProjectStore
 from migration_report_tool.paths import resource_root
@@ -41,18 +42,21 @@ class SignalMappingReviewTests(unittest.TestCase):
             self._write_adms_sld(adms_sld)
             standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
             report = build_signal_mapping_report(ioa, adms_sld, standard)
-            self.assertEqual(report.sheet_name, "Calculated · IOA + ADMS SLD + STANDARD")
-            self.assertEqual(len(report.rows), 1)
-            row = report.rows[0]
+            self.assertEqual(report.sheet_name, "Calculated · STANDARD → ADMS validation + ZENON implementation hint")
+            self.assertGreater(len(report.rows), 1)
+            index = {key: i for i, (key, _label, _width) in enumerate(SIGNAL_MAPPING_COLUMNS)}
+            row = next(item for item in report.rows if item.values[index["standard_dot_no"]] == "1")
             self.assertEqual(row.rmu, "26859")
             self.assertEqual(row.values[1], "3L1T")
-            self.assertEqual(row.values[8], "Y1 CMD")
-            self.assertEqual(row.values[9], "1")
-            self.assertEqual(row.values[10], "TRUE")
+            self.assertEqual(row.values[index["standard_signal_name"]], "Y1 CMD")
+            self.assertEqual(row.values[index["standard_dot_no"]], "1")
+            self.assertEqual(row.values[report.analysis_column], "TRUE")
             self.assertIn("Type (from ADMS SLD): 3L1T", row.analysis_detail)
-            self.assertIn("STANDARD", [g[0] for g in report.group_definitions][3])
+            groups = [g[0] for g in report.group_definitions]
+            self.assertLess(groups.index("STANDARD DATABASE I/O list"), groups.index("ADMS"))
+            self.assertLess(groups.index("ADMS"), groups.index("ZENON"))
 
-    def test_name_and_dot_match_is_true_even_when_rmu_type_differs(self):
+    def test_wrong_rmu_type_does_not_cross_match_another_standard_type(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             ioa = root / "ZENON-ADMS-IOA.csv"
@@ -61,9 +65,8 @@ class SignalMappingReviewTests(unittest.TestCase):
             self._write_adms_sld(adms_sld, cabinet_type="99L99T")
             standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
             report = build_signal_mapping_report(ioa, adms_sld, standard)
-            self.assertEqual(report.rows[0].values[10], "TRUE")
-            self.assertIn("name and DOT number match", report.rows[0].analysis_detail)
-            self.assertIn("supporting context", report.rows[0].analysis_detail)
+            self.assertEqual(report.rows[0].values[report.analysis_column], "FALSE")
+            self.assertIn("not present in the STANDARD point list", report.rows[0].analysis_detail)
 
     def test_same_dot_but_different_signal_name_is_false(self):
         with tempfile.TemporaryDirectory() as td:
@@ -71,11 +74,11 @@ class SignalMappingReviewTests(unittest.TestCase):
             ioa = root / "ZENON-ADMS-IOA.csv"
             adms_sld = root / "ADMS-SLD.csv"
             self._write_ioa(ioa, adms_signal="26859 DEFINITELY WRONG SIGNAL")
-            self._write_adms_sld(adms_sld, cabinet_type="99L99T")
+            self._write_adms_sld(adms_sld, cabinet_type="3L1T")
             standard = resource_root() / "templates" / "IOA STANDARD.xlsx"
             report = build_signal_mapping_report(ioa, adms_sld, standard)
-            self.assertEqual(report.rows[0].values[10], "FALSE")
-            self.assertIn("signal name mismatch", report.rows[0].analysis_detail)
+            row = next(item for item in report.rows if item.values[report.analysis_column] == "FALSE" and "DEFINITELY WRONG SIGNAL" in item.analysis_detail)
+            self.assertIn("signal name mismatch", row.analysis_detail)
 
     def test_legacy_db_smart_sheet_is_not_a_source_anymore(self):
         with self.assertRaises(RuntimeError):
@@ -94,7 +97,8 @@ class SignalMappingReviewTests(unittest.TestCase):
                 store.set_source("ioa", ioa)
                 store.set_source("adms_sld", adms_sld)
                 report = build_signal_mapping_report_from_store(store)
-                self.assertEqual(report.rows[0].values[8], "Y1 CMD")
+                index = {key: i for i, (key, _label, _width) in enumerate(SIGNAL_MAPPING_COLUMNS)}
+                self.assertEqual(report.rows[0].values[index["standard_signal_name"]], "Y1 CMD")
                 self.assertTrue(any(p.name == "IOA STANDARD.xlsx" for p in report.input_paths))
             finally:
                 store.db.close()
@@ -103,7 +107,7 @@ class SignalMappingReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = ProjectStore(Path(tmp) / "ADF")
             store.update_db_smart_review(
-                row_key="row-key-1", rmu="26859", field="review_status", value="REVIEWED",
+                row_key="row-key-1", rmu="26859", field="review_status", value="CLOSED",
                 modified_by="tester", source_hash="abc", site_name="ADF",
             )
             store.update_db_smart_review(
@@ -111,7 +115,7 @@ class SignalMappingReviewTests(unittest.TestCase):
                 modified_by="tester", source_hash="abc", site_name="ADF",
             )
             review = store.db_smart_review_map()["row-key-1"]
-            self.assertEqual(review["review_status"], "REVIEWED")
+            self.assertEqual(review["review_status"], "CLOSED")
             self.assertEqual(review["comments"], "Checked by SE")
             changes = store.changes()
             self.assertEqual(len(changes), 2)

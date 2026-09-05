@@ -16,6 +16,7 @@ class MappingKind(str, Enum):
     EXACT = "Exact"
     ALIAS = "Built-in Alias"
     OVERRIDE = "Site Override"
+    BLANK = "Blank · no source"
     MISSING = "Missing"
     AMBIGUOUS = "Ambiguous"
 
@@ -32,6 +33,7 @@ class FieldSpec:
     label: str
     aliases: tuple[str, ...]
     required: bool = False
+    warn_if_missing: bool = True
     description: str = ""
 
     @property
@@ -78,7 +80,20 @@ class SchemaValidationResult:
 
     @property
     def warnings(self) -> tuple[FieldMapping, ...]:
-        return tuple(m for m in self.mappings if not m.required and m.kind == MappingKind.MISSING)
+        return tuple(
+            m for m in self.mappings
+            if (
+                (
+                    m.kind == MappingKind.BLANK
+                    and self.schema.field(m.canonical_key).warn_if_missing
+                )
+                or (
+                    not m.required
+                    and m.kind == MappingKind.MISSING
+                    and self.schema.field(m.canonical_key).warn_if_missing
+                )
+            )
+        )
 
     @property
     def level(self) -> SchemaLevel:

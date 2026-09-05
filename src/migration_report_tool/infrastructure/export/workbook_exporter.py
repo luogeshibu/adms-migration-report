@@ -28,16 +28,19 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.comments import Comment
 from openpyxl.utils import get_column_letter
 
-from ...db_smart import DBSmartReport, build_signal_mapping_report_from_store
+from ...db_smart import DBSmartReport, build_signal_mapping_report_from_store, signal_row_is_zenon_only
 from ...paths import resource_root
 from ...schema import COMPARISON_GROUPS, SOURCE_TYPES
 from ...storage import ProjectStore
-from ...review_status import analysis_review_state, field_false_color, signal_review_display_status
+from ...review_status import (
+    analysis_review_state, field_false_color, rmu_review_display_status,
+    signal_review_display_status, review_record_is_explicit,
+)
 from ...config.sources import schema_for
 from ...services.audit_presentation import present_audit_item
 from ...services.schema_service import (
     get_source_display_names, field_display_name, apply_display_names_to_groups,
-    RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS,
+    RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS, rmu_review_groups,
 )
 from ..parsers import validate_source_file
 
@@ -74,7 +77,8 @@ FALSE_TYPE = "F7D7D7"
 
 REVIEW_NOT_REQUIRED = "EEF4F8"
 REVIEW_UNREVIEWED = "F3F4F6"
-REVIEWED = "DDF5E7"
+REVIEWED = "2E7D32"  # legacy alias; REVIEWED migrates to CLOSED
+CLOSED = "2E7D32"
 NEEDS_ACTION = "FDECEC"
 REVIEW_VALIDATION_REQUIRED = "FFF4D6"
 ANALYSIS_TRUE = "DDF5E7"
@@ -85,6 +89,8 @@ _CELL_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _FILL_CACHE: dict[str, PatternFill] = {}
 _FONT_NORMAL = Font(bold=False, color="18212F")
 _FONT_BOLD = Font(bold=True, color="18212F")
+_FONT_REVIEW_WHITE_BOLD = Font(bold=True, color="FFFFFF")
+_FONT_CHECKMARK = Font(name="Segoe UI Symbol", bold=True, color="FFFFFF", size=13)
 _ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=False)
 _ALIGN_LEFT_WRAP = Alignment(horizontal="left", vertical="center", wrap_text=True)
 _ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=False)
@@ -187,7 +193,6 @@ def _analysis_false_fill(key: str, value: str) -> str | None:
         "analysis_smart": "SMART",
         "analysis_type": "TYPE",
         "analysis_ip": "IP",
-        "analysis_link": "LINK",
     }
     return field_false_color(labels.get(key, "")) or FALSE_NAME
 
@@ -205,7 +210,7 @@ def _add_rmu_color_explanation(ws) -> None:
     # Add field-specific comments to the four Analysis subheaders when present.
     for cell in ws[2]:
         label = str(cell.value or "").strip().upper()
-        if label in {"NAME", "FEEDER", "SMART", "TYPE", "IP", "LINK"}:
+        if label in {"NAME", "FEEDER", "SMART", "TYPE", "IP"}:
             cell.comment = Comment(
                 f"FALSE means {label} is inconsistent across available sources. All FALSE cells use the same mismatch highlight.",
                 "NARI Saudi ADMS Migration Report",
@@ -220,42 +225,38 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
     review_group = (
         "Review",
         "#E8EDF3",
-        (("rmu_review_status", "Review", 125),),
+        (
+            ("rmu_check_passed", "Checked", 90),
+            ("rmu_review_status", "Review", 125),
+        ),
     )
-    rmu_groups = (review_group,) + tuple(apply_display_names_to_groups(
-        COMPARISON_GROUPS, store, RMU_REVIEW_DISPLAY_BINDINGS
-    ))
+    rmu_groups = (review_group,) + tuple(rmu_review_groups(store))
     columns = _write_grouped_headers(
         ws,
         rmu_groups,
         vertical_merge_groups={"Remarks", "Resolution"},
     )
     _add_rmu_color_explanation(ws)
-    analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip", "analysis_link"}
-    neutral_review_keys = analysis_keys | {"remarks", "comments", "rmu_review_status"}
+    analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
+    neutral_review_keys = analysis_keys | {"remarks", "comments", "rmu_check_passed", "rmu_review_status"}
     review_map = store.rmu_review_map()
     review_fills = {
-        "NOT REQUIRED": REVIEW_NOT_REQUIRED,
         "UNREVIEWED": REVIEW_UNREVIEWED,
-        "REVIEWED": REVIEWED,
+        "CLOSED": CLOSED,
         "NEEDS ACTION": NEEDS_ACTION,
-        "VALIDATION REQUIRED": REVIEW_VALIDATION_REQUIRED,
     }
 
     for row_idx, data in enumerate(store.rows(), 3):
         row_fill = _analysis_row_fill(data)
         rmu = str(data.get("rmu", "") or "").strip()
         analysis_state = analysis_review_state(data)
-        stored_review = str(review_map.get(rmu, {}).get("review_status") or "UNREVIEWED").strip().upper()
-        review_status = (
-            stored_review if analysis_state.issue_count > 0
-            else stored_review if analysis_state.has_result and stored_review in {"REVIEWED", "NEEDS ACTION"}
-            else "NOT REQUIRED" if analysis_state.has_result
-            else "VALIDATION REQUIRED"
-        )
+        review_status = rmu_review_display_status(data, review_map.get(rmu, {}))
         for col_idx, (key, _label, _width) in enumerate(columns, 1):
+            review_record = review_map.get(rmu, {})
             value = (
-                review_status if key == "rmu_review_status"
+                ("✓" if bool(int(review_record.get("check_passed") or 0)) else "")
+                if key == "rmu_check_passed"
+                else review_status if key == "rmu_review_status"
                 else (
                     store.rmu_resolution_summary(rmu)
                     if analysis_state.issue_count > 0
@@ -271,15 +272,23 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
             # FALSE Analysis cell is emphasized. Index + source data carry the
             # row-level business status color.
             fill = WHITE if key in neutral_review_keys else row_fill
+            if key == "rmu_check_passed" and str(value).strip():
+                fill = CLOSED
             if key == "rmu_review_status":
                 fill = review_fills.get(review_status, "F3F4F6")
             false_fill = _analysis_false_fill(key, value) if key in analysis_keys else None
             if false_fill:
                 fill = false_fill
-            bold = key in analysis_keys or key in {"no", "rmu", "rmu_review_status"} or (key == "comments" and bool(str(value).strip()))
-            center = key in analysis_keys or key in {"no", "rmu", "rmu_review_status"}
+            bold = key in analysis_keys or key in {"no", "rmu", "rmu_check_passed", "rmu_review_status"} or (key == "comments" and bool(str(value).strip()))
+            center = key in analysis_keys or key in {"no", "rmu", "rmu_check_passed", "rmu_review_status"}
             wrap = key in {"remarks", "comments"}
             _body_cell(cell, fill=fill, bold=bold, center=center, wrap=wrap)
+            if key == "rmu_check_passed" and str(value).strip():
+                # Checked is a human-verification checkbox state, not an automatic PASS result.
+                # Export the same visual meaning as the UI: a centered tick on the completed cell.
+                cell.font = _FONT_CHECKMARK
+            elif key == "rmu_review_status" and review_status == "CLOSED":
+                cell.font = _FONT_REVIEW_WHITE_BOLD
         ws.row_dimensions[row_idx].height = 22
 
     # Freeze the full App review block (Review + Analysis + Remarks + Resolution + Index).
@@ -297,6 +306,7 @@ def _signal_groups(report: DBSmartReport, store: ProjectStore):
         "Review",
         "#E8EDF3",
         (
+            ("db_check_passed", "Checked", 90),
             ("db_review_status", "Review", 125),
             ("db_review_comments", "Comments", 300),
         ),
@@ -318,34 +328,39 @@ def _build_signal_mapping_review_sheet(wb, store: ProjectStore):
     review_map = store.db_smart_review_map()
 
     signal_review_fills = {
-        "NOT REQUIRED": REVIEW_NOT_REQUIRED,
         "UNREVIEWED": REVIEW_UNREVIEWED,
-        "REVIEWED": REVIEWED,
+        "CLOSED": CLOSED,
         "NEEDS ACTION": NEEDS_ACTION,
-        "VALIDATION REQUIRED": REVIEW_VALIDATION_REQUIRED,
     }
     for row_idx, source_row in enumerate(report.rows, 3):
         review = review_map.get(source_row.row_key, {})
-        stored_status = str(review.get("review_status") or "UNREVIEWED").strip().upper() or "UNREVIEWED"
         analysis_result = ""
         if report.analysis_column is not None and report.analysis_column < len(source_row.values):
             analysis_result = str(source_row.values[report.analysis_column] or "").strip().upper()
-        status = signal_review_display_status(analysis_result, stored_status)
-        comments = str(review.get("comments") or "")
-        values = [status, comments, *source_row.values]
+        zenon_only = signal_row_is_zenon_only(source_row)
+        status = signal_review_display_status(
+            analysis_result, review.get("review_status"),
+            explicit=review_record_is_explicit(review),
+            zenon_only=zenon_only,
+        )
+        comments = str(review.get("comments") or getattr(source_row, "suggested_comment", "") or "")
+        checked_tick = "✓" if bool(int(review.get("check_passed") or 0)) else ""
+        values = [checked_tick, status, comments, *source_row.values]
 
-        # Automatic validation determines the row tint; Human Review uses only
-        # the Review cell. This keeps Matched and Reviewed visually distinct.
-        base_fill = ROW_PASS if analysis_result == "TRUE" else ROW_ONE_ISSUE if analysis_result == "FALSE" else REVIEW_VALIDATION_REQUIRED
+        # Automatic validation determines the row tint. ZENON-only points are
+        # accepted as default Closed and therefore use the same green row tint.
+        base_fill = ROW_PASS if (analysis_result == "TRUE" or zenon_only) else ROW_ONE_ISSUE if analysis_result == "FALSE" else REVIEW_VALIDATION_REQUIRED
         for col_idx, ((key, _label, _width), value) in enumerate(zip(columns, values), 1):
             cell = ws.cell(row_idx, col_idx, value)
-            fill = signal_review_fills.get(status, REVIEW_UNREVIEWED) if key == "db_review_status" else WHITE if key == "db_review_comments" else base_fill
-            bold = key == "db_review_status"
-            center = key == "db_review_status"
+            fill = signal_review_fills.get(status, REVIEW_UNREVIEWED) if key == "db_review_status" else WHITE if key in {"db_check_passed", "db_review_comments"} else base_fill
+            if key == "db_check_passed" and str(value).strip():
+                fill = CLOSED
+            bold = key in {"db_check_passed", "db_review_status"}
+            center = key in {"db_check_passed", "db_review_status"}
             wrap = key == "db_review_comments"
 
             # Source analysis column is highlighted exactly like the App view.
-            source_index = col_idx - 3  # Review/Comments occupy the first two columns.
+            source_index = col_idx - 4  # Checked/Review/Comments occupy the first three columns.
             if source_index == report.analysis_column:
                 normalized = str(value or "").strip().upper()
                 if normalized == "TRUE":
@@ -357,9 +372,14 @@ def _build_signal_mapping_review_sheet(wb, store: ProjectStore):
                 if source_row.analysis_detail:
                     cell.comment = Comment(source_row.analysis_detail, "NARI Saudi ADMS Migration Report")
             _body_cell(cell, fill=fill, bold=bold, center=center, wrap=wrap)
+            if key == "db_check_passed" and str(value).strip():
+                cell.font = Font(name="Segoe UI Symbol", size=10, bold=True, color="FFFFFF")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif key == "db_review_status" and status == "CLOSED":
+                cell.font = _FONT_REVIEW_WHITE_BOLD
         ws.row_dimensions[row_idx].height = 22
 
-    ws.freeze_panes = "C3"  # Review + Comments remain visible while scanning the mapping.
+    ws.freeze_panes = "D3"  # Checked + Review + Comments remain visible while scanning the mapping.
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.fitToWidth = 1
@@ -388,7 +408,8 @@ def _build_import_sources_sheet(wb, store: ProjectStore):
         schema = schema_for(key)
         if path and schema is not None:
             try:
-                validation = validate_source_file(key, path, store.source_column_overrides(key))
+                sheet_name = store.source_sheet_name(key) if path.suffix.lower() in {".xlsx", ".xlsm"} and hasattr(store, "source_sheet_name") else ""
+                validation = validate_source_file(key, path, store.source_column_overrides(key), sheet_name=sheet_name or None)
             except Exception as exc:
                 validation = None
                 ws.append([label_and_filter[0], path.name, "", "", "", "", "", f"ERROR: {exc}", str(path)])

@@ -1,5 +1,4 @@
 from pathlib import Path
-import csv
 import tempfile
 import unittest
 import os
@@ -9,7 +8,6 @@ from openpyxl import load_workbook
 from migration_report_tool.config.column_schema import COMPARISON_GROUPS
 from migration_report_tool.core import build_comparison, export_report
 from migration_report_tool.infrastructure.database.sqlite_store import ProjectStore
-from migration_report_tool.infrastructure.filesystem.site_repository import SiteInfo
 from migration_report_tool.services.schema_service import (
     RMU_REVIEW_DISPLAY_BINDINGS,
     SIGNAL_REVIEW_DISPLAY_BINDINGS,
@@ -18,7 +16,6 @@ from migration_report_tool.services.schema_service import (
     set_source_display_names,
 )
 from migration_report_tool.domain.mapping.signal_mapping import SIGNAL_MAPPING_GROUPS
-from migration_report_tool.services.zenon_sld_service import regenerate_site_zenon_sld
 
 
 class DisplayNameAndZenonRegenerationTests(unittest.TestCase):
@@ -104,55 +101,9 @@ class DisplayNameAndZenonRegenerationTests(unittest.TestCase):
                 wb = load_workbook(target, read_only=True, data_only=False)
                 try:
                     self.assertEqual(wb["RMU Data Review"]["M2"].value, "SE Circuit")
-                    self.assertEqual(wb["Signal Mapping Review"]["C2"].value, "Equipment ID")
+                    self.assertEqual(wb["Signal Mapping Review"]["D2"].value, "Equipment ID")
                 finally:
                     wb.close()
-            finally:
-                store.db.close()
-
-    def test_regenerate_zenon_sld_atomically_replaces_existing_csv(self):
-        xml = """<?xml version='1.0' encoding='utf-8'?>
-<Root>
-  <Picture ShortName='ABS-110'>
-    <Elements_0><LinkName>01_VERT_SRMU_2L1T_01</LinkName><SubstituteDestination>JED-NTH-ABS-04-6299</SubstituteDestination></Elements_0>
-  </Picture>
-</Root>"""
-        with tempfile.TemporaryDirectory() as td:
-            site_dir = Path(td) / "ABS"
-            site_dir.mkdir()
-            xml_path = site_dir / "ABS.XML"
-            xml_path.write_text(xml, encoding="utf-8")
-            target = site_dir / "ZENON-SLD.csv"
-            target.write_text("OLD CONTENT\n", encoding="utf-8")
-            store = ProjectStore(Path(td) / "app-workspace")
-            try:
-                site = SiteInfo("ABS", site_dir, {"zenon_xml": xml_path})
-                result = regenerate_site_zenon_sld(site, store)
-                self.assertEqual(result.row_count, 1)
-                self.assertEqual(result.target_path, target)
-                with target.open("r", encoding="utf-8-sig", newline="") as f:
-                    rows = list(csv.DictReader(f))
-                self.assertEqual(rows[0]["RMU"], "6299")
-                self.assertEqual(rows[0]["Feeder"], "JED-NTH-ABS-04")
-                self.assertEqual(rows[0]["Screen name"], "ABS-110")
-            finally:
-                store.db.close()
-
-    def test_zero_row_regeneration_keeps_existing_csv(self):
-        xml = """<?xml version='1.0' encoding='utf-8'?><Root><Picture ShortName='OTHER'/></Root>"""
-        with tempfile.TemporaryDirectory() as td:
-            site_dir = Path(td) / "ABS"
-            site_dir.mkdir()
-            xml_path = site_dir / "ABS.XML"
-            xml_path.write_text(xml, encoding="utf-8")
-            target = site_dir / "ZENON-SLD.csv"
-            target.write_text("OLD CONTENT\n", encoding="utf-8")
-            store = ProjectStore(Path(td) / "app-workspace")
-            try:
-                site = SiteInfo("ABS", site_dir, {"zenon_xml": xml_path})
-                with self.assertRaises(ValueError):
-                    regenerate_site_zenon_sld(site, store)
-                self.assertEqual(target.read_text(encoding="utf-8"), "OLD CONTENT\n")
             finally:
                 store.db.close()
 

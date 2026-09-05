@@ -42,7 +42,7 @@ class AuditPresentationTests(unittest.TestCase):
         })
         self.assertEqual(item["module"], "Site Data Sources")
         self.assertEqual(item["record"], "ZENON DB")
-        self.assertEqual(item["field"], "Column Mapping · RMU Type")
+        self.assertEqual(item["field"], "Column Mapping · Equipment Type / Subtype")
 
 
 if __name__ == "__main__":

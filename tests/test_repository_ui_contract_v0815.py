@@ -9,7 +9,7 @@ def _source_text():
 def test_repository_uses_module_tabs_and_standard_mapping():
     text = _source_text()
     assert "self.module_source_tabs = QTabWidget()" in text
-    assert "Edit Selected Table Mapping" in text
+    assert 'mapping_btn = QPushButton("Map Fields...")' in text
     assert 'source_type == "standard_reference"' in text
     assert "MODULE_SOURCE_GROUPS" in text
 
