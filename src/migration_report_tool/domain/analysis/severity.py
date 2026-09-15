@@ -54,13 +54,30 @@ class AnalysisReviewState:
 
 
 def analysis_review_state(data: dict) -> AnalysisReviewState:
-    normalized = {
-        label: str(data.get(key) or "").strip().upper()
-        for label, key in ANALYSIS_FIELDS
-    }
-    has_result = any(value in {"TRUE", "FALSE"} for value in normalized.values())
-    false_fields = tuple(label for label, _key in ANALYSIS_FIELDS if normalized[label] == "FALSE")
-    issue_count = len(false_fields)
+    # v0.8.178: Equipment Data Review may expose a site-configured set of
+    # comparison rules.  Rows carry stable internal rule ids plus the generated
+    # value keys.  Legacy NAME/FEEDER/SMART/TYPE/IP rows remain fully supported.
+    dynamic_order = list((data or {}).get("analysis_field_order") or [])
+    dynamic_keys = dict((data or {}).get("analysis_field_keys") or {})
+    dynamic_labels = dict((data or {}).get("analysis_field_labels") or {})
+    if dynamic_order:
+        normalized = {
+            field_id: str((data or {}).get(dynamic_keys.get(field_id) or f"analysis__{field_id}") or "").strip().upper()
+            for field_id in dynamic_order
+        }
+        has_result = any(value in {"TRUE", "FALSE"} for value in normalized.values())
+        false_fields = tuple(field_id for field_id in dynamic_order if normalized.get(field_id) == "FALSE")
+        issue_count = len(false_fields)
+        false_display = {str(dynamic_labels.get(field_id) or field_id).strip().upper() for field_id in false_fields}
+    else:
+        normalized = {
+            label: str(data.get(key) or "").strip().upper()
+            for label, key in ANALYSIS_FIELDS
+        }
+        has_result = any(value in {"TRUE", "FALSE"} for value in normalized.values())
+        false_fields = tuple(label for label, _key in ANALYSIS_FIELDS if normalized[label] == "FALSE")
+        issue_count = len(false_fields)
+        false_display = set(false_fields)
 
     if not has_result:
         status = "none"
@@ -68,11 +85,11 @@ def analysis_review_state(data: dict) -> AnalysisReviewState:
     elif issue_count == 0:
         status = "pass"
         label = "Pass"
-    elif "NAME" in false_fields or issue_count >= 3:
-        # NAME remains a high-priority identity/linkage failure.  Any 3+ issues
-        # are also Critical even when NAME itself passes.
+    elif "NAME" in false_display or issue_count >= 3:
+        # Preserve the historical NAME priority when a configured rule is named
+        # NAME.  Otherwise 3+ independent configured mismatches are Critical.
         status = "critical"
-        label = "Critical / NAME" if "NAME" in false_fields else "Critical"
+        label = "Critical / NAME" if "NAME" in false_display else "Critical"
     elif issue_count == 1:
         status = "one_issue"
         label = "1 Issue"

@@ -110,6 +110,23 @@ def resolve_excel_sheet_name(path: Path, preferred_sheet: str | None = None) -> 
         wb.close()
 
 
+def resolve_source_excel_sheet_name(source_type: str, path: Path, preferred_sheet: str | None = None) -> str:
+    """Resolve the effective Excel sheet for one source role.
+
+    A site-level/manual selection always wins.  When AUTO is active, a source
+    schema may declare a preferred business sheet (for example ADMS SLD uses
+    ``ADMS-SLD主设备``).  If that sheet is absent, the historical conservative
+    first-usable-sheet behavior remains the fallback.
+    """
+    path = Path(path)
+    preferred = str(preferred_sheet or "").strip()
+    if preferred:
+        return resolve_excel_sheet_name(path, preferred)
+    schema = schema_for(source_type)
+    schema_sheet = str(schema.sheet_name or "").strip() if schema else ""
+    return resolve_excel_sheet_name(path, schema_sheet or None)
+
+
 def read_excel_raw(path: Path, *, sheet_name: str | None = None) -> tuple[list[str], list[dict]]:
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
@@ -182,7 +199,8 @@ def validate_source_file(source_type: str, path: Path, overrides: Mapping[str, s
     elif path.suffix.lower() == ".csv":
         headers, _ = read_csv_raw(path)
     elif path.suffix.lower() in {".xlsx", ".xlsm"}:
-        headers, _ = read_excel_raw(path, sheet_name=sheet_name)
+        effective_sheet = resolve_source_excel_sheet_name(source_type, path, sheet_name)
+        headers, _ = read_excel_raw(path, sheet_name=effective_sheet)
     else:
         return None
     return resolve_schema(schema, headers, overrides)
@@ -205,7 +223,8 @@ def read_mapped_rows(
     elif path.suffix.lower() == ".csv":
         headers, rows = read_csv_raw(path)
     elif path.suffix.lower() in {".xlsx", ".xlsm"}:
-        headers, rows = read_excel_raw(path, sheet_name=sheet_name)
+        effective_sheet = resolve_source_excel_sheet_name(source_type, path, sheet_name)
+        headers, rows = read_excel_raw(path, sheet_name=effective_sheet)
     else:
         raise ValueError(f"Unsupported tabular source format: {path.name}")
     validation = resolve_schema(schema, headers, overrides)

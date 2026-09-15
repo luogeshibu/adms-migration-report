@@ -25,7 +25,7 @@ def test_exactly_three_rectification_registers_have_requested_columns():
     assert 'Status / Cmd Need Action Register' in text
     assert 'Analog Need Action Register' in text
     assert text.index('RMU Need Action Register') < text.index('Status / Cmd Need Action Register') < text.index('Analog Need Action Register')
-    for label in ('Modification Item', 'Original Value', 'Target Value', 'Source', 'Remarks'):
+    for label in ('Issue Type', 'Original Value', 'Target Value', 'Source', 'Remarks'):
         assert f'<th>{label}</th>' in text
     assert text.count('<th>NARI Confirm</th>') == 3
     assert text.count('<th>SE/DNV Verify</th>') == 3

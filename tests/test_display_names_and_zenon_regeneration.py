@@ -14,6 +14,7 @@ from migration_report_tool.services.schema_service import (
     apply_display_names_to_groups,
     get_source_display_names,
     set_source_display_names,
+    set_hidden_source_fields,
 )
 from migration_report_tool.domain.mapping.signal_mapping import SIGNAL_MAPPING_GROUPS
 
@@ -97,6 +98,9 @@ class DisplayNameAndZenonRegenerationTests(unittest.TestCase):
                 store.save_comparison(rows)
                 set_source_display_names(store, "se_list", {"feeder": "SE Circuit"}, "tester")
                 set_source_display_names(store, "ioa", {"rmu": "Equipment ID"}, "tester")
+                # v0.8.172 defaults optional source fields hidden; this test
+                # explicitly shows all SE fields to verify renamed export labels.
+                set_hidden_source_fields(store, "se_list", set(), "tester")
                 target = export_report(store)
                 wb = load_workbook(target, read_only=True, data_only=False)
                 try:

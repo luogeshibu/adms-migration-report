@@ -1,6 +1,7 @@
 """RMU comparison service using mapped tabular source data."""
 from __future__ import annotations
 from collections import Counter
+from pathlib import Path
 from ..adapters import SourceAdapter, WorkspaceFileAdapter
 from ..analysis import (
     compare_consistency, first_value, normalize_feeder_for_compare,
@@ -12,6 +13,45 @@ from .schema_service import (
     custom_review_column_key, equipment_review_column_key, RMU_CUSTOM_GROUP_BY_SOURCE,
 )
 from ..config.sources import schema_for
+from .configurable_comparison_service import get_config as get_configurable_comparison_config, build_configurable_review
+
+
+def _active_source_context(store: ProjectStore) -> dict[str, dict]:
+    """Return reviewer-facing identity metadata for the five physical RMU sources.
+
+    The comparison row stores this compact context so the *next* source refresh
+    can explain exactly which file/version produced a value change.  The source
+    data remain authoritative; this metadata is audit context only.
+    """
+    result: dict[str, dict] = {}
+    fingerprints = dict((store.config or {}).get("repository_fingerprints", {}) or {})
+    live_meta = dict((store.config or {}).get("live_source_metadata", {}) or {})
+    manual = store.manual_source_overrides() if hasattr(store, "manual_source_overrides") else {}
+    selections = store.source_file_selections() if hasattr(store, "source_file_selections") else {}
+
+    for source_type in ("se_list", "zenon_db", "zenon_sld", "adms_db", "adms_sld"):
+        fp = dict(fingerprints.get(source_type) or {})
+        live = dict(live_meta.get(source_type) or {})
+        manual_record = dict(manual.get(source_type) or {})
+        selection = dict(selections.get(source_type) or {})
+        active = store.source_path(source_type) if hasattr(store, "source_path") else None
+
+        # Reviewer-facing names have priority over timestamped workspace copies.
+        name = str(selection.get("file_name") or "").strip()
+        if not name:
+            name = str(manual_record.get("original_name") or "").strip()
+        if not name:
+            name = str(fp.get("name") or "").strip()
+        if not name and active is not None:
+            name = Path(active).name
+
+        result[source_type] = {
+            "name": name,
+            "sha256": str(fp.get("sha256") or ""),
+            "size": int(fp.get("size") or live.get("size") or 0),
+            "mtime_ns": int(fp.get("mtime_ns") or live.get("mtime_ns") or 0),
+        }
+    return result
 
 
 def rmu_type_issue_map(store: ProjectStore | None) -> dict[str, str]:
@@ -333,7 +373,15 @@ def _load_zenon_sld_for_review(
 
 
 def equipment_inventory_type_counts(store: ProjectStore, adapter: SourceAdapter | None = None) -> dict[str, int]:
-    """Return DeviceType counts from the mapped all-equipment ZENON-SLD source."""
+    """Return legacy DeviceType filters only when the configurable engine is unused.
+
+    v0.8.178 intentionally does not assume that any configured table contains a
+    DeviceType column.  In configurable mode the Equipment Data Review scope is
+    therefore the configured key union and the UI exposes only All Equipment.
+    """
+    configurable = get_configurable_comparison_config(store, bootstrap=False)
+    if configurable.get("sources"):
+        return {}
     adapter = adapter or WorkspaceFileAdapter(store)
     counts = Counter()
     for row in adapter.load_rows("zenon_sld") or []:
@@ -412,6 +460,19 @@ def _best_equipment_source_candidate(
 def build_equipment_source_view(
     store: ProjectStore, profile: str = "__ALL__", adapter: SourceAdapter | None = None
 ) -> tuple[list[dict], dict]:
+    """Build Equipment Data Review from the active site-local comparison config.
+
+    v0.8.178 moves only the *source/comparison input layer* to a fully
+    configurable engine. Existing projects are bootstrapped once from whatever
+    legacy five-source files are active, after which the number/names of tables,
+    key columns, comparison fields, source titles and visible fields are all
+    site-local reviewer choices. The historical fixed implementation below is
+    retained as a safety fallback only when no configurable source exists.
+    """
+    configurable = get_configurable_comparison_config(store, bootstrap=False)
+    if configurable.get("sources"):
+        return build_configurable_review(store)
+
     """Build the generic five-source Equipment Data Review view.
 
     ZENON-SLD remains the authoritative equipment/type inventory and therefore
@@ -718,6 +779,7 @@ def build_comparison(store: ProjectStore, adapter: SourceAdapter | None = None) 
     zsld_i, zsld_n = list_index(zsld, "rmu")
 
     keys = set(se_i) | set(zdb_i) | set(adb_i) | set(asld_i) | set(zsld_i)
+    source_context = _active_source_context(store)
     rows = []
     for no, rmu in enumerate(sorted(keys, key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else x)), 1):
         s, z, x, a, g = se_i.get(rmu, {}), zdb_i.get(rmu, {}), zsld_i.get(rmu, {}), adb_i.get(rmu, {}), asld_i.get(rmu, {})
@@ -854,6 +916,9 @@ def build_comparison(store: ProjectStore, adapter: SourceAdapter | None = None) 
                 "IP": _resolution_candidates(ip_result),
             },
             "status": status, "remarks": "; ".join(remarks), "comments": "",
+            # Audit-only provenance used by the next refresh to explain source
+            # value changes for equipment that has Needs Action history.
+            "_source_context": source_context,
         }
 
         # Added App columns are normally reference/display values only.  The

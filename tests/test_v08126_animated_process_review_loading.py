@@ -11,7 +11,7 @@ class V08126AnimatedProcessReviewLoadingTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.143"', self.version)
+        self.assertIn('__version__ = "0.8.196"', self.version)
 
     def test_busy_popup_has_explicit_ping_pong_timer(self):
         marquee = self.ui[self.ui.index("class BusyMarqueeProgressBar"):self.ui.index("class BusyOperationPopup")]
@@ -48,7 +48,7 @@ class V08126AnimatedProcessReviewLoadingTests(unittest.TestCase):
 
     def test_project_schema_is_not_changed_by_this_release(self):
         migrations = (self.root / "src" / "migration_report_tool" / "infrastructure" / "database" / "migrations.py").read_text(encoding="utf-8")
-        self.assertIn("TARGET_SCHEMA_VERSION = 11", migrations)
+        self.assertIn("TARGET_SCHEMA_VERSION = 12", migrations)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ def _pdf_source():
 
 def test_open_rmu_pdf_has_rectification_fields():
     pdf = _pdf_source()
-    for label in ('Modification Item', 'Original Value', 'Target Value', 'Source', 'Remarks'):
+    for label in ('Issue Type', 'Original Value', 'Target Value', 'Source', 'Remarks'):
         assert f'<th>{label}</th>' in pdf
     assert 'adms_db_value' in pdf
     assert 'user_value' in pdf

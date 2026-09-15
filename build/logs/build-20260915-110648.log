@@ -1,0 +1,71 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20260915110648
+用户名: NARI-LUOGESHIBU\luoge
+RunAs 用户: NARI-LUOGESHIBU\luoge
+配置名称: 
+计算机: NARI-LUOGESHIBU (Microsoft Windows NT 10.0.26200.0)
+主机应用程序: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -noexit -command try { . "d:\Tools\vscode\Microsoft VS Code\645f29cc31\resources\app\out\vs\workbench\contrib\terminal\common\scripts\shellIntegration.ps1" } catch {}
+进程 ID: 13728
+PSVersion: 5.1.26100.9444
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9444
+BuildVersion: 10.0.26100.9444
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+========================================================================
+ Migration Report Tool - FORMAL WINDOWS RELEASE BUILD
+========================================================================
+Project root: D:\Workspace\Python\adms-migration-report
+Formal output: D:\Workspace\Python\adms-migration-report\release
+[1/10] Validating Windows build environment...
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe -c import struct,sys; assert sys.platform=='win32', 'Windows Python required'; assert struct.calcsize('P')*8==64, '64-bit Python required'; assert (3,11) <= sys.version_info[:2] < (3,15), 'Python 3.11-3.14 required'; import PySide6,openpyxl,PyInstaller; from migration_report_tool.version import __version__; print('Python:',sys.version.split()[0]); print('Migration Report Tool:',__version__); print('PySide6:',PySide6.__version__); print('openpyxl:',openpyxl.__version__); print('PyInstaller:',PyInstaller.__version__)
+
+  pip dependency check
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe -m pip check
+
+  locked version check
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\verify_locked_environment.py --lock D:\Workspace\Python\adms-migration-report\requirements.lock.txt
+
+Version: v0.8.196
+[2/10] Preflight validation...
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\preflight.py --root D:\Workspace\Python\adms-migration-report
+
+  Test user data: D:\Workspace\Python\adms-migration-report\build\test-sandbox\user-data
+  Test project data: D:\Workspace\Python\adms-migration-report\build\test-sandbox\project-data
+[3/10] Regression tests (isolated)...
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe -m unittest discover -s tests -p test_*.py -v
+
+[4/10] Generating build metadata...
+  Windows version resource
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\generate_version_info.py --version 0.8.196 --output D:\Workspace\Python\adms-migration-report\build\generated\version_info.txt
+
+  BUILD_INFO.json
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\write_build_info.py --root D:\Workspace\Python\adms-migration-report --version 0.8.196 --output D:\Workspace\Python\adms-migration-report\build\BUILD_INFO.json
+
+[5/10] Cleaning staging directories...
+[6/10] Compiling Windows x64 application...
+
+[7/10] Packaged EXE self-test...
+  Embedded Windows icon resource check
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\verify_windows_icon.py --exe D:\Workspace\Python\adms-migration-report\build\stage\MigrationReportTool\MigrationReportTool.exe
+
+[8/10] Creating versioned release + ZIP + SHA256...
+  > D:\Workspace\Python\adms-migration-report\.venv\Scripts\python.exe packaging\tools\package_release.py --root D:\Workspace\Python\adms-migration-report --version 0.8.196 --dist D:\Workspace\Python\adms-migration-report\build\stage\MigrationReportTool --release D:\Workspace\Python\adms-migration-report\release
+
+[9/10] Verifying release artifacts...
+[10/10] Finalizing build workspace...
+
+========================================================================
+ BUILD + RELEASE SUCCESSFUL
+========================================================================
+Release: D:\Workspace\Python\adms-migration-report\release\v0.8.196
+ZIP:     D:\Workspace\Python\adms-migration-report\release\v0.8.196\MigrationReportTool-v0.8.196-Windows-x64.zip
+Log:     D:\Workspace\Python\adms-migration-report\build\logs\build-20260915-110648.log
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20260915110944
+**********************

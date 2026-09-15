@@ -10,7 +10,7 @@ class V08133LivePulseAndRmuOnlyTypeWarningTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.143"', self.version)
+        self.assertIn('__version__ = "0.8.196"', self.version)
 
     def test_busy_popup_never_switches_to_static_percentage_mode(self):
         block = self.ui[self.ui.index("def set_message(self, title:"):self.ui.index("def signal_review_row_hash")]
@@ -19,7 +19,7 @@ class V08133LivePulseAndRmuOnlyTypeWarningTests(unittest.TestCase):
         self.assertNotIn("self.progress.setFormat", block)
 
     def test_rmu_gui_render_yields_frequently_to_animation_timer(self):
-        self.assertIn("self._comparison_render_batch_size = 1", self.ui)
+        self.assertIn("self._comparison_render_batch_size = 24", self.ui)
         render_block = self.ui[self.ui.index("def _render_comparison_batch"):self.ui.index("def _finish_comparison_render")]
         self.assertIn("QTimer.singleShot(0", render_block)
 
@@ -36,7 +36,7 @@ class V08133LivePulseAndRmuOnlyTypeWarningTests(unittest.TestCase):
 
     def test_project_schema_is_still_v10(self):
         migrations = (self.root / "src" / "migration_report_tool" / "infrastructure" / "database" / "migrations.py").read_text(encoding="utf-8")
-        self.assertIn("TARGET_SCHEMA_VERSION = 11", migrations)
+        self.assertIn("TARGET_SCHEMA_VERSION = 12", migrations)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ than renaming/copying the customer's DATA / DB-smart worksheets.
 Exactly five worksheets are exported, in this order:
 
 1. RMU Data Review          - generated from the App RMU review model/layout
-2. Signal Mapping Review    - generated from the App signal review model/layout
+2. Signal Mapping Review    - generated from the App signal review model/layout when configured; otherwise an explicit NOT CONFIGURED placeholder
 3. STANDARD                 - copied from the active application IOA STANDARD.xlsx
 4. Import Sources           - active source inventory
 5. Change Audit Log         - immutable application audit trail
@@ -40,9 +40,10 @@ from ...config.sources import schema_for
 from ...services.audit_presentation import present_audit_item
 from ...services.schema_service import (
     get_source_display_names, field_display_name, apply_display_names_to_groups,
-    RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS, rmu_review_groups,
+    RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS, rmu_review_groups, equipment_source_review_groups,
 )
 from ..parsers import validate_source_file
+from ...parsers import clean
 
 
 RMU_REVIEW_SHEET = "RMU Data Review"
@@ -230,16 +231,30 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
             ("rmu_review_status", "Review", 125),
         ),
     )
-    rmu_groups = (review_group,) + tuple(rmu_review_groups(store))
+    try:
+        from ...services.configurable_comparison_service import get_config as get_equipment_comparison_config
+        configurable = get_equipment_comparison_config(store, bootstrap=False)
+    except Exception:
+        configurable = {"sources": []}
+    review_layout = equipment_source_review_groups(store) if configurable.get("sources") else rmu_review_groups(store)
+    rmu_groups = (review_group,) + tuple(review_layout)
     columns = _write_grouped_headers(
         ws,
         rmu_groups,
         vertical_merge_groups={"Remarks", "Resolution"},
     )
     _add_rmu_color_explanation(ws)
-    analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
+    analysis_keys = {
+        key for key, _label, _width in columns
+        if str(key).startswith("analysis__") or key in {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
+    }
     neutral_review_keys = analysis_keys | {"remarks", "comments", "rmu_check_passed", "rmu_review_status"}
+    # Preload reviewer state and structured resolutions once.  The old export
+    # path queried SQLite again for every equipment row (2,000+ rows at many
+    # sites), which made Excel export appear frozen even though the data was
+    # already in the same local database.
     review_map = store.rmu_review_map()
+    all_resolutions = store.rmu_resolution_map()
     review_fills = {
         "UNREVIEWED": REVIEW_UNREVIEWED,
         "CLOSED": CLOSED,
@@ -253,14 +268,15 @@ def _build_rmu_data_review_sheet(wb, store: ProjectStore):
         review_status = rmu_review_display_status(data, review_map.get(rmu, {}))
         for col_idx, (key, _label, _width) in enumerate(columns, 1):
             review_record = review_map.get(rmu, {})
+            saved_resolutions = all_resolutions.get(rmu, {}) if isinstance(all_resolutions, dict) else {}
             value = (
                 ("✓" if bool(int(review_record.get("check_passed") or 0)) else "")
                 if key == "rmu_check_passed"
                 else review_status if key == "rmu_review_status"
                 else (
-                    store.rmu_resolution_summary(rmu)
+                    _resolution_summary_from_saved(store, saved_resolutions)
                     if analysis_state.issue_count > 0
-                    else store.rmu_manual_review_comment(rmu)
+                    else clean(review_record.get("manual_comment"))
                 ) if key == "comments"
                 else data.get(key, "")
             )
@@ -315,6 +331,45 @@ def _signal_groups(report: DBSmartReport, store: ProjectStore):
         report.group_definitions, store, SIGNAL_REVIEW_DISPLAY_BINDINGS
     )
     return (review_group,) + tuple(source_groups)
+
+
+def _build_signal_mapping_unavailable_sheet(wb, reason: str = ""):
+    """Create a non-blocking placeholder when Signal Mapping is not configured.
+
+    Equipment Data Review is an independent review stream.  Formal Excel export
+    must therefore remain available for equipment-only sites instead of failing
+    because the legacy IOA/ADMS-SLD Signal Mapping inputs are absent.
+    """
+    if SIGNAL_REVIEW_SHEET in wb.sheetnames:
+        del wb[SIGNAL_REVIEW_SHEET]
+    ws = wb.create_sheet(SIGNAL_REVIEW_SHEET, 1)
+    ws.append(["Status", "Message"])
+    ws.append([
+        "NOT CONFIGURED",
+        "Signal Mapping Review was not exported because its optional source set is not configured for this site.",
+    ])
+    if reason:
+        ws.append(["Detail", str(reason)])
+    for cell in ws[1]:
+        _header_cell(cell, top=True)
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            _body_cell(cell, fill=WHITE, wrap=True)
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 95
+    ws.freeze_panes = "A2"
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+def _resolution_summary_from_saved(store: ProjectStore, saved: dict) -> str:
+    """Render one equipment Resolution summary without another SQLite query."""
+    if not saved:
+        return ""
+    return "\n".join(
+        store._resolution_record_summary(saved[field])
+        for field in store._ordered_resolution_fields(saved)
+    )
 
 
 def _build_signal_mapping_review_sheet(wb, store: ProjectStore):
@@ -486,7 +541,7 @@ def _build_audit_log_sheet(wb, store: ProjectStore):
     return ws
 
 
-def export_report(store: ProjectStore) -> Path:
+def export_report(store: ProjectStore, target_path: Path | None = None) -> Path:
     """Export the App's two review views plus STANDARD and traceability sheets.
 
     The active STANDARD workbook is always closed deterministically.  This is
@@ -511,7 +566,13 @@ def export_report(store: ProjectStore) -> Path:
                 wb.remove(sheet)
 
         rmu_ws = _build_rmu_data_review_sheet(wb, store)
-        signal_ws = _build_signal_mapping_review_sheet(wb, store)
+        try:
+            signal_ws = _build_signal_mapping_review_sheet(wb, store)
+        except FileNotFoundError as exc:
+            # Signal Mapping is optional for equipment-only sites.  Preserve the
+            # five-sheet delivery shape with a clear placeholder instead of
+            # aborting the entire formal Equipment Data Review export.
+            signal_ws = _build_signal_mapping_unavailable_sheet(wb)
         sources_ws = _build_import_sources_sheet(wb, store)
         audit_ws = _build_audit_log_sheet(wb, store)
 
@@ -532,7 +593,13 @@ def export_report(store: ProjectStore) -> Path:
             or "Migration"
         )
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = store.reports_dir / f"{site_name}-REVIEW-{timestamp}.xlsx"
+        if target_path is None:
+            target = store.reports_dir / f"{site_name}-REVIEW-{timestamp}.xlsx"
+        else:
+            target = Path(target_path).expanduser()
+            if target.suffix.lower() != ".xlsx":
+                target = target.with_suffix(".xlsx")
+            target.parent.mkdir(parents=True, exist_ok=True)
         wb.save(target)
         return target
     finally:

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer, QRect, QSettings, QEvent, QModelIndex, Signal, QItemSelection, QItemSelectionModel, QObject, QRunnable, QThreadPool, Slot, QEventLoop
-from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QShortcut, QPainter, QPen, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QKeySequence, QShortcut, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -105,10 +105,10 @@ from ..config.sources import schema_for
 from ..config.column_schema import EQUIPMENT_SOURCE_GROUPS
 from ..domain.schema import (BLANK_OVERRIDE_TOKEN, MappingKind, resolve_schema, encode_manual_override, decode_manual_override, is_manual_override)
 from ..config.source_modules import MODULE_SOURCE_GROUPS
-from ..infrastructure.parsers import validate_source_file, list_excel_sheets, resolve_excel_sheet_name
+from ..infrastructure.parsers import validate_source_file, list_excel_sheets, resolve_source_excel_sheet_name
 from ..services.schema_service import (
     get_source_overrides, set_source_overrides, get_source_display_names, set_source_display_names,
-    default_display_name, apply_display_names_to_groups, RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS,
+    default_display_name, canonical_system_field_label, apply_display_names_to_groups, RMU_REVIEW_DISPLAY_BINDINGS, SIGNAL_REVIEW_DISPLAY_BINDINGS,
     custom_review_column_key, rmu_review_groups, equipment_source_review_groups, validation_summary,
     system_logic_field_keys, equipment_review_protected_column_keys, get_hidden_source_fields, set_hidden_source_fields,
     get_resolved_source_mappings, set_resolved_source_mappings, module_field_mapping_lines,
@@ -120,6 +120,28 @@ from ..services.standard_reference_service import (
 )
 from ..services.rmu_review_service import (
     rmu_type_issue_map, build_equipment_source_view, equipment_inventory_type_counts,
+)
+from ..services.configurable_comparison_service import (
+    get_config as get_equipment_comparison_config, save_config as save_equipment_comparison_config,
+    source_path as configurable_source_path, encode_source_path as encode_configurable_source_path,
+    inspect_table as inspect_configurable_table, list_sheets as list_configurable_sheets,
+    config_status as configurable_comparison_status, source_column_catalog as configurable_source_columns,
+    analysis_column_key as configurable_analysis_column_key, analysis_detail_key as configurable_analysis_detail_key,
+    scan_site_tabular_files as scan_configurable_site_files, file_family_key as configurable_file_family_key,
+    family_candidates as configurable_family_candidates, file_pool_usage as configurable_file_pool_usage,
+    save_signal_source_assignment as save_configurable_signal_assignment,
+    resolve_signal_source_assignment as resolve_configurable_signal_assignment,
+    get_signal_source_assignments as get_configurable_signal_assignments,
+    configured_live_source_changes, remember_configured_live_source_metadata,
+    configured_live_source_metadata,
+    list_comparison_profiles as list_equipment_comparison_profiles,
+    get_comparison_profile as get_equipment_comparison_profile,
+    save_comparison_profile as save_equipment_comparison_profile,
+    delete_comparison_profile as delete_equipment_comparison_profile,
+    apply_comparison_profile as apply_equipment_comparison_profile,
+    get_profile_link as get_equipment_comparison_profile_link,
+    save_profile_link as save_equipment_comparison_profile_link,
+    COMPARISON_MODE_DEFAULT, COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK,
 )
 from ..services.audit_presentation import present_audit_item
 from ..services.derived_table_service import (
@@ -168,7 +190,30 @@ class QMessageBox(_QtMessageBox):
 class QInputDialog(_QtInputDialog):
     @staticmethod
     def getItem(parent, title, label, *args, **kwargs):
-        return _QtInputDialog.getItem(parent, ui_tr(title, current_language()), ui_tr(label, current_language()), *args, **kwargs)
+        """Localized item picker with an explicit Save/Cancel commit action.
+
+        Qt's Simplified-Chinese translation renders the stock OK button as
+        ``正常`` on some Windows/PySide6 builds, which looks like a status value
+        instead of an action.  Build the dialog explicitly so every selection
+        dialog uses ``保存`` / ``取消`` in Chinese (Save / Cancel in English)
+        while preserving the exact item value returned to existing callers.
+        """
+        items = list(args[0] if len(args) >= 1 else kwargs.pop("items", []))
+        current = int(args[1] if len(args) >= 2 else kwargs.pop("current", 0) or 0)
+        editable = bool(args[2] if len(args) >= 3 else kwargs.pop("editable", True))
+        dialog = _QtInputDialog(parent)
+        dialog.setWindowTitle(ui_tr(title, current_language()))
+        dialog.setLabelText(ui_tr(label, current_language()))
+        dialog.setComboBoxItems(items)
+        dialog.setComboBoxEditable(editable)
+        combo = dialog.findChild(QComboBox)
+        if combo is not None and items:
+            combo.setCurrentIndex(max(0, min(current, len(items) - 1)))
+        dialog.setOkButtonText(ui_tr("Save", current_language()))
+        dialog.setCancelButtonText(ui_tr("Cancel", current_language()))
+        if dialog.exec() != _QtDialog.Accepted:
+            return "", False
+        return dialog.textValue(), True
 
     @staticmethod
     def getText(parent, title, label, *args, **kwargs):
@@ -211,10 +256,14 @@ from ..repository import (
     save_repository_root,
     save_last_site,
     scan_repository,
+    site_has_tabular_files,
     source_status,
     sync_site_to_project,
     load_source_detection_keywords,
     save_source_detection_keywords,
+    load_source_detection_categories,
+    save_source_detection_categories,
+    classify_source_detection_hint,
     save_manual_source_assignment,
     rank_source_candidates,
     source_version_candidates,
@@ -549,14 +598,26 @@ def _load_repository_site(repository_root: Path, site_name: str, *, deep: bool) 
     return SiteInfo(site_name, site_dir, sources, detections, unmapped)
 
 
+def _path_text_equal(left: str, right: str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, ValueError):
+        return clean(left).casefold() == clean(right).casefold()
+
+
 def _worker_effective_source_path(site: SiteInfo, store: ProjectStore, source_type: str) -> Path | None:
     """Resolve the same active source a reviewer sees, but without touching Qt.
 
-    Persistent version pins win first, then an external manual override, then the
-    current repository AUTO selection, and finally the last project snapshot.
-    This makes lazy module loading work immediately after startup instead of
-    requiring Run Validation merely to repopulate in-memory tables.
+    v0.8.181: explicit Site File Pool assignments for Signal Mapping win first.
+    Equipment Data Review has its own configurable source engine and therefore
+    never depends on these legacy role lookups. For remaining legacy roles,
+    persistent version pins win first, then manual override, repository AUTO,
+    then the last project snapshot.
     """
+    if source_type in {"ioa", "adms_sld"}:
+        assigned = resolve_configurable_signal_assignment(store, source_type)
+        if assigned is not None and assigned.exists():
+            return assigned
     selected = selected_repository_source_path(site, store, source_type)
     if selected is not None and selected.exists():
         return selected
@@ -681,6 +742,20 @@ def _background_signal_mapping_module_job(
         store.close()
 
 
+def _build_active_equipment_review(store) -> tuple[list[dict], dict]:
+    """Build the active Equipment Data Review projection.
+
+    v0.8.178 uses the site-local configurable engine only after a comparison
+    configuration has explicitly been saved. Legacy sites keep their existing
+    five-source behavior until the reviewer opens Configure Comparison and
+    saves the migrated/editable source definition.
+    """
+    config = get_equipment_comparison_config(store, bootstrap=False)
+    if config.get("sources"):
+        return build_equipment_source_view(store, "__ALL__")
+    return build_comparison(store)
+
+
 def _background_rmu_review_module_job(
     project_folder: str, repository_root: str, site_name: str, progress=None
 ) -> dict:
@@ -691,16 +766,24 @@ def _background_rmu_review_module_job(
     site = _load_repository_site(root, site_name, deep=False)
     store = ProjectStore(Path(project_folder))
     try:
-        emit(20, "Loading changed RMU source files")
-        sync = sync_site_to_project(store, site)
-        emit(62, "Calculating RMU Data Review")
-        rows, _summary = build_comparison(store)
+        configurable = get_equipment_comparison_config(store, bootstrap=False)
+        changed_keys = []
+        if configurable.get("sources"):
+            emit(20, "Reading configured Equipment Data Review source tables")
+        else:
+            emit(20, "Loading changed RMU source files")
+            sync = sync_site_to_project(store, site)
+            changed_keys = list(sync.changed_keys)
+        emit(62, "Calculating Equipment Data Review")
+        rows, _summary = _build_active_equipment_review(store)
         if rows:
             store.save_comparison(rows)
-        emit(95, "Preparing RMU Data Review")
+        if configurable.get("sources"):
+            remember_configured_live_source_metadata(store)
+        emit(95, "Preparing Equipment Data Review")
         return {
             "site": site, "row_count": len(rows),
-            "changed_keys": list(sync.changed_keys),
+            "changed_keys": changed_keys,
         }
     finally:
         store.close()
@@ -719,9 +802,9 @@ def _background_rmu_render_prepare_job(
 ) -> dict:
     """Prepare universal Equipment Data Review rows outside the Qt GUI thread.
 
-    Every DeviceType uses the same five-source Analysis/Review/Resolution/
-    Comments/lifecycle contract. RMU differs only in its legacy persistence key
-    so projects upgraded from earlier releases retain all existing history.
+    The row source may be the legacy five-source projection or the v0.8.178
+    site-local configurable comparison engine. Review/Resolution/Comments and
+    lifecycle semantics are shared by both modes.
     """
     emit = progress or (lambda _value, _text: None)
     store = ProjectStore(Path(project_folder))
@@ -737,11 +820,16 @@ def _background_rmu_render_prepare_job(
         column_keys = [clean(item[0]) for item in tuple(columns or ()) if item]
 
         if inventory_mode:
-            emit(8, "Reading five equipment source tables")
+            emit(8, "Reading configured equipment source tables")
             rows, source_summary = build_equipment_source_view(store, profile_token)
             emit(28, "Loading equipment review decisions")
             review_map = store.rmu_review_map()
             all_resolutions = store.rmu_resolution_map()
+            tracking_rows = store.equipment_action_tracking() if hasattr(store, "equipment_action_tracking") else store.rmu_action_tracking()
+            action_tracking_keys = [
+                clean(item.get("equipment_key") or item.get("rmu")) for item in tracking_rows
+                if clean(item.get("equipment_key") or item.get("rmu"))
+            ]
             review_filter = clean(review_filter) or "ALL REVIEWS"
             analysis_filter = clean(analysis_filter) or "ALL ANALYSIS"
 
@@ -762,23 +850,31 @@ def _background_rmu_render_prepare_job(
                     return state.issue_count >= 3
                 if analysis_filter == "CRITICAL":
                     return state.is_critical
+                if analysis_filter.startswith("RULE::"):
+                    return analysis_filter.split("::", 1)[1].upper() in {clean(value).upper() for value in false_keys}
                 if analysis_filter.endswith(" MISMATCH"):
                     return analysis_filter.removesuffix(" MISMATCH") in false_keys
                 return True
 
-            def resolution_summary_for(review_key: str) -> str:
+            def resolution_summary_for(review_key: str, data: dict) -> str:
                 saved = all_resolutions.get(review_key, {}) if isinstance(all_resolutions, dict) else {}
+                if not saved:
+                    return ""
+                labels = {clean(key).upper(): clean(value) for key, value in dict(data.get("analysis_field_labels") or {}).items()}
+                order = [clean(value).upper() for value in (data.get("analysis_field_order") or []) if clean(value)]
+                if not order:
+                    order = ["NAME", "FEEDER", "SMART", "TYPE", "IP"]
                 parts = []
-                for field in ("NAME", "FEEDER", "SMART", "TYPE", "IP"):
+                for field in order:
                     record = saved.get(field) or {}
                     if clean(record.get("decision_type")):
                         parts.append(compact_resolution_text(record))
                         customer_comment = clean(record.get("customer_comment"))
                         if customer_comment:
-                            parts.append(f"{field} comment: {customer_comment}")
+                            parts.append(f"{labels.get(field) or field} comment: {customer_comment}")
                 return "\n".join(parts)
 
-            emit(45, "Filtering five-source equipment review")
+            emit(45, "Filtering configured equipment review")
             shown = []
             for data in rows:
                 review_key = clean(data.get("review_key") or data.get("rmu"))
@@ -789,7 +885,7 @@ def _background_rmu_render_prepare_job(
                     continue
                 if not analysis_filter_match(data):
                     continue
-                resolution_summary = resolution_summary_for(review_key)
+                resolution_summary = resolution_summary_for(review_key, data)
                 manual_review_comment = clean(review_record.get("manual_comment"))
                 review_text = resolution_summary if state.issue_count > 0 else manual_review_comment
                 if search_field == "comments":
@@ -847,7 +943,7 @@ def _background_rmu_render_prepare_job(
                 f"Resolution {resolved_issue_decisions} / {total_issue_decisions} issue decision(s) · {resolution_pct}% · "
                 f"Unresolved {max(0, total_issue_decisions - resolved_issue_decisions)} · Needs Action {needs_action_decisions}"
             )
-            emit(92, "Preparing five-source equipment review rows")
+            emit(92, "Preparing equipment review rows")
             return {
                 "mode": "equipment_review",
                 "profile": profile_token,
@@ -855,6 +951,7 @@ def _background_rmu_render_prepare_job(
                 "shown": shown,
                 "review_map": review_map,
                 "all_resolutions": all_resolutions,
+                "action_tracking_keys": action_tracking_keys,
                 "summary_text": summary_text,
                 "progress_text": progress_text,
             }
@@ -989,20 +1086,45 @@ def _background_rmu_render_prepare_job(
 def _background_refresh_sources_job(
     project_folder: str, repository_root: str, site_name: str, progress=None
 ) -> dict:
-    """Deep-scan and refresh one site's changed source snapshot off the GUI thread."""
+    """Refresh active site sources off the GUI thread.
+
+    v0.8.182 keeps the legacy snapshot synchronizer only for projects that have
+    not adopted configurable Equipment Data Review.  Configurable sites read the
+    live CSV/XLSX/XLSM files directly and never copy them into Project Data.
+    """
     emit = progress or (lambda _value, _text: None)
     root = Path(repository_root)
-    emit(5, "Scanning workspace and source versions")
+    emit(5, "Scanning live source files")
     site = _load_repository_site(root, site_name, deep=True)
     store = ProjectStore(Path(project_folder))
     try:
+        configurable = get_equipment_comparison_config(store, bootstrap=False)
+        if configurable.get("sources"):
+            emit(25, "Re-reading configured live Equipment Data Review files")
+            changed_keys, _signature = configured_live_source_changes(store)
+            rows, _summary = _build_active_equipment_review(store)
+            # Replace the projection even when the live configuration currently
+            # yields zero rows so stale data can never survive a source change.
+            store.save_comparison(rows)
+            remember_configured_live_source_metadata(store)
+            store.config["validation_required_after_source_import"] = True
+            store.save_config()
+            emit(95, "Preparing refreshed direct-source view")
+            return {
+                "site": site,
+                "changed_keys": list(changed_keys),
+                "row_count": len(rows),
+                "configurable_mode": True,
+                "direct_read": True,
+            }
+
         emit(25, "Comparing live source files with the last loaded snapshot")
         sync = sync_site_to_project(store, site)
         changed_keys = list(sync.changed_keys)
         rmu_sources = {"se_list", "zenon_db", "zenon_sld", "adms_db", "adms_sld"}
         if changed_keys and set(changed_keys) & rmu_sources:
             emit(55, "Refreshing RMU data affected by changed sources")
-            rows, _summary = build_comparison(store)
+            rows, _summary = _build_active_equipment_review(store)
             if rows:
                 store.save_comparison(rows)
             row_count = len(rows)
@@ -1020,6 +1142,8 @@ def _background_refresh_sources_job(
             "site": site,
             "changed_keys": changed_keys,
             "row_count": row_count,
+            "configurable_mode": False,
+            "direct_read": False,
         }
     finally:
         store.close()
@@ -1039,21 +1163,51 @@ def _background_validation_job(
     site = _load_repository_site(root, site_name, deep=True)
     store = ProjectStore(Path(project_folder))
     try:
-        emit(20, "Re-reading all active source files")
-        sync = sync_site_to_project(store, site, force_all=True)
-        emit(48, "Running RMU validation")
-        rows, _summary = build_comparison(store)
+        configurable = get_equipment_comparison_config(store, bootstrap=False)
+        configurable_mode = bool(configurable.get("sources"))
+
+        if configurable_mode:
+            # v0.8.180: Equipment Data Review now has a fully configurable
+            # source contract. Do NOT run the legacy repository synchronizer
+            # first: it validates SE/ZENON/ADMS files against the historical
+            # fixed schemas and can reject a perfectly valid configured table
+            # before the configurable comparison engine gets a chance to read
+            # the user's selected Key / Index and comparison bindings.
+            #
+            # build_configurable_review() reads every configured CSV/XLSX/XLSM
+            # directly, so this path still force re-reads the active equipment
+            # files on every Run Validation.
+            emit(20, "Re-reading configured Equipment Data Review source tables")
+            sync = None
+        else:
+            emit(20, "Re-reading all active source files")
+            sync = sync_site_to_project(store, site, force_all=True)
+
+        emit(48, "Running Equipment Data Review validation")
+        rows, _summary = _build_active_equipment_review(store)
         if not rows:
             raise RuntimeError("No valid migration records were found in the current site sources.")
         store.save_comparison(rows)
+        if configurable_mode:
+            # Record only path/stat metadata.  The workbook itself stays in the
+            # site/user location and is never copied into Project Data.
+            remember_configured_live_source_metadata(store)
         store.config["validation_required_after_source_import"] = False
 
         emit(65, "Running Signal Mapping validation")
         signal_report = None
         signal_matched = signal_mismatched = signal_zenon_extra = 0
         signal_standard_points = signal_adms_points = 0
-        ioa_path = store.source_path("ioa")
-        adms_sld_path = store.source_path("adms_sld")
+        # Configurable Equipment Data Review must not force the unrelated
+        # Signal Mapping inputs through the legacy equipment-source importer.
+        # Resolve the same live IOA/ADMS-SLD files the Signal Mapping module
+        # itself uses. Legacy projects keep the original snapshot behavior.
+        if configurable_mode:
+            ioa_path = _worker_effective_source_path(site, store, "ioa")
+            adms_sld_path = _worker_effective_source_path(site, store, "adms_sld")
+        else:
+            ioa_path = store.source_path("ioa")
+            adms_sld_path = store.source_path("adms_sld")
         standard_path = standard_reference_path()
         if ioa_path and adms_sld_path and standard_path.exists():
             signal_report = build_signal_mapping_report(
@@ -1113,15 +1267,29 @@ def _background_validation_job(
         emit(97, "Finalizing validation results")
         states = [analysis_review_state(row) for row in rows]
         issue_fields = Counter(field for state in states for field in state.false_fields)
+        issue_field_labels: dict[str, str] = {}
+        issue_field_order: list[str] = []
+        for row in rows:
+            labels = dict(row.get("analysis_field_labels") or {})
+            for field_id in row.get("analysis_field_order") or ():
+                field_id = clean(field_id)
+                if not field_id:
+                    continue
+                issue_field_labels.setdefault(field_id, clean(labels.get(field_id)) or field_id)
+                if field_id not in issue_field_order:
+                    issue_field_order.append(field_id)
         return {
             "site": site,
-            "imported_count": len(sync.imported),
-            "changed_keys": list(sync.changed_keys),
-            "snapshot_dir": str(sync.snapshot_dir),
+            "configurable_mode": configurable_mode,
+            "imported_count": len(sync.imported) if sync is not None else 0,
+            "changed_keys": list(sync.changed_keys) if sync is not None else [],
+            "snapshot_dir": str(sync.snapshot_dir) if sync is not None else "Live configured source files",
             "row_count": len(rows),
             "pass_count": sum(state.is_pass for state in states),
             "issue_count": sum(state.issue_count > 0 for state in states),
             "issue_fields": dict(issue_fields),
+            "issue_field_labels": issue_field_labels,
+            "issue_field_order": issue_field_order,
             "signal_report": signal_report,
             "signal_matched": int(signal_matched),
             "signal_mismatched": int(signal_mismatched),
@@ -1228,7 +1396,7 @@ def _background_reload_live_sources_job(
         pending_keys = set(mapping_required)
         if set(keys) & rmu_sources and not (pending_keys & rmu_sources):
             emit(58, "Refreshing affected RMU review data")
-            rows, _summary = build_comparison(store)
+            rows, _summary = _build_active_equipment_review(store)
             if rows:
                 store.save_comparison(rows)
             row_count = len(rows)
@@ -1270,6 +1438,138 @@ def _background_reload_live_sources_job(
             "signal_report": signal_report,
             "mapping_required": mapping_required,
         }
+    finally:
+        store.close()
+
+
+def _background_reload_configurable_live_sources_job(
+    project_folder: str, repository_root: str, site_name: str, changed_keys, progress=None
+) -> dict:
+    """Re-read changed configurable sources directly from their live files.
+
+    No source workbook/CSV is copied into Project Data.  Equipment changes
+    rebuild only the dynamic Equipment Data Review projection; Signal Mapping
+    changes rebuild the existing Signal Mapping report from its assigned live
+    files.  Human review/lifecycle state remains persisted in project.db.
+    """
+    emit = progress or (lambda _value, _text: None)
+    keys = [clean(key) for key in changed_keys if clean(key)]
+    root = Path(repository_root)
+    emit(5, "Resolving live configurable source paths")
+    site = _load_repository_site(root, site_name, deep=False)
+    store = ProjectStore(Path(project_folder))
+    try:
+        equipment_changed = any(key.startswith("equipment:") for key in keys)
+        signal_changed = any(key.startswith("signal:") for key in keys)
+
+        row_count = store.comparison_row_count()
+        if equipment_changed:
+            emit(28, "Re-reading changed Equipment Data Review files")
+            rows, _summary = _build_active_equipment_review(store)
+            store.save_comparison(rows)
+            row_count = len(rows)
+
+        signal_report = None
+        if signal_changed:
+            emit(62, "Re-reading changed Signal Mapping files")
+            ioa_path = _worker_effective_source_path(site, store, "ioa")
+            adms_sld_path = _worker_effective_source_path(site, store, "adms_sld")
+            standard_path = standard_reference_path()
+            if ioa_path and adms_sld_path and standard_path.exists():
+                signal_report = build_signal_mapping_report(
+                    ioa_path, adms_sld_path, standard_path,
+                    ioa_overrides=store.source_column_overrides("ioa"),
+                    adms_sld_overrides=store.source_column_overrides("adms_sld"),
+                    standard_overrides=store.source_column_overrides("standard_reference"),
+                    ioa_sheet_name=store.source_sheet_name("ioa") if hasattr(store, "source_sheet_name") else None,
+                    adms_sld_sheet_name=store.source_sheet_name("adms_sld") if hasattr(store, "source_sheet_name") else None,
+                )
+                fingerprints = {
+                    item.row_key: {
+                        "row_hash": signal_review_row_hash(item, signal_report.analysis_column),
+                        "source_hash": signal_report.source_hash,
+                    }
+                    for item in signal_report.rows
+                }
+                store.sync_db_smart_review_fingerprints(
+                    fingerprints, modified_by="SYSTEM",
+                    aliases=signal_review_alias_map(signal_report),
+                    metadata={item.row_key: signal_review_metadata(signal_report, item) for item in signal_report.rows},
+                )
+
+        # Reset the watcher baseline only after the new live contents were read
+        # successfully.  This prevents a failed/locked workbook from being
+        # silently accepted as the new baseline.
+        remember_configured_live_source_metadata(store)
+        store.config["validation_required_after_source_import"] = True
+        store.save_config()
+        emit(95, "Updating direct-source review view")
+        return {
+            "site": site,
+            "changed_keys": keys,
+            "row_count": row_count,
+            "signal_report": signal_report,
+            "direct_read": True,
+        }
+    finally:
+        store.close()
+
+
+def _background_equipment_check_batch_job(
+    project_folder: str, updates: list[tuple[str, bool]], modified_by: str
+) -> dict:
+    """Persist manual Equipment checks on a worker connection in one transaction."""
+    store = ProjectStore(Path(project_folder))
+    try:
+        saved: list[tuple[str, bool]] = []
+        for review_key, checked in updates:
+            key = clean(review_key)
+            if not key:
+                continue
+            store.update_rmu_check_passed(
+                key, bool(checked), modified_by,
+                reason="Equipment manually checked / passed in Row Locator",
+                _commit=False,
+            )
+            saved.append((key, bool(checked)))
+        store.db.commit()
+        return {"saved": saved, "count": len(saved)}
+    finally:
+        store.close()
+
+
+def _background_review_status_batch_job(
+    project_folder: str, updates: list[tuple[str, str, str]], modified_by: str
+) -> dict:
+    """Persist Equipment Review statuses on a worker connection in one transaction.
+
+    Review-status changes are a high-frequency reviewer interaction.  Keep the
+    GUI optimistic and responsive: the visible row/cache is patched first,
+    while this worker serializes the durable SQLite/lifecycle writes.
+    """
+    store = ProjectStore(Path(project_folder))
+    try:
+        saved: list[tuple[str, str]] = []
+        for review_key, status, reason in updates:
+            key = clean(review_key)
+            if not key:
+                continue
+            normalized = normalize_review_status(status)
+            store.update_rmu_review_status(
+                key, normalized, modified_by, reason=clean(reason), _commit=False
+            )
+            saved.append((key, normalized))
+        store.db.commit()
+        return {"saved": saved, "count": len(saved)}
+    finally:
+        store.close()
+
+
+def _background_excel_export_job(project_folder: str, target_path: str) -> str:
+    """Build the formal workbook off the Qt GUI thread."""
+    store = ProjectStore(Path(project_folder))
+    try:
+        return str(export_report(store, target_path=Path(target_path)))
     finally:
         store.close()
 
@@ -1933,6 +2233,10 @@ class EditValueDialog(QDialog):
         layout.addWidget(sub)
         layout.addSpacing(10)
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(7)
         form.setLabelAlignment(Qt.AlignLeft)
         self.multiline = multiline
         if multiline:
@@ -2130,15 +2434,41 @@ class RMUResolutionDialog(QDialog):
 
     FIELD_ORDER = ("NAME", "FEEDER", "SMART", "TYPE", "IP")
 
+    def _analysis_value_key(self, field: str) -> str:
+        key = clean(self._field_value_keys.get(clean(field).upper()))
+        if key:
+            return key
+        original = self._field_original.get(clean(field).upper(), clean(field))
+        return f"analysis_{clean(original).lower()}"
+
+    def _analysis_detail(self, field: str) -> str:
+        key = self._analysis_value_key(field)
+        return clean(self.row_data.get(f"{key}__detail") or self.row_data.get(f"{key}_detail"))
+
+    def _field_label(self, field: str) -> str:
+        return clean(self._field_labels.get(clean(field).upper())) or clean(field)
+
+    def _field_candidates(self, field: str) -> list[dict]:
+        wanted = clean(field).upper()
+        for key, value in dict(self.row_data.get("resolution_candidates") or {}).items():
+            if clean(key).upper() == wanted:
+                return list(value or [])
+        return []
+
     def __init__(self, rmu: str, row_data: dict, current_resolutions: dict, parent=None, equipment_type: str = "RMU"):
         super().__init__(parent)
         self.rmu = clean(rmu)
         self.equipment_type = clean(equipment_type).upper() or "RMU"
         self.row_data = row_data or {}
         self.current_resolutions = current_resolutions or {}
+        configured_order = [clean(value) for value in (self.row_data.get("analysis_field_order") or []) if clean(value)]
+        self._field_original = {value.upper(): value for value in configured_order}
+        self._field_labels = {clean(key).upper(): clean(value) for key, value in dict(self.row_data.get("analysis_field_labels") or {}).items()}
+        self._field_value_keys = {clean(key).upper(): clean(value) for key, value in dict(self.row_data.get("analysis_field_keys") or {}).items()}
+        field_order = [value.upper() for value in configured_order] if configured_order else list(self.FIELD_ORDER)
         self.issue_fields = [
-            field for field in self.FIELD_ORDER
-            if clean(self.row_data.get(f"analysis_{field.lower()}" )).upper() == "FALSE"
+            field for field in field_order
+            if clean(self.row_data.get(self._analysis_value_key(field))).upper() == "FALSE"
         ]
         self.combos: dict[str, QComboBox] = {}
         self.previews: dict[str, QLabel] = {}
@@ -2159,12 +2489,20 @@ class RMUResolutionDialog(QDialog):
         )
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
-        desc = QLabel(
-            "Choose one resolution for each FALSE Analysis field. Customer Comments are optional and independent from the Resolution choice; "
-            "changing a comment never changes Analysis or the selected Resolution. Both the latest comment and every historical comment change are retained. "
-            "Where ADMS DB provides the reference value, choosing the same normalized value closes the equipment review; choosing a different value sets Review to Needs Action. "
-            "Unresolved remains Unreviewed."
-        )
+        if configured_order:
+            resolution_help = (
+                "Choose one resolution for each FALSE configured Analysis field. Customer Comments are optional and independent from the Resolution choice; "
+                "changing a comment never changes Analysis or the selected Resolution. Both the latest comment and every historical comment change are retained. "
+                "Resolution choices record the agreed handling only and never change Review Status. Use the separate Review Status control to mark Needs Action, Closed, or Unreviewed. A Needs Action item stays open until a reviewer explicitly changes its Review Status."
+            )
+        else:
+            resolution_help = (
+                "Choose one resolution for each FALSE Analysis field. Customer Comments are optional and independent from the Resolution choice; "
+                "changing a comment never changes Analysis or the selected Resolution. Both the latest comment and every historical comment change are retained. "
+                "Resolution choices record the agreed handling only and never change Review Status. Choosing a value equal to ADMS DB does not close the equipment, and choosing a different source does not open it automatically. "
+                "Use the separate Review Status control to mark Needs Action, Closed, or Unreviewed."
+            )
+        desc = QLabel(resolution_help)
         desc.setObjectName("Muted")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -2182,19 +2520,19 @@ class RMUResolutionDialog(QDialog):
         table.setColumnWidth(2, 650)
         table.horizontalHeader().setMinimumHeight(42)
 
-        candidates_by_field = self.row_data.get("resolution_candidates") or {}
         # Building multiple nested cell widgets can trigger repeated geometry
         # calculations. Freeze painting until the dialog is fully populated.
         table.setUpdatesEnabled(False)
         for row_index, field in enumerate(self.issue_fields):
-            issue_item = QTableWidgetItem(field)
+            field_label = self._field_label(field)
+            issue_item = QTableWidgetItem(field_label)
             font = issue_item.font(); font.setBold(True); issue_item.setFont(font)
             issue_item.setTextAlignment(Qt.AlignCenter)
             issue_item.setBackground(QColor("#F7D7D7"))
-            issue_item.setToolTip(clean(self.row_data.get(f"analysis_{field.lower()}_detail")))
+            issue_item.setToolTip(self._analysis_detail(field))
             table.setItem(row_index, 0, issue_item)
 
-            candidates = list(candidates_by_field.get(field, []) or [])
+            candidates = self._field_candidates(field)
             source_lines = []
             for candidate in candidates:
                 source = clean(candidate.get("source"))
@@ -2205,13 +2543,14 @@ class RMUResolutionDialog(QDialog):
                     line += f"  →  {normalized}"
                 source_lines.append(line)
             values_item = QTableWidgetItem("\n".join(source_lines) or "No selectable source value is available")
-            values_item.setToolTip(clean(self.row_data.get(f"analysis_{field.lower()}_detail")))
+            values_item.setToolTip(self._analysis_detail(field))
             table.setItem(row_index, 1, values_item)
 
             self.issue_snapshots[field] = {
                 "analysis_field": field,
-                "analysis_result": clean(self.row_data.get(f"analysis_{field.lower()}")),
-                "analysis_detail": clean(self.row_data.get(f"analysis_{field.lower()}_detail")),
+                "analysis_label": field_label,
+                "analysis_result": clean(self.row_data.get(self._analysis_value_key(field))),
+                "analysis_detail": self._analysis_detail(field),
                 "source_values": [dict(candidate or {}) for candidate in candidates],
             }
 
@@ -2220,7 +2559,7 @@ class RMUResolutionDialog(QDialog):
             cell_layout.setContentsMargins(8, 7, 8, 7)
             cell_layout.setSpacing(6)
             combo = QComboBox()
-            combo.setToolTip(f"Select exactly one Resolution for {field}")
+            combo.setToolTip(f"Select exactly one Resolution for {field_label}")
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(34)
             combo.setMaxVisibleItems(12)
@@ -2231,7 +2570,7 @@ class RMUResolutionDialog(QDialog):
                 raw = clean(candidate.get("value"))
                 normalized = clean(candidate.get("normalized"))
                 description = build_resolution_description(
-                    rmu=self.rmu, field=field, decision_type="USE_SOURCE",
+                    rmu=self.rmu, field=field_label, decision_type="USE_SOURCE",
                     selected_source=source, selected_value=raw, normalized_value=normalized,
                     equipment_type=self.equipment_type,
                 )
@@ -2246,14 +2585,14 @@ class RMUResolutionDialog(QDialog):
                     },
                 )
             needs_action_description = build_resolution_description(
-                rmu=self.rmu, field=field, decision_type="NEEDS_ACTION", equipment_type=self.equipment_type
+                rmu=self.rmu, field=field_label, decision_type="NEEDS_ACTION", equipment_type=self.equipment_type
             )
             combo.addItem(
                 "Needs Action · correction required",
                 {"decision_type": "NEEDS_ACTION", "decision_description": needs_action_description},
             )
             exception_description = build_resolution_description(
-                rmu=self.rmu, field=field, decision_type="ACCEPT_EXCEPTION", equipment_type=self.equipment_type
+                rmu=self.rmu, field=field_label, decision_type="ACCEPT_EXCEPTION", equipment_type=self.equipment_type
             )
             combo.addItem(
                 "Accept Exception · no source correction",
@@ -2357,7 +2696,7 @@ class RMUResolutionDialog(QDialog):
                 if is_other:
                     comment = _other.toPlainText().strip()
                     text = build_resolution_description(
-                        rmu=self.rmu, field=_field, decision_type="OTHER",
+                        rmu=self.rmu, field=self._field_label(_field), decision_type="OTHER",
                         selected_source="Others", selected_value=comment,
                     )
                     _combo.setToolTip(text)
@@ -2374,7 +2713,7 @@ class RMUResolutionDialog(QDialog):
                     )
                 else:
                     text = build_resolution_description(
-                        rmu=self.rmu, field=_field, decision_type="UNRESOLVED"
+                        rmu=self.rmu, field=self._field_label(_field), decision_type="UNRESOLVED"
                     )
                 _preview.setText(text)
                 _combo.setToolTip(text)
@@ -2444,7 +2783,7 @@ class RMUResolutionDialog(QDialog):
                     QMessageBox.warning(
                         self,
                         "Comment Required",
-                        f"Enter a custom Resolution value / instruction for {field} before saving.",
+                        f"Enter a custom Resolution value / instruction for {self._field_label(field)} before saving.",
                     )
                     if editor:
                         editor.setFocus()
@@ -2459,6 +2798,12 @@ class RMUResolutionDialog(QDialog):
                 payload = dict(data)
                 decision = clean(payload.get("decision_type")).upper()
                 if decision == "OTHER":
+                    # v0.8.195: resolve the configured/display label inside
+                    # this loop.  The previous branch referenced an undefined
+                    # ``field_label`` local, so choosing "Others · custom
+                    # resolution" failed before the background SQLite save
+                    # could even start.
+                    field_label = self._field_label(field)
                     editor = self.other_comments.get(field)
                     comment = editor.toPlainText().strip() if editor else ""
                     payload.update({
@@ -2466,7 +2811,7 @@ class RMUResolutionDialog(QDialog):
                         "selected_value": comment,
                         "normalized_value": "",
                         "decision_description": build_resolution_description(
-                            rmu=self.rmu, field=field, decision_type="OTHER",
+                            rmu=self.rmu, field=field_label, decision_type="OTHER",
                             selected_source="Others", selected_value=comment,
                         ),
                     })
@@ -2504,9 +2849,9 @@ class ColumnVisibilityDialog(QDialog):
         title.setObjectName("SectionTitle")
         root.addWidget(title)
         desc = QLabel(
-            "Every mapped App field can be shown or hidden here. SYSTEM calculation fields are always visible because they feed matching, Analysis or validation. "
-            "Optional built-in fields and USER App columns are presentation choices only. New App fields appear automatically and can be hidden later. "
-            "No source mapping, SQLite review data or exported report history is deleted by changing this view."
+            "This dialog controls App/meta columns such as Index, Source Coverage, Analysis, Remarks and Resolution. "
+            "Physical source columns follow the Show checkboxes in the configurable Equipment Data Review source editor, so each site has one visibility setting per source field. "
+            "SYSTEM calculation fields are always visible because they feed matching, Analysis or validation. No source mapping, SQLite review data or exported report history is deleted by changing this view."
         )
         desc.setObjectName("Muted")
         desc.setWordWrap(True)
@@ -2728,13 +3073,153 @@ class SourceColumnOrderDialog(QDialog):
         ]
 
 
+class SystemMappingEditorDialog(QDialog):
+    """Explicit editor for protected SYSTEM semantics.
+
+    The main Map Fields grid remains strictly source-driven (one physical
+    source column = one visible App row).  When a non-standard file does not
+    contain any declared alias for a required SYSTEM field, there is therefore
+    no canonical row to unlock in that grid.  This companion editor closes that
+    gap without creating phantom source rows: reviewers bind each protected
+    SYSTEM semantic directly to one of the live physical headers.
+    """
+
+    def __init__(self, source_type: str, schema, headers, locked_keys, current_overrides, parent=None):
+        super().__init__(parent)
+        self.source_type = str(source_type or "")
+        self.schema = schema
+        self.headers = tuple(clean(h) for h in (headers or ()) if clean(h))
+        self.locked_keys = set(locked_keys or ())
+        self.current_overrides = dict(current_overrides or {})
+        self._result_overrides = dict(self.current_overrides)
+        self._combos: dict[str, QComboBox] = {}
+
+        self.setWindowTitle("Edit System Mappings")
+        self.resize(760, 520)
+        root = QVBoxLayout(self)
+        title = QLabel("System Mapping Assignments")
+        title.setObjectName("SectionTitle")
+        root.addWidget(title)
+        desc = QLabel(
+            "Bind protected SYSTEM semantics to the current physical source headers. "
+            "Use this when the file uses non-standard names such as DE_NAME instead of EQUIPMENT. "
+            "This does not add phantom source columns: the main Map Fields table still mirrors the physical file exactly."
+        )
+        desc.setObjectName("Muted")
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        specs = [spec for spec in (self.schema.fields if self.schema else ()) if spec.key in self.locked_keys]
+        self.table = QTableWidget(len(specs), 4)
+        self.table.setHorizontalHeaderLabels(["System Field", "Source Field", "Requirement", "Current Status"])
+        _configure_table_base(self.table)
+        _set_interactive_column(self.table, 0, 220)
+        _set_stretch_column(self.table, 1)
+        _set_fixed_column(self.table, 2, 110)
+        _set_fixed_column(self.table, 3, 150)
+
+        validation = resolve_schema(self.schema, self.headers, self.current_overrides) if self.schema else None
+        by_key = validation.mapping_by_key if validation is not None else {}
+        for row, spec in enumerate(specs):
+            mapping = by_key.get(spec.key)
+            app_item = QTableWidgetItem(canonical_system_field_label(self.source_type, spec.key, spec.label))
+            app_item.setToolTip(spec.description or spec.label)
+            self.table.setItem(row, 0, app_item)
+
+            combo = NoWheelComboBox()
+            combo.addItem("Auto", "")
+            if not spec.required:
+                combo.addItem("Blank · no source field", BLANK_OVERRIDE_TOKEN)
+            if self.headers:
+                combo.insertSeparator(combo.count())
+            for header in self.headers:
+                combo.addItem(header, header)
+
+            saved = clean(self.current_overrides.get(spec.key, ""))
+            selected = ""
+            if saved == BLANK_OVERRIDE_TOKEN:
+                selected = BLANK_OVERRIDE_TOKEN
+            elif is_manual_override(saved):
+                selected = decode_manual_override(saved)
+            elif mapping is not None and mapping.kind == MappingKind.OVERRIDE and mapping.actual_column:
+                selected = clean(mapping.actual_column)
+            idx = combo.findData(selected)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            self._combos[spec.key] = combo
+            self.table.setCellWidget(row, 1, combo)
+
+            req = QTableWidgetItem("Required" if spec.required else "System")
+            req.setForeground(QColor(COLORS["warning"] if spec.required else COLORS["info"]))
+            self.table.setItem(row, 2, req)
+
+            if mapping is None:
+                status_text = "Missing"
+            elif mapping.actual_column:
+                status_text = f"{mapping.kind.value} → {mapping.actual_column}"
+            else:
+                status_text = mapping.kind.value
+            status = QTableWidgetItem(status_text)
+            status.setForeground(QColor(
+                COLORS["warning"] if mapping is None or mapping.kind in {MappingKind.MISSING, MappingKind.AMBIGUOUS, MappingKind.BLANK}
+                else COLORS["success"]
+            ))
+            self.table.setItem(row, 3, status)
+
+        root.addWidget(self.table, 1)
+        note = QLabel(
+            "Required SYSTEM fields must resolve before Save. Manual selections are stored as explicit source-header bindings; "
+            "Auto continues to use the declared aliases when they exist."
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        save_btn = self.buttons.button(QDialogButtonBox.Save)
+        save_btn.setText("Apply System Mappings")
+        save_btn.setObjectName("Primary")
+        self.buttons.accepted.connect(self._accept_mappings)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+
+    def _candidate_overrides(self) -> dict[str, str]:
+        candidate = dict(self.current_overrides)
+        for key, combo in self._combos.items():
+            value = clean(combo.currentData())
+            if value == BLANK_OVERRIDE_TOKEN:
+                candidate[key] = BLANK_OVERRIDE_TOKEN
+            elif value:
+                candidate[key] = encode_manual_override(value)
+            else:
+                candidate.pop(key, None)
+        return candidate
+
+    def _accept_mappings(self):
+        candidate = self._candidate_overrides()
+        result = resolve_schema(self.schema, self.headers, candidate) if self.schema else None
+        if result is not None and result.errors:
+            QMessageBox.warning(
+                self,
+                "System Mapping Required",
+                result.error_message("current source")
+                + "\n\nSelect a physical Source Field for every required SYSTEM field before applying.",
+            )
+            return
+        self._result_overrides = candidate
+        self.accept()
+
+    def overrides(self) -> dict[str, str]:
+        return dict(self._result_overrides)
+
+
 class SourceMappingDialog(QDialog):
     """Simple App-column <-> source-column mapping editor.
 
-    Built-in logic fields keep the established validation contract. App-column
-    names, USER columns, explicit Source Field selections and display order are
-    application-global. A site whose physical file lacks a selected header keeps
-    the column visible but displays it as unmapped/blank.
+    The table mirrors the active physical header: one source column equals one
+    App row. Canonical system semantics attach to matching rows, while unmatched
+    source headers become optional App fields with the same default name. App
+    labels and visibility remain configurable without creating phantom columns.
     """
 
     def __init__(self, source_type: str, source_path: Path, store, user_name: str, parent=None):
@@ -2758,13 +3243,30 @@ class SourceMappingDialog(QDialog):
         self.sheet_name = ""
         if self.source_path.suffix.lower() in {".xlsx", ".xlsm"}:
             preferred = store.source_sheet_name(source_type) if store and hasattr(store, "source_sheet_name") else ""
-            self.sheet_name = resolve_excel_sheet_name(self.source_path, preferred or None)
+            self.sheet_name = resolve_source_excel_sheet_name(source_type, self.source_path, preferred or None)
         self.validation = validate_source_file(
             source_type, self.source_path, self.current_overrides, sheet_name=self.sheet_name or None
         )
+        # Snapshot every protected semantic, including currently-missing ones.
+        # v0.8.174 uses this complete state for the Save confirmation so a
+        # missing -> manual binding (for example Equipment Name -> DE_NAME) is
+        # never mistaken for an unchanged mapping simply because the row did not
+        # exist when the dialog first opened.
+        self._initial_locked_mapping_state = self._locked_mapping_state(
+            self.validation, self.current_overrides
+        )
+        # v0.8.167: Map Fields is source-driven.  The live physical header is
+        # the row contract: one physical source column = one App row.  Existing
+        # canonical SYSTEM semantics are attached to the matching physical row;
+        # every other physical header becomes an automatic App field whose
+        # default display name is exactly the source header.
+        self._inactive_custom_fields: list[dict] = []
+        self._source_file_signature = self._file_signature()
+        self._sync_live_source_columns()
         self._combos: dict[str, QComboBox] = {}
         self._display_edits: dict[str, QLineEdit] = {}
         self._custom_widgets: dict[str, dict] = {}
+        self._visibility_checks: dict[str, QCheckBox] = {}
 
         self.setWindowTitle(ui_tr(f"Map Fields · {self.schema.label if self.schema else source_type}"))
         self.resize(820, 620)
@@ -2773,12 +3275,12 @@ class SourceMappingDialog(QDialog):
         title.setObjectName("SectionTitle")
         root.addWidget(title)
         desc = QLabel(
-            "Choose which Source Field feeds each App Column. The App-column configuration is global across all sites: built-in display "
-            "names, USER-added columns, explicit Source Field selections and saved column order are shared by every station. "
-            "If a station's physical file does not contain the selected Source Field, that column remains visible and is shown as unmapped/blank. "
-            "For SYSTEM fields: Auto shows the currently resolved header as 'Auto → Header'; Blank forces an empty value; selecting a physical header creates an explicit Manual mapping. "
-            "SYSTEM calculation mappings are protected by default; use Unlock System Mappings before deliberately remapping them. "
-            "A later new source column can be selected manually, or you can switch back to Auto at any time."
+            "This table mirrors the live physical source header: one physical source column equals one App row. "
+            "A newly added Excel/CSV column is detected after the file is saved and appears automatically; its default App name is the source header itself. "
+            "You may rename the App label later without changing the physical Source Field. Canonical SYSTEM semantics are attached to the matching physical row and stay locked visible because they feed matching, Analysis or validation. "
+            "Optional rows are hidden by default and can be shown/hidden for Equipment Data Review without deleting their mapping. "
+            "Map Fields settings are global by App/source type: mapping, App display names, Show/Hide and column order saved at one station are reused by every station. "
+            "The physical source file and Excel sheet remain station-specific. Absent physical columns are not rendered as phantom rows."
         )
         desc.setObjectName("Muted")
         desc.setWordWrap(True)
@@ -2809,15 +3311,24 @@ class SourceMappingDialog(QDialog):
         protection_row.addWidget(self.unlock_system_btn)
         root.addLayout(protection_row)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["App Column", "Source Field", "Type", "Status"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Show", "App Column", "Source Field", "Type", "Status"])
         _configure_table_base(self.table)
-        _set_interactive_column(self.table, 0, 250)
-        _set_stretch_column(self.table, 1)
-        _set_fixed_column(self.table, 2, 145)
-        _set_fixed_column(self.table, 3, 115)
+        _set_fixed_column(self.table, 0, 70)
+        _set_interactive_column(self.table, 1, 250)
+        _set_stretch_column(self.table, 2)
+        _set_fixed_column(self.table, 3, 145)
+        _set_fixed_column(self.table, 4, 115)
         self._populate()
         root.addWidget(self.table, 1)
+
+        # Watch only file metadata on the GUI thread.  When Excel/CSV is saved
+        # with new/removed headers, the header is re-read once and the dialog
+        # rebuilds itself automatically without repeatedly parsing the workbook.
+        self._live_header_timer = QTimer(self)
+        self._live_header_timer.setInterval(1500)
+        self._live_header_timer.timeout.connect(self._refresh_if_source_changed)
+        self._live_header_timer.start()
 
         self.result_label = QLabel(self._summary_text(self.validation))
         self.result_label.setObjectName("Muted")
@@ -2825,23 +3336,18 @@ class SourceMappingDialog(QDialog):
         root.addWidget(self.result_label)
 
         button_row = QHBoxLayout()
-        add_custom_btn = QPushButton("+ Add App Column")
-        add_custom_btn.setObjectName("Primary")
-        add_custom_btn.setToolTip("Create a new App column and map it to a physical source field.")
-        add_custom_btn.clicked.connect(self._add_custom_field)
-        button_row.addWidget(add_custom_btn)
-        delete_custom_btn = QPushButton("Delete Column")
-        delete_custom_btn.setToolTip("System logic columns are protected. User-added and optional presentation columns can be removed.")
-        delete_custom_btn.clicked.connect(self._delete_custom_field)
-        button_row.addWidget(delete_custom_btn)
+        show_all_btn = QPushButton("Show All Fields")
+        show_all_btn.setToolTip("Show every optional and USER App field in Equipment Data Review. SYSTEM calculation fields are always shown.")
+        show_all_btn.clicked.connect(self._show_all_fields)
+        button_row.addWidget(show_all_btn)
+        hide_optional_btn = QPushButton("Hide Optional Fields")
+        hide_optional_btn.setToolTip("Hide every optional and USER App field at once. SYSTEM calculation fields stay visible and cannot be hidden.")
+        hide_optional_btn.clicked.connect(self._hide_optional_fields)
+        button_row.addWidget(hide_optional_btn)
         move_column_btn = QPushButton("Move Column...")
         move_column_btn.setToolTip("Reorder App columns inside this source group. This changes presentation only.")
         move_column_btn.clicked.connect(self._move_columns)
         button_row.addWidget(move_column_btn)
-        restore_btn = QPushButton("Restore Optional Columns")
-        restore_btn.setToolTip("Restore optional built-in presentation columns previously removed from this App table.")
-        restore_btn.clicked.connect(self._restore_hidden_builtin_fields)
-        button_row.addWidget(restore_btn)
         reset_btn = QPushButton("Reset Auto Mapping")
         reset_btn.clicked.connect(self._reset_all_to_auto)
         button_row.addWidget(reset_btn)
@@ -2855,8 +3361,151 @@ class SourceMappingDialog(QDialog):
         button_row.addWidget(self.button_box)
         root.addLayout(button_row)
 
+    def _file_signature(self):
+        try:
+            stat = self.source_path.stat()
+            return (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            return None
+
+    def _header_key(self, value: str) -> str:
+        return clean(value).casefold()
+
+    def _built_in_owner_by_header(self) -> dict[str, str]:
+        """Return one canonical App key for each live physical header.
+
+        A physical header may satisfy more than one legacy alias.  The table must
+        still contain one row only, so SYSTEM/required semantics win, followed by
+        schema order.
+        """
+        if self.validation is None or self.schema is None:
+            return {}
+        header_lookup = {self._header_key(h): h for h in self.validation.headers}
+        candidates: dict[str, list[tuple[int, int, str]]] = {}
+        by_key = self.validation.mapping_by_key
+        for index, spec in enumerate(self.schema.fields):
+            mapping = by_key.get(spec.key)
+            actual = clean(mapping.actual_column if mapping else '')
+            hk = self._header_key(actual)
+            if not hk or hk not in header_lookup:
+                continue
+            priority = 0
+            if spec.key in self.locked_system_fields:
+                priority += 100
+            if spec.required:
+                priority += 20
+            if getattr(mapping, 'kind', None) == MappingKind.EXACT:
+                priority += 5
+            candidates.setdefault(hk, []).append((-priority, index, spec.key))
+        return {hk: sorted(values)[0][2] for hk, values in candidates.items()}
+
+    def _stable_auto_custom_key(self, header: str, reserved: set[str]) -> str:
+        base = f"source_{slug_key(header)}"
+        key = base
+        index = 2
+        while key in reserved:
+            key = f"{base}_{index}"
+            index += 1
+        return key
+
+    def _sync_live_source_columns(self) -> None:
+        """Make App rows mirror the current physical source header exactly.
+
+        Existing USER mappings that are not present in this site's current file
+        are retained as inactive metadata so a different station can still use
+        them, but they are not rendered as phantom rows in this dialog.
+        """
+        if self.validation is None or self.schema is None:
+            return
+        headers = [clean(h) for h in self.validation.headers if clean(h)]
+        header_keys = {self._header_key(h) for h in headers}
+        owners = self._built_in_owner_by_header()
+        existing = [dict(item or {}) for item in self.current_custom_fields]
+        by_actual = {}
+        for item in existing:
+            actual = clean(item.get('actual_column'))
+            if actual:
+                by_actual.setdefault(self._header_key(actual), item)
+
+        active_custom: list[dict] = []
+        inactive_custom: list[dict] = []
+        reserved = {spec.key for spec in self.schema.fields}
+        reserved.update(clean(item.get('field_key')) for item in existing if clean(item.get('field_key')))
+        used_custom_keys: set[str] = set()
+
+        for header in headers:
+            hk = self._header_key(header)
+            if hk in owners:
+                continue
+            item = by_actual.get(hk)
+            if item is None:
+                key = self._stable_auto_custom_key(header, reserved)
+                reserved.add(key)
+                item = {
+                    'field_key': key,
+                    'display_name': header,
+                    'actual_column': header,
+                    'auto_source_field': True,
+                }
+            else:
+                item = dict(item)
+                item['actual_column'] = header
+                if not clean(item.get('display_name')):
+                    item['display_name'] = header
+            active_custom.append(item)
+            used_custom_keys.add(clean(item.get('field_key')))
+
+        for item in existing:
+            key = clean(item.get('field_key'))
+            actual = clean(item.get('actual_column'))
+            if key in used_custom_keys:
+                continue
+            # A USER App mapping to a currently absent source header remains
+            # globally persistent but is not a row in this source-driven view.
+            # Any pre-existing USER metadata not selected as the one visible
+            # owner of a physical header stays persisted but inactive. This also
+            # protects legacy duplicate mappings from being deleted on Save.
+            inactive_custom.append(item)
+
+        self.current_custom_fields = active_custom
+        self._inactive_custom_fields = inactive_custom
+
+    def _refresh_if_source_changed(self):
+        signature = self._file_signature()
+        if signature is None or signature == self._source_file_signature:
+            return
+        self._source_file_signature = signature
+        try:
+            self._capture_unsaved_state()
+            validation = validate_source_file(
+                self.source_type, self.source_path, self.current_overrides,
+                sheet_name=self.sheet_name or None,
+            )
+            if validation is None:
+                return
+            self.validation = validation
+            # Include currently active and inactive USER metadata before syncing
+            # so renamed App labels survive a live header refresh.
+            self._sync_live_source_columns()
+            self._combos.clear()
+            self._display_edits.clear()
+            self._custom_widgets.clear()
+            self._visibility_checks.clear()
+            self._initial_locked_selections.clear()
+            self._populate()
+            self.result_label.setText(self._summary_text(self.validation))
+        except Exception as exc:
+            # Excel can be momentarily locked while the user saves it.  Keep the
+            # last valid header and retry on the next metadata change/open.
+            self.result_label.setText(f"Source changed; waiting for a readable header: {type(exc).__name__}: {exc}")
+
     def _unlock_system_mappings(self):
+        # Once unlocked, this button remains useful: it reopens the dedicated
+        # SYSTEM semantic editor.  v0.8.173 disabled the button after Unlock,
+        # which meant a required semantic with no alias row (e.g. Equipment
+        # Name in a DE_NAME file) could never actually be mapped.
         if self.system_mapping_unlocked:
+            self._edit_system_mappings()
             return
         text = (
             "SYSTEM · LOCKED fields are used by system-level Analysis, matching, and validation calculations.\n\n"
@@ -2876,12 +3525,52 @@ class SourceMappingDialog(QDialog):
         self.system_mapping_unlocked = True
         self._apply_system_mapping_protection()
         self.system_protection_label.setText(
-            "System mappings are UNLOCKED for this dialog only. Any protected mapping change will require confirmation again when you Save."
+            "System mappings are UNLOCKED for this dialog. Use Edit System Mappings to bind missing or non-standard source headers; Save will ask for confirmation again."
         )
-        self.unlock_system_btn.setText("System Mappings Unlocked")
-        self.unlock_system_btn.setEnabled(False)
+        self.unlock_system_btn.setText("Edit System Mappings...")
+        self.unlock_system_btn.setEnabled(True)
+        self.unlock_system_btn.setToolTip(
+            "Edit every protected SYSTEM semantic, including required fields that have no automatic alias match in the current physical header."
+        )
         self.result_label.setText(
-            "Protected system mappings unlocked for this dialog. Verify each Source Field carefully before Save."
+            "Protected system mappings unlocked. Bind any missing SYSTEM field to a verified physical source header before Save."
+        )
+        # Open the real assignment editor immediately so Unlock is an actionable
+        # operation rather than only changing the colour/enabled state of rows
+        # that already happened to auto-match.
+        self._edit_system_mappings()
+
+    def _edit_system_mappings(self):
+        if not self.system_mapping_unlocked or self.schema is None or self.validation is None:
+            return
+        # Preserve unsaved labels/visibility and any edits to already-visible
+        # SYSTEM rows before presenting the full semantic assignment list.
+        self._capture_unsaved_state()
+        dialog = SystemMappingEditorDialog(
+            self.source_type,
+            self.schema,
+            self.validation.headers,
+            self.locked_system_fields,
+            self.current_overrides,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.current_overrides = dialog.overrides()
+        # Re-resolve against the cached physical header.  A newly-bound required
+        # semantic now takes ownership of that existing physical row; no phantom
+        # row is added and the one-source-column/one-App-row invariant remains.
+        self.validation = resolve_schema(self.schema, self.validation.headers, self.current_overrides)
+        self._sync_live_source_columns()
+        self._combos.clear()
+        self._display_edits.clear()
+        self._custom_widgets.clear()
+        self._visibility_checks.clear()
+        self._populate()
+        self._apply_system_mapping_protection()
+        self.result_label.setText(
+            "SYSTEM mappings updated in this dialog. Review the promoted rows, then Save to persist and refresh calculated data."
         )
 
     def _apply_system_mapping_protection(self):
@@ -2894,7 +3583,7 @@ class SourceMappingDialog(QDialog):
             if key in self.locked_system_fields:
                 combo.setEnabled(self.system_mapping_unlocked)
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 2)
+            item = self.table.item(row, 3)
             meta = item.data(Qt.ItemDataRole.UserRole) if item else None
             if not isinstance(meta, dict) or not bool(meta.get("locked")):
                 continue
@@ -2906,15 +3595,25 @@ class SourceMappingDialog(QDialog):
                 "System calculation field. Click 'Unlock System Mappings...' before changing its Source Field mapping."
             )
 
+    def _locked_mapping_state(self, validation, overrides) -> dict[str, tuple[str, str, str]]:
+        by_key = validation.mapping_by_key if validation is not None else {}
+        state: dict[str, tuple[str, str, str]] = {}
+        for key in self.locked_system_fields:
+            mapping = by_key.get(key)
+            actual = clean(mapping.actual_column if mapping else "")
+            kind = mapping.kind.value if mapping is not None else "Missing"
+            override = clean((overrides or {}).get(key, ""))
+            state[key] = (actual, kind, override)
+        return state
+
     def _changed_locked_mapping_keys(self) -> list[str]:
+        if self.schema is None or self.validation is None:
+            return []
+        current_validation = resolve_schema(self.schema, self.validation.headers, self.current_overrides)
+        current_state = self._locked_mapping_state(current_validation, self.current_overrides)
         changed: list[str] = []
         for key in self.locked_system_fields:
-            combo = self._combos.get(key)
-            if combo is None:
-                continue
-            initial = clean(self._initial_locked_selections.get(key, ""))
-            current = clean(combo.currentData())
-            if current != initial:
+            if current_state.get(key) != self._initial_locked_mapping_state.get(key):
                 changed.append(key)
         return changed
 
@@ -2925,13 +3624,13 @@ class SourceMappingDialog(QDialog):
         specs = {spec.key: spec for spec in (self.schema.fields if self.schema else ())}
         for key in changed_keys:
             spec = specs.get(key)
-            labels.append(default_display_name(self.source_type, key, spec.label if spec else key))
+            labels.append(canonical_system_field_label(self.source_type, key, spec.label if spec else key))
         fields = ", ".join(labels)
         text = (
             "You changed protected system Source Field mapping(s):\n\n"
             f"{fields}\n\n"
             "These mappings feed system-level Analysis and validation and are shared across ALL sites for this source type. "
-            "Saving may change RMU comparison results after Refresh/Validation.\n\n"
+            "Saving may change equipment comparison results after Refresh/Validation.\n\n"
             "Save these protected system mapping changes?"
         )
         answer = QMessageBox.warning(
@@ -2946,10 +3645,17 @@ class SourceMappingDialog(QDialog):
     def _summary_text(self, result):
         if result is None:
             return "No tabular field mapping is available for this source."
-        if result.errors:
-            return "Required field mapping is incomplete. Fix the red/missing built-in mappings before saving."
-        custom_count = len(self.current_custom_fields)
-        return f"{len(result.mappings)} built-in fields · {custom_count} global USER App column(s)."
+        physical_count = len(tuple(result.headers or ()))
+        missing_required = [
+            m.canonical_key for m in result.mappings
+            if getattr(m, 'kind', None) in {MappingKind.MISSING, MappingKind.AMBIGUOUS}
+            and next((spec.required for spec in self.schema.fields if spec.key == m.canonical_key), False)
+        ] if self.schema else []
+        if missing_required:
+            return (f"{physical_count} physical source column(s) loaded. "
+                    f"Missing required system mapping(s): {', '.join(missing_required)}. "
+                    "Unlock System Mappings and assign the verified physical Source Field; non-standard headers are supported.")
+        return f"{physical_count} physical source column(s) loaded · one source column = one App row."
 
     def _source_combo(self, actual_column: str = "", *, custom: bool = False, auto_resolved: str = ""):
         combo = NoWheelComboBox()
@@ -2988,169 +3694,214 @@ class SourceMappingDialog(QDialog):
             combo.setCurrentIndex(idx)
         return combo
 
+    def _visibility_widget(self, field_key: str, *, locked: bool = False) -> QWidget:
+        """Build one persistent Show/Hide selector for an App field.
+
+        Visibility is presentation-only. Hidden fields stay in the mapping model,
+        retain their Source Field mapping and remain available for later re-show.
+        SYSTEM calculation fields are always checked and cannot be hidden.
+        """
+        checkbox = QCheckBox()
+        checkbox.setChecked(True if locked else field_key not in self.current_hidden_fields)
+        checkbox.setEnabled(not locked)
+        checkbox.setToolTip(
+            "SYSTEM calculation field. It is always shown because it feeds matching, Analysis or validation."
+            if locked else
+            "Show this App field in Equipment Data Review. Uncheck to hide it without deleting its mapping or App definition."
+        )
+        self._visibility_checks[field_key] = checkbox
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch()
+        layout.addWidget(checkbox)
+        layout.addStretch()
+        return holder
+
     def _populate(self):
         if self.validation is None or self.schema is None:
             return
         by_key = self.validation.mapping_by_key
-        visible_specs = [spec for spec in self.schema.fields if spec.key not in self.current_hidden_fields]
-        specs_by_key = {spec.key: spec for spec in visible_specs}
-        custom_by_key = {
-            clean((item or {}).get("field_key")): dict(item or {})
+        headers = [clean(h) for h in self.validation.headers if clean(h)]
+        owners = self._built_in_owner_by_header()
+        specs_by_key = {spec.key: spec for spec in self.schema.fields}
+        custom_by_header = {
+            self._header_key(clean(item.get('actual_column'))): dict(item)
             for item in self.current_custom_fields
-            if clean((item or {}).get("field_key"))
+            if clean(item.get('actual_column'))
         }
-        default_order = [spec.key for spec in visible_specs] + list(custom_by_key)
-        order = [key for key in self.current_column_order if key in specs_by_key or key in custom_by_key]
-        order.extend(key for key in default_order if key not in order)
-        self.current_column_order = list(order)
 
-        self.table.setRowCount(len(order))
-        for row, field_key in enumerate(order):
-            spec = specs_by_key.get(field_key)
-            if spec is None:
-                self._populate_custom_row(row, custom_by_key[field_key])
+        # Build exactly one row for every physical source header, in source order.
+        rows: list[tuple[str, str, object]] = []
+        for header in headers:
+            hk = self._header_key(header)
+            owner_key = owners.get(hk)
+            if owner_key:
+                rows.append(('built_in', owner_key, header))
+            else:
+                item = custom_by_header.get(hk)
+                if item is not None:
+                    rows.append(('custom', clean(item.get('field_key')), item))
+
+        # Preserve a user-defined presentation order only among rows that still
+        # exist in the live file. New headers join automatically without creating
+        # phantom absent fields.
+        row_by_key = {key: row for row in rows for key in [row[1]] if key}
+        source_order = [row[1] for row in rows if row[1]]
+        ordered_keys = [k for k in self.current_column_order if k in row_by_key]
+        ordered_keys.extend(k for k in source_order if k not in ordered_keys)
+        rows = [row_by_key[k] for k in ordered_keys]
+        self.current_column_order = list(ordered_keys)
+
+        self.table.setRowCount(len(rows))
+        for row, (kind, field_key, payload) in enumerate(rows):
+            if kind == 'custom':
+                self._populate_custom_row(row, payload)
                 continue
 
+            spec = specs_by_key[field_key]
             mapping = by_key[spec.key]
-            built_in_display = default_display_name(self.source_type, spec.key, spec.label)
-            display_edit = QLineEdit(self.current_display_names.get(spec.key, built_in_display) or built_in_display)
-            display_edit.setMaxLength(80)
-            display_edit.setToolTip("App column name. Renaming changes presentation only; validation keeps the same internal field.")
-            self._display_edits[spec.key] = display_edit
-            self.table.setCellWidget(row, 0, display_edit)
+            locked = spec.key in self.locked_system_fields
+            source_header = clean(payload)
+            self.table.setCellWidget(row, 0, self._visibility_widget(spec.key, locked=locked))
 
-            saved_override = self.current_overrides.get(spec.key, "")
+            historical_default = default_display_name(self.source_type, spec.key, spec.label)
+            saved_name = clean(self.current_display_names.get(spec.key, ''))
+            # Earlier builds persisted their own canonical default labels. Treat
+            # those as defaults, not as an intentional rename.  A real user rename
+            # is retained.
+            display_name = source_header
+            if saved_name and saved_name not in {historical_default, clean(spec.label)}:
+                display_name = saved_name
+            display_edit = QLineEdit(display_name)
+            display_edit.setMaxLength(80)
+            display_edit.setToolTip(
+                "Defaults to the physical source header. You may rename the App label; the underlying system key/mapping does not change."
+            )
+            self._display_edits[spec.key] = display_edit
+            self.table.setCellWidget(row, 1, display_edit)
+
+            saved_override = self.current_overrides.get(spec.key, '')
             if mapping.kind == MappingKind.BLANK:
                 active_override = BLANK_OVERRIDE_TOKEN
             elif is_manual_override(saved_override):
                 active_override = decode_manual_override(saved_override)
             elif mapping.kind == MappingKind.OVERRIDE:
-                # Legacy fallback mapping: display the effective physical field.
-                # If the user saves it again, it is promoted to an explicit
-                # Manual choice and will thereafter override Auto deliberately.
                 active_override = decode_manual_override(saved_override)
             else:
-                active_override = ""
-            auto_resolved = mapping.actual_column if mapping.kind in {MappingKind.EXACT, MappingKind.ALIAS} else ""
+                active_override = ''
+            auto_resolved = source_header
             combo = self._source_combo(active_override, custom=False, auto_resolved=auto_resolved)
-            if mapping.kind == MappingKind.BLANK:
-                combo.setToolTip(
-                    "Explicit blank mapping. This App field will display an empty value and no physical Source Field will be used. "
-                    "Choose Auto to resume normal header-name detection."
-                )
-            elif saved_override and not active_override:
-                legacy_name = decode_manual_override(saved_override)
-                combo.setToolTip(
-                    f"Legacy mapping '{legacy_name}' is not controlling this field because Auto currently resolves to '{mapping.actual_column}'. "
-                    "Choose a physical Source Field from this list if you want to make an explicit Manual mapping, or keep Auto."
-                )
-            elif mapping.kind in {MappingKind.EXACT, MappingKind.ALIAS}:
-                combo.setToolTip(
-                    f"Auto currently resolves this App field to Source Field '{mapping.actual_column}'. "
-                    "The Auto option always means automatic header-name detection; choose a physical Source Field to override it, "
-                    "or choose 'Blank · no source field' to keep the App field intentionally empty."
-                )
-            elif mapping.kind == MappingKind.OVERRIDE:
-                combo.setToolTip(
-                    f"Manual Source Field mapping is active: '{mapping.actual_column}'. "
-                    "Choose Auto to remove the manual mapping and return to automatic header-name detection."
-                )
-            else:
-                expected = ", ".join(str(alias) for alias in spec.aliases if clean(alias))
-                combo.setToolTip(
-                    "Auto has no matching Source Field in the current file. "
-                    + (f"Expected header/alias: {expected}. " if expected else "")
-                    + "The App value will remain blank. Choose a physical Source Field manually, "
-                    "keep Auto selected so a future matching header can be detected, or choose 'Blank · no source field' "
-                    "for an intentional blank."
-                )
             self._combos[spec.key] = combo
-            self.table.setCellWidget(row, 1, combo)
+            self.table.setCellWidget(row, 2, combo)
 
-            locked = spec.key in self.locked_system_fields
             if locked:
-                # Preserve the selector state that existed when this dialog first
-                # opened so Save can distinguish a real protected remap from a
-                # harmless reopen/reorder of the table.
                 self._initial_locked_selections.setdefault(spec.key, clean(combo.currentData()))
                 combo.setEnabled(self.system_mapping_unlocked)
                 if not self.system_mapping_unlocked:
                     combo.setToolTip(
-                        "SYSTEM calculation mapping is protected. Click 'Unlock System Mappings...' to remap this Source Field. "
-                        "Changing it affects Analysis/validation for all sites."
+                        "SYSTEM calculation mapping is protected. Click 'Unlock System Mappings...' to remap this Source Field."
                     )
             role_key = (
-                "SYSTEM · UNLOCKED" if locked and self.system_mapping_unlocked
-                else "SYSTEM · LOCKED" if locked
-                else "SYSTEM · OPTIONAL"
+                'SYSTEM · UNLOCKED' if locked and self.system_mapping_unlocked
+                else 'SYSTEM · LOCKED' if locked
+                else 'SYSTEM · OPTIONAL'
             )
             role = QTableWidgetItem(role_key)
-            role.setData(Qt.ItemDataRole.UserRole, {"kind": "built_in", "field_key": spec.key, "locked": locked})
+            role.setData(Qt.ItemDataRole.UserRole, {'kind': 'built_in', 'field_key': spec.key, 'locked': locked})
             role.setForeground(QColor(
-                COLORS["muted"] if not locked
-                else COLORS["warning"] if self.system_mapping_unlocked
-                else COLORS["info"]
+                COLORS['muted'] if not locked
+                else COLORS['warning'] if self.system_mapping_unlocked
+                else COLORS['info']
             ))
-            role.setToolTip(
-                ("System calculation field. Source Field remapping is enabled for this dialog and will require Save confirmation."
-                 if self.system_mapping_unlocked else
-                 "System calculation field. Click 'Unlock System Mappings...' before changing its Source Field mapping.")
-                if locked else
-                "Presentation/reference field. It can be removed from this App table without changing validation logic."
-            )
-            self.table.setItem(row, 2, role)
+            self.table.setItem(row, 3, role)
 
-            status_text = "Manual" if mapping.kind == MappingKind.OVERRIDE else mapping.kind.value
+            status_text = 'Manual' if mapping.kind == MappingKind.OVERRIDE else mapping.kind.value
             status = QTableWidgetItem(status_text)
-            status.setData(Qt.ItemDataRole.UserRole, {"kind": "built_in", "field_key": spec.key, "locked": locked})
+            status.setData(Qt.ItemDataRole.UserRole, {'kind': 'built_in', 'field_key': spec.key, 'locked': locked})
             status.setForeground(QColor(
-                COLORS["danger"] if mapping.kind.value in {"Missing", "Ambiguous"} and spec.required
-                else COLORS["warning"] if mapping.kind in {MappingKind.MISSING, MappingKind.AMBIGUOUS, MappingKind.BLANK}
-                else COLORS["success"]
+                COLORS['warning'] if mapping.kind in {MappingKind.MISSING, MappingKind.AMBIGUOUS, MappingKind.BLANK}
+                else COLORS['success']
             ))
             f = status.font(); f.setBold(True); status.setFont(f)
-            status.setToolTip((mapping.message or spec.description or "") + "\nBuilt-in App column")
-            self.table.setItem(row, 3, status)
+            status.setToolTip((mapping.message or spec.description or '') + '\nPhysical source column: ' + source_header)
+            self.table.setItem(row, 4, status)
 
     def _populate_custom_row(self, row: int, item: dict):
         field_key = clean((item or {}).get("field_key"))
         display_name = clean((item or {}).get("display_name")) or field_key
         actual_column = clean((item or {}).get("actual_column"))
+        self.table.setCellWidget(row, 0, self._visibility_widget(field_key, locked=False))
         display_edit = QLineEdit(display_name)
         display_edit.setMaxLength(80)
         display_edit.setToolTip("Application-global App column name. The same column is shown for every site.")
-        self.table.setCellWidget(row, 0, display_edit)
+        self.table.setCellWidget(row, 1, display_edit)
         combo = self._source_combo(actual_column, custom=True)
-        combo.setToolTip("Global Source Field selection. Saving it here applies the same mapping to every station.")
-        self.table.setCellWidget(row, 1, combo)
+        combo.setEnabled(False)
+        combo.setToolTip(
+            "Source-driven row: this App field is bound to this physical source header. Rename the App label if needed; the physical column remains unchanged."
+        )
+        self.table.setCellWidget(row, 2, combo)
         headers = set(self.validation.headers if self.validation is not None else ())
         mapped = bool(actual_column and actual_column in headers)
-        role = QTableWidgetItem("USER")
+        role = QTableWidgetItem("SOURCE · OPTIONAL")
         role.setData(Qt.ItemDataRole.UserRole, {"kind": "added", "field_key": field_key, "locked": False})
         role.setForeground(QColor(COLORS["success"]))
-        role.setToolTip("Application-global USER App column. Name, deletion and Source Field mapping all apply to every station.")
-        self.table.setItem(row, 2, role)
+        role.setToolTip("Physical source column discovered from the live file. The App display name can be changed; visibility is presentation-only.")
+        self.table.setItem(row, 3, role)
         status = QTableWidgetItem("Mapped" if mapped else "Unmapped · blank")
         status.setData(Qt.ItemDataRole.UserRole, {"kind": "added", "field_key": field_key, "locked": False})
         status.setForeground(QColor(COLORS["success"] if mapped else COLORS["warning"]))
         f = status.font(); f.setBold(True); status.setFont(f)
-        status.setToolTip("Added App column")
-        self.table.setItem(row, 3, status)
+        status.setToolTip("Physical source column")
+        self.table.setItem(row, 4, status)
         self._custom_widgets[field_key] = {"display": display_edit, "combo": combo}
 
     def _current_table_order(self) -> list[str]:
         order: list[str] = []
         for row in range(self.table.rowCount()):
-            meta_item = self.table.item(row, 2) or self.table.item(row, 3)
+            meta_item = self.table.item(row, 3) or self.table.item(row, 4)
             meta = meta_item.data(Qt.ItemDataRole.UserRole) if meta_item else None
             key = clean((meta or {}).get("field_key")) if isinstance(meta, dict) else ""
             if key and key not in order:
                 order.append(key)
         return order
 
+    def _sync_hidden_from_visibility(self) -> None:
+        hidden: set[str] = set()
+        for key, checkbox in self._visibility_checks.items():
+            if key in self.locked_system_fields:
+                checkbox.setChecked(True)
+                continue
+            if not checkbox.isChecked():
+                hidden.add(key)
+        self.current_hidden_fields = hidden
+
+    def _visibility_summary(self) -> str:
+        total = len(self._visibility_checks)
+        hidden = sum(1 for key, checkbox in self._visibility_checks.items() if key not in self.locked_system_fields and not checkbox.isChecked())
+        visible = total - hidden
+        if current_language() == LANG_ZH_CN:
+            return f"显示 {visible} 个字段 · 隐藏 {hidden} 个字段。保存后应用到设备数据审核。"
+        return f"{visible} field(s) shown · {hidden} hidden. Save to apply visibility to Equipment Data Review."
+
+    def _show_all_fields(self):
+        for checkbox in self._visibility_checks.values():
+            checkbox.setChecked(True)
+        self._sync_hidden_from_visibility()
+        self.result_label.setText(self._visibility_summary())
+
+    def _hide_optional_fields(self):
+        for key, checkbox in self._visibility_checks.items():
+            checkbox.setChecked(key in self.locked_system_fields)
+        self._sync_hidden_from_visibility()
+        self.result_label.setText(self._visibility_summary())
+
     def _capture_unsaved_state(self):
-        # Merge visible built-ins so a hidden field's prior presentation metadata
-        # is not discarded merely because the user is reordering other columns.
+        # v0.8.166: visibility is independent from mapping. Unchecked fields
+        # remain fully defined and mapped; only review presentation is hidden.
+        self._sync_hidden_from_visibility()
         for key, combo in self._combos.items():
             value = clean(combo.currentData())
             if value == BLANK_OVERRIDE_TOKEN:
@@ -3178,7 +3929,13 @@ class SourceMappingDialog(QDialog):
                 "display_name": clean(widgets["display"].text()),
                 "actual_column": clean(widgets["combo"].currentData()),
             })
-        self.current_custom_fields = custom_fields
+        # Keep USER mappings that belong to other station/file schemas even
+        # though this source-driven dialog does not render absent physical rows.
+        inactive_by_key = {clean(item.get('field_key')): dict(item) for item in self._inactive_custom_fields if clean(item.get('field_key'))}
+        active_keys = {clean(item.get('field_key')) for item in custom_fields}
+        merged = list(custom_fields)
+        merged.extend(item for key, item in inactive_by_key.items() if key not in active_keys)
+        self.current_custom_fields = merged
         self.current_column_order = self._current_table_order()
 
     def _move_columns(self):
@@ -3189,16 +3946,16 @@ class SourceMappingDialog(QDialog):
         items: list[tuple[str, str, str]] = []
         default_order: list[str] = []
         for spec in self.schema.fields:
-            if spec.key in self.current_hidden_fields:
+            if spec.key not in self._display_edits:
                 continue
             default_name = default_display_name(self.source_type, spec.key, spec.label)
-            label = self.current_display_names.get(spec.key, default_name) or default_name
-            items.append((spec.key, label, "SYSTEM"))
+            label = clean(self._display_edits[spec.key].text()) or default_name
+            items.append((spec.key, label, "SYSTEM" if spec.key in self.locked_system_fields else "OPTIONAL"))
             default_order.append(spec.key)
         for item in self.current_custom_fields:
             key = clean(item.get("field_key"))
             label = clean(item.get("display_name")) or key
-            if key:
+            if key and key in self._custom_widgets:
                 items.append((key, label, "USER"))
                 default_order.append(key)
 
@@ -3212,6 +3969,7 @@ class SourceMappingDialog(QDialog):
         self._combos.clear()
         self._display_edits.clear()
         self._custom_widgets.clear()
+        self._visibility_checks.clear()
         self._populate()
         self.result_label.setText("Column display order changed. Save to apply it to RMU Data Review and workbook exports.")
 
@@ -3244,57 +4002,36 @@ class SourceMappingDialog(QDialog):
             if clean(combo.itemData(idx)).casefold() == display_name.casefold():
                 combo.setCurrentIndex(idx)
                 break
-        self.table.setCurrentCell(row, 0)
+        self.table.setCurrentCell(row, 1)
         self.result_label.setText(ui_tr(f"Added '{display_name}'. Choose its Source Field, then Save; both will apply to every station.", current_language()))
 
     def _delete_custom_field(self):
+        """Legacy internal entry point retained for compatibility.
+
+        v0.8.166 intentionally no longer deletes App fields. If an older caller
+        invokes this method, it behaves as Hide for the selected optional/USER
+        field so mapping metadata is never destroyed.
+        """
         row = self.table.currentRow()
         if row < 0:
             return
-        meta_item = self.table.item(row, 2) or self.table.item(row, 3)
+        meta_item = self.table.item(row, 3) or self.table.item(row, 4)
         meta = meta_item.data(Qt.ItemDataRole.UserRole) if meta_item else None
         if not isinstance(meta, dict):
             return
-        kind = clean(meta.get("kind"))
         field_key = clean(meta.get("field_key"))
-        locked = bool(meta.get("locked"))
-        display_widget = self.table.cellWidget(row, 0)
-        display_name = clean(display_widget.text()) if isinstance(display_widget, QLineEdit) else field_key
-        if kind == "built_in" and locked:
-            QMessageBox.information(
-                self, "Delete Column",
-                f"'{display_name}' is used by current App logic and is protected. It cannot be deleted."
-            )
+        if not field_key or field_key in self.locked_system_fields:
+            self.result_label.setText("SYSTEM calculation fields are always shown and cannot be hidden.")
             return
-        question = (
-            f"Remove App column '{display_name}'?"
-            if kind != "added" else
-            f"Remove global USER App column '{display_name}' from RMU Data Review for ALL sites?\n\n"
-            "Historical report snapshots and audit records will not be changed."
-        )
-        if QMessageBox.question(self, "Delete Column", question) != QMessageBox.Yes:
-            return
-        if kind == "added":
-            self._custom_widgets.pop(field_key, None)
-        elif kind == "built_in":
-            self.current_hidden_fields.add(field_key)
-            self._combos.pop(field_key, None)
-            self._display_edits.pop(field_key, None)
-        self.current_column_order = [key for key in self.current_column_order if key != field_key]
-        self.table.removeRow(row)
-        self.result_label.setText(ui_tr(f"Removed '{display_name}'. Save to apply the App table change.", current_language()))
+        checkbox = self._visibility_checks.get(field_key)
+        if checkbox is not None:
+            checkbox.setChecked(False)
+        self._sync_hidden_from_visibility()
+        self.result_label.setText(self._visibility_summary())
 
     def _restore_hidden_builtin_fields(self):
-        if not self.current_hidden_fields:
-            self.result_label.setText("No optional built-in columns are hidden.")
-            return
-        self._capture_unsaved_state()
-        self.current_hidden_fields.clear()
-        self._combos.clear()
-        self._display_edits.clear()
-        self._custom_widgets.clear()
-        self._populate()
-        self.result_label.setText("Optional built-in columns restored. Save to keep them visible.")
+        """Legacy compatibility alias; the Restore button was removed in v0.8.166."""
+        self._show_all_fields()
 
     def _reset_all_to_auto(self):
         protected_skipped = 0
@@ -3324,6 +4061,10 @@ class SourceMappingDialog(QDialog):
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _save(self):
+        # Capture every visible edit first.  This is also required for mappings
+        # made in the v0.8.174 SYSTEM assignment editor, including semantics that
+        # were missing (and therefore had no row) when Map Fields first opened.
+        self._capture_unsaved_state()
         # v0.8.148: protected system mappings require an explicit second
         # confirmation at Save. This is deliberately separate from the Unlock
         # acknowledgement so an accidental selector change cannot silently alter
@@ -3349,11 +4090,25 @@ class SourceMappingDialog(QDialog):
             result = resolve_schema(self.schema, self.validation.headers, overrides)
             if result is not None and result.errors:
                 self._set_save_state(False)
-                QMessageBox.critical(self, "Source Mapping", result.error_message(self.source_path.name))
+                if self.system_mapping_unlocked:
+                    QMessageBox.warning(
+                        self,
+                        "Source Mapping",
+                        result.error_message(self.source_path.name)
+                        + "\n\nSYSTEM mappings are unlocked. Use Edit System Mappings to bind every required semantic to a physical Source Field.",
+                    )
+                    self._edit_system_mappings()
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "Source Mapping",
+                        result.error_message(self.source_path.name)
+                        + "\n\nClick Unlock System Mappings... to map a non-standard physical header to the missing required SYSTEM field.",
+                    )
                 return
 
             display_names = {key: clean(value) for key, value in self.current_display_names.items() if clean(value)}
-            visible_builtin_keys = {spec.key for spec in self.schema.fields if spec.key not in self.current_hidden_fields}
+            visible_builtin_keys = {key for key in self._display_edits if key not in self.current_hidden_fields}
             if any(not display_names.get(key) for key in visible_builtin_keys):
                 self._set_save_state(False)
                 QMessageBox.warning(self, "Source Mapping", "App Column name cannot be blank.")
@@ -3394,6 +4149,1155 @@ class SourceMappingDialog(QDialog):
             self._set_save_state(False)
             QMessageBox.critical(self, "Source Mapping", f"{type(exc).__name__}: {exc}")
 
+
+
+
+class ConfigurableEquipmentComparisonDialog(QDialog):
+    """Site-local editor for arbitrary Excel/CSV Equipment Data Review inputs.
+
+    This dialog intentionally operates on physical source columns.  There is no
+    built-in SE/ZENON/ADMS schema in this workflow: each source chooses its own
+    key column, source title, worksheet and visible fields; comparison rules bind
+    logical review fields to any physical column from any configured source.
+    """
+
+    def __init__(self, store, user_name: str, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.user_name = clean(user_name) or "system"
+        self.ui_language = normalize_language(getattr(parent, "ui_language", current_language()))
+        self.config = json.loads(json.dumps(get_equipment_comparison_config(store, bootstrap=True), ensure_ascii=False))
+        self.profile_link = dict(get_equipment_comparison_profile_link(store) or {})
+        self._profile_pending_mode = clean(self.profile_link.get("mode")) or "local"
+        self._profile_pending_name = clean(self.profile_link.get("profile_name"))
+        self._profile_pending_modified_at = clean(self.profile_link.get("profile_modified_at"))
+        self._profile_pending_synced_at = clean(self.profile_link.get("synced_at"))
+        self._loading_profile_controls = False
+        self._loading_source = False
+        self._current_source_id = ""
+        self._columns_cache: dict[str, tuple] = {}
+
+        self.setWindowTitle("Configure Equipment Comparison")
+        self.resize(1600, 920)
+        self.setMinimumSize(1280, 760)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+
+        title = QLabel("Equipment Data Review · Configurable Sources")
+        title.setObjectName("SectionTitle")
+        root.addWidget(title)
+        desc = QLabel(
+            "Add any number of CSV/XLSX/XLSM tables. For every table choose the key/index field used to join rows. "
+            "Then define exactly which fields should be compared. All physical columns are shown by default; uncheck Show to hide a field for this site only. "
+            "Source titles default to filenames and can be renamed. Filenames, worksheets and physical field names are never fixed by the App."
+        )
+        desc.setObjectName("Muted")
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        # Reusable/global comparison profile ---------------------------------
+        profile_card = QFrame(); profile_card.setObjectName("Card")
+        profile_layout = QGridLayout(profile_card); profile_layout.setContentsMargins(12, 9, 12, 9); profile_layout.setHorizontalSpacing(8); profile_layout.setVerticalSpacing(5)
+        profile_layout.setColumnStretch(1, 1); profile_layout.setColumnStretch(3, 2); profile_layout.setColumnStretch(4, 1)
+        profile_title = QLabel("Configuration Reuse / Inheritance"); profile_title.setObjectName("SectionTitle")
+        profile_layout.addWidget(profile_title, 0, 0, 1, 6)
+        profile_layout.addWidget(QLabel("Mode"), 1, 0)
+        self.profile_mode_combo = QComboBox()
+        self.profile_mode_combo.addItem(ui_tr("Local · this site only", self.ui_language), "local")
+        self.profile_mode_combo.addItem(ui_tr("Inherit global profile · explicit sync", self.ui_language), "inherit")
+        self.profile_mode_combo.currentIndexChanged.connect(self._profile_mode_changed)
+        profile_layout.addWidget(self.profile_mode_combo, 1, 1)
+        profile_layout.addWidget(QLabel("Profile"), 1, 2)
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentIndexChanged.connect(self._profile_selection_changed)
+        profile_layout.addWidget(self.profile_combo, 1, 3, 1, 2)
+        sync_profile_btn = QPushButton("Apply / Sync")
+        sync_profile_btn.setObjectName("Primary")
+        sync_profile_btn.clicked.connect(self._apply_selected_profile)
+        profile_layout.addWidget(sync_profile_btn, 1, 5)
+        save_profile_btn = QPushButton("Save Current as Profile...")
+        save_profile_btn.clicked.connect(self._save_current_as_profile)
+        update_profile_btn = QPushButton("Update Selected Profile")
+        update_profile_btn.clicked.connect(self._update_selected_profile)
+        delete_profile_btn = QPushButton("Delete Profile")
+        delete_profile_btn.clicked.connect(self._delete_selected_profile)
+        profile_layout.addWidget(save_profile_btn, 2, 1)
+        profile_layout.addWidget(update_profile_btn, 2, 2, 1, 2)
+        profile_layout.addWidget(delete_profile_btn, 2, 4)
+        self.profile_status_label = QLabel("")
+        self.profile_status_label.setObjectName("Muted"); self.profile_status_label.setWordWrap(True)
+        profile_layout.addWidget(self.profile_status_label, 3, 0, 1, 6)
+        profile_note = QLabel("A profile reuses source roles/order/titles, Key/Index defaults, Show/Hide defaults, default/per-field comparison modes and comparison field mappings. Physical file paths are never inherited; the target site keeps its own live files. Global profile changes never silently rewrite a site: press Apply / Sync, review the result, then Save & Rebuild Review.")
+        profile_note.setObjectName("Muted"); profile_note.setWordWrap(True)
+        profile_layout.addWidget(profile_note, 4, 0, 1, 6)
+        root.addWidget(profile_card)
+        self._refresh_profile_controls()
+
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(6)
+
+        # Site file pool + configured source list --------------------------
+        left = QFrame(); left.setObjectName("Card")
+        left_box = QVBoxLayout(left); left_box.setContentsMargins(12, 12, 12, 12); left_box.setSpacing(8)
+        pool_title_row = QHBoxLayout()
+        pool_title = QLabel("Available Site Files"); pool_title.setObjectName("SectionTitle")
+        refresh_pool_btn = QPushButton("Refresh")
+        refresh_pool_btn.setToolTip("Re-scan this site's folders for CSV/XLSX/XLSM files. Discovery never silently adds a file to a review.")
+        refresh_pool_btn.clicked.connect(self._refresh_file_pool)
+        pool_title_row.addWidget(pool_title); pool_title_row.addStretch(); pool_title_row.addWidget(refresh_pool_btn)
+        left_box.addLayout(pool_title_row)
+        pool_note = QLabel("Files may stay Unused, be added to Equipment Review, or be assigned to a Signal Mapping role. Optional Equipment/ and SignalMapping/ subfolders are supported.")
+        pool_note.setObjectName("Muted"); pool_note.setWordWrap(True)
+        left_box.addWidget(pool_note)
+        self.file_pool_list = QListWidget()
+        self.file_pool_list.setMinimumHeight(190)
+        self.file_pool_list.setMinimumWidth(300)
+        left_box.addWidget(self.file_pool_list, 1)
+        pool_buttons = QHBoxLayout()
+        add_pool_btn = QPushButton("Add → Equipment"); add_pool_btn.setObjectName("Primary"); add_pool_btn.clicked.connect(self._add_pool_to_equipment)
+        signal_pool_btn = QPushButton("Use for Signal..."); signal_pool_btn.clicked.connect(self._assign_pool_to_signal)
+        pool_buttons.addWidget(add_pool_btn); pool_buttons.addWidget(signal_pool_btn)
+        left_box.addLayout(pool_buttons)
+
+        source_separator = QFrame(); source_separator.setFrameShape(QFrame.HLine); source_separator.setFrameShadow(QFrame.Sunken)
+        left_box.addWidget(source_separator)
+        left_title = QLabel("Equipment Sources"); left_title.setObjectName("SectionTitle")
+        left_box.addWidget(left_title)
+        self.source_list = QListWidget()
+        self.source_list.setMinimumWidth(300)
+        self.source_list.currentItemChanged.connect(self._source_selection_changed)
+        left_box.addWidget(self.source_list, 1)
+        left_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add File(s)"); add_btn.clicked.connect(self._add_sources)
+        toggle_btn = QPushButton("Enable / Disable"); toggle_btn.clicked.connect(self._toggle_source_enabled)
+        remove_btn = QPushButton("Remove"); remove_btn.clicked.connect(self._remove_source)
+        left_buttons.addWidget(add_btn); left_buttons.addWidget(toggle_btn); left_buttons.addWidget(remove_btn)
+        left_box.addLayout(left_buttons)
+        split.addWidget(left)
+
+        # Selected source editor ------------------------------------------
+        middle = QFrame(); middle.setObjectName("Card")
+        middle_box = QVBoxLayout(middle); middle_box.setContentsMargins(14, 12, 14, 12); middle_box.setSpacing(8)
+        source_title = QLabel("Selected Source"); source_title.setObjectName("SectionTitle")
+        middle_box.addWidget(source_title)
+        form = QFormLayout()
+        self.source_title_edit = QLineEdit()
+        self.source_title_edit.editingFinished.connect(self._save_current_source_editor)
+        form.addRow("Module Title", self.source_title_edit)
+        self.source_enabled_check = QCheckBox("Participate in Equipment Data Review")
+        self.source_enabled_check.toggled.connect(self._source_enabled_changed)
+        form.addRow("Review Participation", self.source_enabled_check)
+        self.version_mode_combo = QComboBox()
+        self.version_mode_combo.addItem(ui_tr("Latest file in family (AUTO)", self.ui_language), "latest_family")
+        self.version_mode_combo.addItem(ui_tr("Pin this exact file", self.ui_language), "pinned")
+        self.version_mode_combo.currentIndexChanged.connect(self._version_mode_changed)
+        form.addRow("Version Mode", self.version_mode_combo)
+        self.family_key_edit = QLineEdit()
+        self.family_key_edit.setPlaceholderText("Automatically derived from filename; editable for similar versions")
+        self.family_key_edit.editingFinished.connect(self._family_key_changed)
+        form.addRow("File Family", self.family_key_edit)
+        file_row = QHBoxLayout()
+        self.source_path_edit = QLineEdit(); self.source_path_edit.setReadOnly(True)
+        self.source_path_edit.setMinimumWidth(320); self.source_path_edit.setMinimumHeight(34)
+        replace_btn = QPushButton("Replace File..."); replace_btn.clicked.connect(self._replace_current_file)
+        replace_btn.setMinimumWidth(112); replace_btn.setMinimumHeight(34)
+        file_row.setSpacing(8)
+        file_row.addWidget(self.source_path_edit, 1); file_row.addWidget(replace_btn)
+        file_host = QWidget(); file_host.setLayout(file_row); file_host.setMinimumHeight(38)
+        form.addRow("Active Source File", file_host)
+        self.sheet_combo = QComboBox(); self.sheet_combo.currentIndexChanged.connect(self._sheet_changed)
+        form.addRow("Worksheet", self.sheet_combo)
+        self.header_row_edit = QLineEdit("1"); self.header_row_edit.setMaximumWidth(100); self.header_row_edit.editingFinished.connect(self._header_row_changed)
+        form.addRow("Header Row", self.header_row_edit)
+        self.key_combo = QComboBox(); self.key_combo.currentIndexChanged.connect(self._key_changed)
+        form.addRow("Key / Index Field", self.key_combo)
+        middle_box.addLayout(form)
+
+        fields_label = QLabel("Physical Fields · Show / Hide")
+        fields_label.setStyleSheet("font-weight:700;")
+        middle_box.addWidget(fields_label)
+        fields_note = QLabel("Every detected source field is visible by default. Hiding a field changes only this site's Equipment Data Review presentation; it does not remove the field from comparison rules.")
+        fields_note.setObjectName("Muted"); fields_note.setWordWrap(True)
+        middle_box.addWidget(fields_note)
+        self.fields_table = QTableWidget(0, 2)
+        self.fields_table.setHorizontalHeaderLabels(["Show", "Physical Field"])
+        _configure_table_base(self.fields_table)
+        self.fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.fields_table.setColumnWidth(0, 70)
+        self.fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.fields_table.itemChanged.connect(self._field_show_changed)
+        middle_box.addWidget(self.fields_table, 1)
+        split.addWidget(middle)
+
+        # Comparison rules -------------------------------------------------
+        right = QFrame(); right.setObjectName("Card")
+        right_box = QVBoxLayout(right); right_box.setContentsMargins(14, 12, 14, 12); right_box.setSpacing(8)
+        right_title = QLabel("Comparison Rules"); right_title.setObjectName("SectionTitle")
+        right_box.addWidget(right_title)
+        default_mode_row = QHBoxLayout()
+        default_mode_row.addWidget(QLabel("Default Comparison Mode"))
+        self.default_compare_mode_combo = QComboBox()
+        self.default_compare_mode_combo.addItem(ui_tr("Strict equality · blank participates", self.ui_language), COMPARISON_MODE_STRICT)
+        self.default_compare_mode_combo.addItem(ui_tr("Ignore blank values", self.ui_language), COMPARISON_MODE_IGNORE_BLANK)
+        default_mode = clean(self.config.get("default_comparison_mode")) or COMPARISON_MODE_STRICT
+        default_index = self.default_compare_mode_combo.findData(default_mode)
+        self.default_compare_mode_combo.setCurrentIndex(default_index if default_index >= 0 else 0)
+        self.default_compare_mode_combo.currentIndexChanged.connect(self._default_comparison_mode_changed)
+        self.default_compare_mode_combo.setToolTip(ui_tr(
+            "This is the site default. Each comparison field can inherit it or override it independently.",
+            self.ui_language,
+        ))
+        default_mode_row.addWidget(self.default_compare_mode_combo, 1)
+        right_box.addLayout(default_mode_row)
+        compare_note = QLabel(
+            "Each row is one Analysis field. Choose which physical field from each source participates and choose its comparison mode. "
+            "Strict mode treats blank as a real value; Ignore Blank keeps the legacy behavior and excludes blank values from the comparison."
+        )
+        compare_note.setObjectName("Muted"); compare_note.setWordWrap(True)
+        right_box.addWidget(compare_note)
+        self.rule_table = QTableWidget(0, 1)
+        _configure_table_base(self.rule_table)
+        self.rule_table.verticalHeader().setVisible(False)
+        self.rule_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        right_box.addWidget(self.rule_table, 1)
+        rule_buttons = QHBoxLayout()
+        add_rule = QPushButton("Add Comparison Field"); add_rule.setObjectName("Primary"); add_rule.clicked.connect(self._add_rule)
+        remove_rule = QPushButton("Remove Rule"); remove_rule.clicked.connect(self._remove_rule)
+        rule_buttons.addWidget(add_rule); rule_buttons.addWidget(remove_rule); rule_buttons.addStretch()
+        right_box.addLayout(rule_buttons)
+        split.addWidget(right)
+
+        left.setMinimumWidth(310); middle.setMinimumWidth(500); right.setMinimumWidth(560)
+        split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setStretchFactor(2, 2)
+        split.setSizes([320, 530, 750])
+        root.addWidget(split, 1)
+
+        self.validation_label = QLabel("")
+        self.validation_label.setObjectName("Muted"); self.validation_label.setWordWrap(True)
+        root.addWidget(self.validation_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.button(QDialogButtonBox.Save).setText("Save & Rebuild Review")
+        buttons.button(QDialogButtonBox.Save).setObjectName("Primary")
+        buttons.accepted.connect(self._accept_config)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self._refresh_file_pool()
+        self._refresh_source_list()
+        self._rebuild_rule_table()
+        if self.source_list.count():
+            self.source_list.setCurrentRow(0)
+        else:
+            self._load_source_editor(None)
+        self._update_validation_text()
+        translate_widget_tree(self, self.ui_language)
+
+    def _selected_profile_name(self) -> str:
+        if not hasattr(self, "profile_combo"):
+            return ""
+        return clean(self.profile_combo.currentData()) or clean(self.profile_combo.currentText())
+
+    def _refresh_profile_controls(self, select_name: str = ""):
+        if not hasattr(self, "profile_combo"):
+            return
+        wanted = clean(select_name) or clean(self._profile_pending_name)
+        self._loading_profile_controls = True
+        try:
+            self.profile_combo.blockSignals(True)
+            self.profile_mode_combo.blockSignals(True)
+            self.profile_combo.clear()
+            self.profile_combo.addItem(ui_tr("— Select reusable profile —", self.ui_language), "")
+            profiles = list_equipment_comparison_profiles()
+            for item in profiles:
+                name = clean(item.get("name"))
+                if name:
+                    self.profile_combo.addItem(name, name)
+            mode_index = self.profile_mode_combo.findData(
+                "inherit" if clean(self._profile_pending_mode) == "inherit" else "local"
+            )
+            self.profile_mode_combo.setCurrentIndex(max(0, mode_index))
+            if wanted:
+                index = self.profile_combo.findData(wanted)
+                if index >= 0:
+                    self.profile_combo.setCurrentIndex(index)
+                else:
+                    self.profile_combo.setCurrentIndex(0)
+            else:
+                self.profile_combo.setCurrentIndex(0)
+        finally:
+            self.profile_mode_combo.blockSignals(False)
+            self.profile_combo.blockSignals(False)
+            self._loading_profile_controls = False
+        self._update_profile_status()
+
+    def _profile_mode_changed(self, _index):
+        if self._loading_profile_controls:
+            return
+        mode = clean(self.profile_mode_combo.currentData()) or "local"
+        self._profile_pending_mode = mode
+        if mode == "local":
+            # Keep the selected profile in the combo so it can still be applied as
+            # a one-time copy; only the saved inheritance link is removed.
+            self._profile_pending_name = ""
+            self._profile_pending_modified_at = ""
+            self._profile_pending_synced_at = ""
+        else:
+            selected = self._selected_profile_name()
+            if selected:
+                self._profile_pending_name = selected
+        self._update_profile_status()
+
+    def _profile_selection_changed(self, _index):
+        if self._loading_profile_controls:
+            return
+        selected = self._selected_profile_name()
+        if clean(self.profile_mode_combo.currentData()) == "inherit":
+            self._profile_pending_name = selected
+        self._update_profile_status()
+
+    def _update_profile_status(self):
+        if not hasattr(self, "profile_status_label"):
+            return
+        selected = self._selected_profile_name()
+        mode = clean(self.profile_mode_combo.currentData()) if hasattr(self, "profile_mode_combo") else "local"
+        zh = self.ui_language == LANG_ZH_CN
+        if mode != "inherit":
+            self.profile_status_label.setText(
+                "本地模式：当前站点独立维护。也可以先选择一个模板执行一次“应用 / 同步”，然后继续保持本地模式。"
+                if zh else
+                "Local mode: this site is independent. You can still choose a profile and Apply / Sync once, then remain Local."
+            )
+            return
+        if not selected:
+            self.profile_status_label.setText(
+                "继承模式：请选择一个全局模板，然后点击“应用 / 同步”。"
+                if zh else
+                "Inheritance mode: select a global profile, then Apply / Sync."
+            )
+            return
+        profile = get_equipment_comparison_profile(selected)
+        if not profile:
+            self.profile_status_label.setText(
+                f"模板“{selected}”已不存在。请选择其他模板，或切换回本地模式。"
+                if zh else
+                f"Profile '{selected}' no longer exists. Choose another profile or switch to Local."
+            )
+            return
+        modified = clean(profile.get("modified_at"))
+        linked_same = clean(self._profile_pending_name) == selected
+        if linked_same and self._profile_pending_modified_at and modified and modified != self._profile_pending_modified_at:
+            self.profile_status_label.setText(
+                f"已继承模板：{selected} · 检测到模板更新（{modified}）。请点击“应用 / 同步”检查后，再保存当前站点。"
+                if zh else
+                f"Inherited profile: {selected} · profile update available ({modified}). Press Apply / Sync to review it before saving this site."
+            )
+        elif linked_same and self._profile_pending_synced_at:
+            self.profile_status_label.setText(
+                f"已继承模板：{selected} · 上次同步 {self._profile_pending_synced_at or '-'} · 全局模板变化不会静默覆盖当前站点。"
+                if zh else
+                f"Inherited profile: {selected} · last synced {self._profile_pending_synced_at or '-'} · global changes are never applied silently."
+            )
+        else:
+            self.profile_status_label.setText(
+                f"已选择模板：{selected} · 点击“应用 / 同步”可将模板规则合并到当前站点的实时源文件配置。"
+                if zh else
+                f"Selected profile: {selected} · press Apply / Sync to merge it with this site's live source files."
+            )
+
+    def _save_current_as_profile(self):
+        self._save_current_source_editor()
+        self._capture_rule_table()
+        name, ok = QInputDialog.getText(
+            self, ui_tr("Reusable Comparison Profile", self.ui_language), ui_tr("Profile name:", self.ui_language)
+        )
+        name = clean(name)
+        if not ok or not name:
+            return
+        existing = get_equipment_comparison_profile(name)
+        if existing and QMessageBox.question(
+            self,
+            ui_tr("Reusable Comparison Profile", self.ui_language),
+            (f"模板“{name}”已经存在。是否用当前配置替换它？" if self.ui_language == LANG_ZH_CN else f"Profile '{name}' already exists. Replace it with the current configuration?"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            saved = save_equipment_comparison_profile(name, self.config, self.user_name)
+        except Exception as exc:
+            QMessageBox.critical(self, ui_tr("Reusable Comparison Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
+            return
+        self._profile_pending_mode = "inherit"
+        self._profile_pending_name = name
+        self._profile_pending_modified_at = clean(saved.get("modified_at"))
+        self._profile_pending_synced_at = datetime.now().isoformat(timespec="seconds")
+        self._refresh_profile_controls(name)
+        QMessageBox.information(
+            self,
+            ui_tr("Reusable Comparison Profile", self.ui_language),
+            (
+                f"已将“{name}”保存为应用级可复用模板。\n\n模板不会保存任何站点的物理源文件路径；其他站点只复用逻辑配置，并绑定各自的实时源文件。"
+                if self.ui_language == LANG_ZH_CN else
+                f"Saved '{name}' as an application-wide reusable profile.\n\nPhysical source-file paths were NOT stored in the profile. Other sites can reuse the logical mapping and bind their own live files."
+            ),
+        )
+
+    def _update_selected_profile(self):
+        self._save_current_source_editor()
+        self._capture_rule_table()
+        name = self._selected_profile_name()
+        if not name:
+            QMessageBox.information(self, ui_tr("Reusable Comparison Profile", self.ui_language), ui_tr("Select a profile first.", self.ui_language))
+            return
+        if QMessageBox.question(
+            self,
+            ui_tr("Update Reusable Profile", self.ui_language),
+            (
+                f"是否用当前站点的逻辑对比配置替换全局模板“{name}”？\n\n其他站点不会被静默修改；它们只会看到模板有更新，必须手工执行“应用 / 同步”。"
+                if self.ui_language == LANG_ZH_CN else
+                f"Replace global profile '{name}' with the current site's logical comparison configuration?\n\nOther sites are not changed silently; they will see an update available and must Apply / Sync explicitly."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            saved = save_equipment_comparison_profile(name, self.config, self.user_name)
+        except Exception as exc:
+            QMessageBox.critical(self, ui_tr("Update Reusable Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
+            return
+        if clean(self._profile_pending_name) == name:
+            self._profile_pending_modified_at = clean(saved.get("modified_at"))
+            self._profile_pending_synced_at = datetime.now().isoformat(timespec="seconds")
+        self._refresh_profile_controls(name)
+
+    def _delete_selected_profile(self):
+        name = self._selected_profile_name()
+        if not name:
+            QMessageBox.information(self, ui_tr("Reusable Comparison Profile", self.ui_language), ui_tr("Select a profile first.", self.ui_language))
+            return
+        if QMessageBox.question(
+            self,
+            ui_tr("Delete Reusable Profile", self.ui_language),
+            (f"删除全局模板“{name}”？\n\n现有站点配置不会改变。" if self.ui_language == LANG_ZH_CN else f"Delete global profile '{name}'?\n\nExisting site configurations remain unchanged."),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            delete_equipment_comparison_profile(name, self.user_name)
+        except Exception as exc:
+            QMessageBox.critical(self, ui_tr("Delete Reusable Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
+            return
+        if clean(self._profile_pending_name) == name:
+            self._profile_pending_mode = "local"
+            self._profile_pending_name = ""
+            self._profile_pending_modified_at = ""
+            self._profile_pending_synced_at = ""
+        self._refresh_profile_controls()
+
+    def _apply_selected_profile(self):
+        self._save_current_source_editor()
+        self._capture_rule_table()
+        name = self._selected_profile_name()
+        if not name:
+            QMessageBox.information(self, ui_tr("Reusable Comparison Profile", self.ui_language), ui_tr("Select a profile first.", self.ui_language))
+            return
+        try:
+            merged, metadata = apply_equipment_comparison_profile(
+                self.store, name, current_config=self.config
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, ui_tr("Apply Comparison Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
+            return
+        self.config = json.loads(json.dumps(merged, ensure_ascii=False))
+        self._profile_pending_mode = "inherit"
+        self._profile_pending_name = clean(metadata.get("profile_name")) or name
+        self._profile_pending_modified_at = clean(metadata.get("profile_modified_at"))
+        self._profile_pending_synced_at = clean(metadata.get("applied_at")) or datetime.now().isoformat(timespec="seconds")
+        self._columns_cache.clear()
+        self._current_source_id = ""
+        self._refresh_source_list()
+        self._rebuild_rule_table()
+        self._refresh_file_pool()
+        if self.source_list.count():
+            self.source_list.setCurrentRow(0)
+        else:
+            self._load_source_editor(None)
+        self._refresh_profile_controls(name)
+        self._update_validation_text()
+
+    def _source_by_id(self, source_id: str):
+        return next((source for source in self.config.get("sources", []) if clean(source.get("id")) == clean(source_id)), None)
+
+    def _current_source(self):
+        return self._source_by_id(self._current_source_id)
+
+    def _source_columns(self, source: dict, *, refresh: bool = False):
+        source_id = clean((source or {}).get("id"))
+        if not source_id:
+            return ()
+        if not refresh and source_id in self._columns_cache:
+            return self._columns_cache[source_id]
+        try:
+            columns = configurable_source_columns(self.store, source)
+        except Exception:
+            columns = ()
+        self._columns_cache[source_id] = tuple(columns)
+        return tuple(columns)
+
+    def _refresh_source_list(self):
+        """Rebuild the source list without generating a synthetic selection change.
+
+        v0.8.178 restored the selected row *after* signals were unblocked.  Qt then
+        emitted currentItemChanged for that programmatic restore, which could run
+        inside a real user selection change and overwrite/load the wrong source
+        editor.  Keep signals blocked through the restore so only a real user click
+        changes the selected source.
+        """
+        current = self._current_source_id
+        self.source_list.blockSignals(True)
+        try:
+            self.source_list.clear()
+            for source in self.config.get("sources", []):
+                path = configurable_source_path(self.store, source)
+                title = clean(source.get("title")) or (path.stem if path else "Source")
+                key_id = clean(source.get("key_column"))
+                key_label = next((column.label for column in self._source_columns(source) if column.id == key_id), ui_tr("Key not set", self.ui_language))
+                active = bool(source.get("enabled", True))
+                state = ui_tr("ON" if active else "OFF", self.ui_language)
+                item = QListWidgetItem(f"{title}  [{state}]\n{key_label}")
+                item.setData(Qt.ItemDataRole.UserRole, source.get("id"))
+                if not active:
+                    item.setForeground(QColor(COLORS["muted"]))
+                elif not path or not path.exists() or not key_id:
+                    item.setForeground(QColor(COLORS["warning"]))
+                self.source_list.addItem(item)
+            restore = next((i for i in range(self.source_list.count()) if self.source_list.item(i).data(Qt.ItemDataRole.UserRole) == current), -1)
+            if restore >= 0:
+                self.source_list.setCurrentRow(restore)
+        finally:
+            self.source_list.blockSignals(False)
+
+    def _source_selection_changed(self, current, previous):
+        """Commit the previous editor, then load exactly the source the user clicked.
+
+        The save path must not rebuild the QListWidget while Qt is delivering its
+        currentItemChanged signal.  Doing so invalidates/replaces the current/previous
+        QListWidgetItems and was the root cause of the source name changing while the
+        Source File field stayed on another workbook.
+        """
+        if self._loading_source:
+            return
+        previous_id = clean(previous.data(Qt.ItemDataRole.UserRole)) if previous is not None else clean(self._current_source_id)
+        source_id = clean(current.data(Qt.ItemDataRole.UserRole)) if current is not None else ""
+        if previous_id and previous_id != source_id:
+            self._save_source_editor(previous_id, refresh_ui=False)
+        self._current_source_id = source_id
+        self._load_source_editor(self._source_by_id(source_id))
+        self._rebuild_rule_table()
+        self._update_validation_text()
+
+    def _load_source_editor(self, source: dict | None):
+        self._loading_source = True
+        enabled = bool(source)
+        for widget in (self.source_title_edit, self.source_enabled_check, self.version_mode_combo, self.family_key_edit, self.sheet_combo, self.header_row_edit, self.key_combo, self.fields_table):
+            widget.setEnabled(enabled)
+        if not source:
+            self.source_title_edit.clear(); self.source_enabled_check.setChecked(False); self.version_mode_combo.setCurrentIndex(0); self.family_key_edit.clear(); self.source_path_edit.clear(); self.sheet_combo.clear(); self.key_combo.clear(); self.fields_table.setRowCount(0)
+            self._loading_source = False
+            return
+        path = configurable_source_path(self.store, source)
+        self.source_title_edit.setText(clean(source.get("title")) or (path.stem if path else "Source"))
+        self.source_enabled_check.setChecked(bool(source.get("enabled", True)))
+        mode_index = self.version_mode_combo.findData(clean(source.get("selection_mode")) or "pinned")
+        self.version_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 1)
+        family = clean(source.get("family_key")) or (configurable_file_family_key(path) if path else "")
+        self.family_key_edit.setText(family)
+        self.source_path_edit.setText(str(path or ""))
+        mode_tip = ui_tr("AUTO latest family resolution" if clean(source.get("selection_mode")) == "latest_family" else "Pinned physical file", self.ui_language)
+        resolved_prefix = ui_tr("Resolved:", self.ui_language)
+        self.source_path_edit.setToolTip(mode_tip + (("\n" + resolved_prefix + " " + str(path)) if path else ""))
+        self.header_row_edit.setText(str(max(1, int(source.get("header_row") or 1))))
+
+        self.sheet_combo.clear()
+        if path and path.exists() and path.suffix.lower() in {".xlsx", ".xlsm"}:
+            try:
+                sheets = list_configurable_sheets(path)
+            except Exception:
+                sheets = ()
+            for name in sheets:
+                self.sheet_combo.addItem(name, name)
+            selected = clean(source.get("sheet_name"))
+            index = self.sheet_combo.findData(selected)
+            if index < 0 and self.sheet_combo.count(): index = 0
+            self.sheet_combo.setCurrentIndex(index)
+        else:
+            self.sheet_combo.addItem(ui_tr("CSV / no worksheet", self.ui_language), "")
+
+        self._populate_current_source_fields(source)
+        self._loading_source = False
+
+    def _populate_current_source_fields(self, source: dict):
+        columns = self._source_columns(source, refresh=True)
+        hidden = set(source.get("hidden_columns") or [])
+        key_id = clean(source.get("key_column"))
+        self.key_combo.blockSignals(True); self.key_combo.clear(); self.key_combo.addItem(ui_tr("Select key / index field...", self.ui_language), "")
+        for column in columns:
+            self.key_combo.addItem(column.label, column.id)
+        key_index = self.key_combo.findData(key_id)
+        self.key_combo.setCurrentIndex(key_index if key_index >= 0 else 0)
+        self.key_combo.blockSignals(False)
+
+        self.fields_table.blockSignals(True)
+        self.fields_table.setRowCount(len(columns))
+        for row, column in enumerate(columns):
+            show_item = QTableWidgetItem("")
+            show_item.setFlags((show_item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            show_item.setCheckState(Qt.Unchecked if column.id in hidden else Qt.Checked)
+            show_item.setData(Qt.ItemDataRole.UserRole, column.id)
+            show_item.setTextAlignment(Qt.AlignCenter)
+            field_item = QTableWidgetItem(column.label)
+            field_item.setFlags(field_item.flags() & ~Qt.ItemIsEditable)
+            field_item.setToolTip(
+                f"{ui_tr('Physical header:', self.ui_language)} {column.header}\n"
+                f"{ui_tr('Column position:', self.ui_language)} {column.index + 1}"
+            )
+            self.fields_table.setItem(row, 0, show_item); self.fields_table.setItem(row, 1, field_item)
+        self.fields_table.blockSignals(False)
+
+    def _save_source_editor(self, source_id: str, *, refresh_ui: bool = True):
+        """Persist the visible editor widgets into one explicit source record.
+
+        Using an explicit source id is important during currentItemChanged: at that
+        moment the editor still belongs to the previous row even though Qt already
+        knows which row is becoming current.
+        """
+        if self._loading_source:
+            return
+        source = self._source_by_id(source_id)
+        if not source:
+            return
+        path = configurable_source_path(self.store, source)
+        source["title"] = clean(self.source_title_edit.text()) or (path.stem if path else "Source")
+        source["enabled"] = bool(self.source_enabled_check.isChecked())
+        source["selection_mode"] = clean(self.version_mode_combo.currentData()) or "pinned"
+        source["family_key"] = clean(self.family_key_edit.text()) or (configurable_file_family_key(path) if path else "")
+        source["family_suffix"] = (path.suffix.lower() if path else clean(source.get("family_suffix")))
+        try:
+            header_row = max(1, int(clean(self.header_row_edit.text()) or 1))
+        except (TypeError, ValueError):
+            header_row = 1
+        self.header_row_edit.setText(str(header_row))
+        source["header_row"] = header_row
+        source["sheet_name"] = clean(self.sheet_combo.currentData())
+        source["key_column"] = clean(self.key_combo.currentData())
+        hidden = []
+        for row in range(self.fields_table.rowCount()):
+            item = self.fields_table.item(row, 0)
+            if item and item.checkState() != Qt.Checked:
+                column_id = clean(item.data(Qt.ItemDataRole.UserRole))
+                if column_id:
+                    hidden.append(column_id)
+        source["hidden_columns"] = sorted(set(hidden))
+        if refresh_ui:
+            self._refresh_source_list()
+            self._rebuild_rule_table()
+            self._update_validation_text()
+
+    def _save_current_source_editor(self):
+        self._save_source_editor(self._current_source_id, refresh_ui=True)
+
+    # v0.8.181 ------------------------------------------------------------
+    # Site File Pool: discovery and review membership are deliberately
+    # separate. A file appearing in the folder is inventory only until the
+    # reviewer explicitly assigns it to Equipment Review or Signal Mapping.
+    def _refresh_file_pool(self):
+        current_path = ""
+        item = self.file_pool_list.currentItem() if hasattr(self, "file_pool_list") else None
+        if item:
+            current_path = clean(item.data(Qt.ItemDataRole.UserRole))
+        paths = scan_configurable_site_files(self.store)
+        self.file_pool_list.blockSignals(True)
+        self.file_pool_list.clear()
+        restore_row = -1
+        root_text = str((self.store.config or {}).get("repository_path") or "").strip()
+        root = Path(root_text) if root_text else None
+        for row, path in enumerate(paths):
+            try:
+                rel = str(path.relative_to(root)) if root is not None else path.name
+            except (ValueError, OSError):
+                rel = path.name
+            usages = configurable_file_pool_usage(self.store, path)
+            family = configurable_file_family_key(path)
+            family_files = configurable_family_candidates(self.store, family, suffix=path.suffix.lower())
+            latest = bool(family_files and family_files[0] == path)
+            status = " · ".join(ui_tr(value, self.ui_language) for value in usages) if usages else ui_tr("Unused", self.ui_language)
+            version_note = " · " + ui_tr("latest", self.ui_language) if latest and len(family_files) > 1 else ""
+            hints = classify_source_detection_hint(path)
+            hint_label = clean((hints[0] or {}).get("label")) if hints else ""
+            hint_note = (f" · {ui_tr('Recognition hint:', self.ui_language)} {hint_label}" if hint_label else "")
+            pool_item = QListWidgetItem(f"{rel}\n{status}{version_note}{hint_note}")
+            pool_item.setData(Qt.ItemDataRole.UserRole, str(path))
+            pool_item.setData(Qt.ItemDataRole.UserRole + 1, hint_label)
+            pool_item.setToolTip(
+                f"{ui_tr('File:', self.ui_language)} {path}\n{ui_tr('Family:', self.ui_language)} {family or '-'}\n"
+                f"{ui_tr('Family versions:', self.ui_language)} {len(family_files)}\n{ui_tr('Usage:', self.ui_language)} {status}"
+                + (f"\n{ui_tr('Recognition hint:', self.ui_language)} {hint_label} ({', '.join((hints[0] or {}).get('keywords') or [])})" if hint_label else "")
+                + f"\n{ui_tr('Recognition is optional; manual source configuration is authoritative.', self.ui_language)}"
+            )
+            self.file_pool_list.addItem(pool_item)
+            if current_path and _path_text_equal(current_path, str(path)):
+                restore_row = row
+        if restore_row >= 0:
+            self.file_pool_list.setCurrentRow(restore_row)
+        elif self.file_pool_list.count():
+            self.file_pool_list.setCurrentRow(0)
+        self.file_pool_list.blockSignals(False)
+
+    def _selected_pool_path(self) -> Path | None:
+        item = self.file_pool_list.currentItem()
+        if not item:
+            return None
+        text = clean(item.data(Qt.ItemDataRole.UserRole))
+        return Path(text) if text else None
+
+    def _append_equipment_source_from_path(self, path: Path, *, auto_family: bool = True) -> dict | None:
+        path = Path(path)
+        try:
+            sheets = list_configurable_sheets(path) if path.suffix.lower() in {".xlsx", ".xlsm"} else ()
+            sheet = sheets[0] if sheets else ""
+            structure = inspect_configurable_table(path, sheet_name=sheet, header_row=1)
+        except Exception as exc:
+            QMessageBox.warning(self, ui_tr("Source File", self.ui_language), f"{path.name}: {type(exc).__name__}: {exc}")
+            return None
+        encoded, path_mode = encode_configurable_source_path(self.store, path)
+        source_id = "src_" + hashlib.sha1((str(path.resolve()) + datetime.now().isoformat()).encode("utf-8")).hexdigest()[:12]
+        while self._source_by_id(source_id):
+            source_id = "src_" + hashlib.sha1((source_id + "x").encode("utf-8")).hexdigest()[:12]
+        hints = classify_source_detection_hint(path)
+        suggested_title = clean((hints[0] or {}).get("label")) if hints else ""
+        source = {
+            "id": source_id,
+            "title": suggested_title or path.stem,
+            "path": encoded,
+            "path_mode": path_mode,
+            "sheet_name": structure.sheet_name,
+            "header_row": 1,
+            "key_column": "",
+            "hidden_columns": [],
+            "enabled": True,
+            "selection_mode": "latest_family" if auto_family else "pinned",
+            "family_key": configurable_file_family_key(path),
+            "family_suffix": path.suffix.lower(),
+        }
+        self.config.setdefault("sources", []).append(source)
+        return source
+
+    def _add_pool_to_equipment(self):
+        path = self._selected_pool_path()
+        if path is None:
+            QMessageBox.information(self, ui_tr("Site File Pool", self.ui_language), ui_tr("Select a site file first.", self.ui_language))
+            return
+        # If the exact file is already represented, select and enable it rather
+        # than creating an accidental duplicate source.
+        for existing in self.config.get("sources", []):
+            active = configurable_source_path(self.store, existing)
+            stored_text = str(existing.get("path") or "").strip()
+            stored = None
+            if stored_text:
+                stored = (Path(str((self.store.config or {}).get("repository_path") or "")) / stored_text) if clean(existing.get("path_mode")) == "site_relative" else Path(stored_text)
+            if (active and _path_text_equal(str(active), str(path))) or (stored and _path_text_equal(str(stored), str(path))):
+                existing["enabled"] = True
+                self._refresh_source_list()
+                for row in range(self.source_list.count()):
+                    if clean(self.source_list.item(row).data(Qt.ItemDataRole.UserRole)) == clean(existing.get("id")):
+                        self.source_list.setCurrentRow(row); break
+                self._refresh_file_pool(); self._update_validation_text()
+                return
+        self._save_current_source_editor()
+        source = self._append_equipment_source_from_path(path, auto_family=True)
+        if source is None:
+            return
+        self._columns_cache.clear(); self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool()
+        for row in range(self.source_list.count()):
+            if clean(self.source_list.item(row).data(Qt.ItemDataRole.UserRole)) == source["id"]:
+                self.source_list.setCurrentRow(row); break
+        self._update_validation_text()
+
+    def _assign_pool_to_signal(self):
+        path = self._selected_pool_path()
+        if path is None:
+            QMessageBox.information(self, ui_tr("Site File Pool", self.ui_language), ui_tr("Select a site file first.", self.ui_language))
+            return
+        role_options = [
+            ui_tr("ZENON / IOA source", self.ui_language),
+            ui_tr("ADMS SLD source", self.ui_language),
+        ]
+        role_label, ok = QInputDialog.getItem(
+            self, ui_tr("Signal Mapping Source", self.ui_language), ui_tr("Use selected file as:", self.ui_language),
+            role_options, 0, False
+        )
+        if not ok:
+            return
+        role = "ioa" if role_options.index(role_label) == 0 else "adms_sld"
+        mode_options = [
+            ui_tr("Latest file in same family (AUTO)", self.ui_language),
+            ui_tr("Pin this exact file", self.ui_language),
+        ]
+        mode_label, ok = QInputDialog.getItem(
+            self, ui_tr("Version Selection", self.ui_language), ui_tr("Source version mode:", self.ui_language),
+            mode_options, 0, False
+        )
+        if not ok:
+            return
+        selection_mode = "latest_family" if mode_options.index(mode_label) == 0 else "pinned"
+        save_configurable_signal_assignment(self.store, role, path, selection_mode=selection_mode, title=path.stem)
+        self._refresh_file_pool()
+        if self.ui_language == LANG_ZH_CN:
+            detail = "自动模式会持续跟随该文件系列中的最新版本。" if selection_mode == "latest_family" else "当前物理文件已固定使用。"
+            message = f"{path.name} 已指定为 {role_label}。\n\n{detail}"
+        else:
+            detail = "AUTO will follow the newest file in this filename family." if selection_mode == "latest_family" else "This exact file is pinned."
+            message = f"{path.name} is now assigned to {role_label}.\n\n{detail}"
+        QMessageBox.information(self, ui_tr("Signal Mapping Source", self.ui_language), message)
+
+    def _toggle_source_enabled(self):
+        source = self._current_source()
+        if not source:
+            return
+        source["enabled"] = not bool(source.get("enabled", True))
+        self._loading_source = True
+        self.source_enabled_check.setChecked(bool(source["enabled"]))
+        self._loading_source = False
+        self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool(); self._update_validation_text()
+
+    def _source_enabled_changed(self, checked: bool):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if source:
+            source["enabled"] = bool(checked)
+            self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool(); self._update_validation_text()
+
+    def _version_mode_changed(self, _index):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if not source:
+            return
+        source["selection_mode"] = clean(self.version_mode_combo.currentData()) or "pinned"
+        if not clean(source.get("family_key")):
+            current = configurable_source_path(self.store, source)
+            if current:
+                source["family_key"] = configurable_file_family_key(current)
+                source["family_suffix"] = current.suffix.lower()
+        self._columns_cache.pop(source["id"], None)
+        self._load_source_editor(source); self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool(); self._update_validation_text()
+
+    def _family_key_changed(self):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if not source:
+            return
+        source["family_key"] = clean(self.family_key_edit.text())
+        self._columns_cache.pop(source["id"], None)
+        if clean(source.get("selection_mode")) == "latest_family":
+            self._load_source_editor(source); self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool(); self._update_validation_text()
+
+    def _add_sources(self):
+        initial = str((Path(str((self.store.config or {}).get("repository_path") or Path.home()))))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, ui_tr("Add Comparison Source Tables", self.ui_language), initial,
+            ("表格文件 (*.csv *.xlsx *.xlsm)" if self.ui_language == LANG_ZH_CN else "Tabular files (*.csv *.xlsx *.xlsm)")
+        )
+        if not paths:
+            return
+        self._save_current_source_editor()
+        for text in paths:
+            self._append_equipment_source_from_path(Path(text), auto_family=True)
+        self._columns_cache.clear()
+        self._refresh_source_list(); self._rebuild_rule_table(); self._refresh_file_pool()
+        if self.source_list.count(): self.source_list.setCurrentRow(self.source_list.count() - 1)
+        self._update_validation_text()
+
+    def _remove_source(self):
+        source = self._current_source()
+        if not source:
+            return
+        title = clean(source.get("title")) or "this source"
+        remove_text = (
+            f"从设备数据审核中移除“{title}”？不会删除物理源文件。"
+            if self.ui_language == LANG_ZH_CN else
+            f"Remove {title} from Equipment Data Review? The physical file will not be deleted."
+        )
+        if QMessageBox.question(self, ui_tr("Remove Source", self.ui_language), remove_text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        source_id = source["id"]
+        self.config["sources"] = [item for item in self.config.get("sources", []) if item.get("id") != source_id]
+        for rule in self.config.get("comparisons", []):
+            rule["bindings"] = {k: v for k, v in dict(rule.get("bindings") or {}).items() if k != source_id}
+        self._columns_cache.pop(source_id, None)
+        self._current_source_id = ""
+        self._refresh_source_list(); self._rebuild_rule_table()
+        if self.source_list.count(): self.source_list.setCurrentRow(0)
+        else: self._load_source_editor(None)
+        self._update_validation_text()
+
+    def _replace_current_file(self):
+        source = self._current_source()
+        if not source:
+            return
+        old_path = configurable_source_path(self.store, source)
+        initial = str(old_path.parent if old_path else Path.home())
+        text, _ = QFileDialog.getOpenFileName(
+            self, ui_tr("Replace Comparison Source File", self.ui_language), initial,
+            ("表格文件 (*.csv *.xlsx *.xlsm)" if self.ui_language == LANG_ZH_CN else "Tabular files (*.csv *.xlsx *.xlsm)")
+        )
+        if not text:
+            return
+        path = Path(text)
+        try:
+            sheets = list_configurable_sheets(path) if path.suffix.lower() in {".xlsx", ".xlsm"} else ()
+            sheet = sheets[0] if sheets else ""
+            inspect_configurable_table(path, sheet_name=sheet, header_row=1)
+        except Exception as exc:
+            QMessageBox.warning(self, ui_tr("Source File", self.ui_language), f"{type(exc).__name__}: {exc}")
+            return
+        encoded, mode = encode_configurable_source_path(self.store, path)
+        source["path"] = encoded; source["path_mode"] = mode; source["sheet_name"] = sheet; source["header_row"] = 1
+        # Preserve bindings when the same headers exist; missing column ids simply
+        # become unbound/invalid and are highlighted by validation until remapped.
+        self._columns_cache.pop(source["id"], None)
+        self._load_source_editor(source); self._rebuild_rule_table(); self._refresh_source_list(); self._update_validation_text()
+
+    def _sheet_changed(self, _index):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if not source:
+            return
+        source["sheet_name"] = clean(self.sheet_combo.currentData())
+        self._columns_cache.pop(source["id"], None)
+        self._populate_current_source_fields(source)
+        self._rebuild_rule_table(); self._update_validation_text()
+
+    def _header_row_changed(self):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if not source:
+            return
+        try:
+            value = max(1, int(clean(self.header_row_edit.text()) or 1))
+        except ValueError:
+            value = 1
+        self.header_row_edit.setText(str(value)); source["header_row"] = value
+        self._columns_cache.pop(source["id"], None)
+        self._populate_current_source_fields(source)
+        self._rebuild_rule_table(); self._update_validation_text()
+
+    def _key_changed(self, _index):
+        if self._loading_source:
+            return
+        source = self._current_source()
+        if source:
+            source["key_column"] = clean(self.key_combo.currentData())
+            self._refresh_source_list(); self._update_validation_text()
+
+    def _field_show_changed(self, _item):
+        if not self._loading_source:
+            self._save_current_source_editor()
+
+    def _default_comparison_mode_changed(self, _index):
+        if not hasattr(self, "default_compare_mode_combo"):
+            return
+        mode = clean(self.default_compare_mode_combo.currentData())
+        self.config["default_comparison_mode"] = (
+            mode if mode in {COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK} else COMPARISON_MODE_STRICT
+        )
+        self._update_validation_text()
+
+    def _rebuild_rule_table(self):
+        # Save edited rule names/bindings first when the table already exists.
+        self._capture_rule_table()
+        sources = list(self.config.get("sources", []))
+        headers = [ui_tr("Comparison Field", self.ui_language), ui_tr("Comparison Mode", self.ui_language)] + [
+            clean(source.get("title")) or ui_tr("Source", self.ui_language) for source in sources
+        ]
+        self.rule_table.blockSignals(True)
+        self.rule_table.clearContents(); self.rule_table.setColumnCount(len(headers)); self.rule_table.setHorizontalHeaderLabels(headers)
+        self.rule_table.setRowCount(len(self.config.get("comparisons", [])))
+        self.rule_table.setColumnWidth(0, 180)
+        self.rule_table.setColumnWidth(1, 220)
+        for col in range(2, len(headers)):
+            self.rule_table.setColumnWidth(col, 190)
+        for row, rule in enumerate(self.config.get("comparisons", [])):
+            name_item = QTableWidgetItem(clean(rule.get("title")) or f"Comparison {row + 1}")
+            name_item.setData(Qt.ItemDataRole.UserRole, rule.get("id"))
+            self.rule_table.setItem(row, 0, name_item)
+            mode_combo = QComboBox()
+            mode_combo.addItem(ui_tr("Use site default", self.ui_language), COMPARISON_MODE_DEFAULT)
+            mode_combo.addItem(ui_tr("Strict equality · blank participates", self.ui_language), COMPARISON_MODE_STRICT)
+            mode_combo.addItem(ui_tr("Ignore blank values", self.ui_language), COMPARISON_MODE_IGNORE_BLANK)
+            mode_value = clean(rule.get("comparison_mode")) or COMPARISON_MODE_DEFAULT
+            mode_index = mode_combo.findData(mode_value)
+            mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+            self.rule_table.setCellWidget(row, 1, mode_combo)
+            bindings = dict(rule.get("bindings") or {})
+            for col, source in enumerate(sources, start=2):
+                combo = QComboBox(); combo.addItem(ui_tr("— Not compared —", self.ui_language), "")
+                for physical in self._source_columns(source):
+                    combo.addItem(physical.label, physical.id)
+                selected = combo.findData(clean(bindings.get(source.get("id"))))
+                combo.setCurrentIndex(selected if selected >= 0 else 0)
+                self.rule_table.setCellWidget(row, col, combo)
+        self.rule_table.blockSignals(False)
+
+    def _capture_rule_table(self):
+        if not hasattr(self, "rule_table") or self.rule_table.rowCount() == 0:
+            return
+        by_id = {clean(rule.get("id")): rule for rule in self.config.get("comparisons", [])}
+        sources = list(self.config.get("sources", []))
+        for row in range(self.rule_table.rowCount()):
+            item = self.rule_table.item(row, 0)
+            if not item:
+                continue
+            rule_id = clean(item.data(Qt.ItemDataRole.UserRole))
+            rule = by_id.get(rule_id)
+            if not rule:
+                continue
+            rule["title"] = clean(item.text()) or "Comparison"
+            mode_combo = self.rule_table.cellWidget(row, 1)
+            mode = clean(mode_combo.currentData()) if isinstance(mode_combo, QComboBox) else COMPARISON_MODE_DEFAULT
+            rule["comparison_mode"] = mode if mode in {COMPARISON_MODE_DEFAULT, COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK} else COMPARISON_MODE_DEFAULT
+            bindings = {}
+            for col, source in enumerate(sources, start=2):
+                combo = self.rule_table.cellWidget(row, col)
+                if isinstance(combo, QComboBox):
+                    column_id = clean(combo.currentData())
+                    if column_id:
+                        bindings[source["id"]] = column_id
+            rule["bindings"] = bindings
+
+    def _add_rule(self):
+        self._capture_rule_table()
+        name, ok = QInputDialog.getText(
+            self, ui_tr("Comparison Field", self.ui_language), ui_tr("Field / Analysis title:", self.ui_language)
+        )
+        name = clean(name)
+        if not ok or not name:
+            return
+        rule_id = "cmp_" + hashlib.sha1((name + datetime.now().isoformat()).encode("utf-8")).hexdigest()[:12]
+        self.config.setdefault("comparisons", []).append({
+            "id": rule_id, "title": name, "comparison_mode": COMPARISON_MODE_DEFAULT, "bindings": {}
+        })
+        self._rebuild_rule_table(); self.rule_table.setCurrentCell(self.rule_table.rowCount() - 1, 0); self._update_validation_text()
+
+    def _remove_rule(self):
+        self._capture_rule_table()
+        row = self.rule_table.currentRow()
+        if row < 0 or row >= len(self.config.get("comparisons", [])):
+            return
+        self.config["comparisons"].pop(row)
+        self._rebuild_rule_table(); self._update_validation_text()
+
+    def _validation_errors(self) -> list[str]:
+        self._capture_rule_table()
+        errors = []
+        zh = self.ui_language == LANG_ZH_CN
+        if not self.config.get("sources"):
+            errors.append("请至少添加一个设备审核数据源。" if zh else "Add at least one source table.")
+            return errors
+        active_sources = [source for source in self.config.get("sources", []) if bool(source.get("enabled", True))]
+        if not active_sources:
+            errors.append("请至少启用一个设备数据审核数据源。" if zh else "Enable at least one Equipment Data Review source.")
+            return errors
+        title_counts = Counter(
+            (clean(source.get("title")) or (configurable_source_path(self.store, source).stem if configurable_source_path(self.store, source) else "Source")).casefold()
+            for source in self.config.get("sources", [])
+        )
+        for source in self.config.get("sources", []):
+            if not bool(source.get("enabled", True)):
+                continue
+            path = configurable_source_path(self.store, source)
+            title = clean(source.get("title")) or (path.stem if path else "Source")
+            if title_counts.get(title.casefold(), 0) > 1:
+                errors.append(f"{title}：当前站点内的数据源/模块标题不能重复。" if zh else f"{title}: source/module titles must be unique within this site.")
+            if not path or not path.exists():
+                errors.append(f"{title}：源文件不存在。" if zh else f"{title}: source file is missing.")
+                continue
+            columns = self._source_columns(source, refresh=True)
+            valid_ids = {column.id for column in columns}
+            if not clean(source.get("key_column")) or source.get("key_column") not in valid_ids:
+                errors.append(f"{title}：请选择有效的主键 / 索引字段。" if zh else f"{title}: choose a valid Key / Index field.")
+        for rule in self.config.get("comparisons", []):
+            title = clean(rule.get("title")) or "Comparison"
+            valid_binding_count = 0
+            for source in active_sources:
+                column_id = clean((rule.get("bindings") or {}).get(source.get("id")))
+                if column_id and any(column.id == column_id for column in self._source_columns(source)):
+                    valid_binding_count += 1
+            if valid_binding_count < 2:
+                errors.append(
+                    f"{title}：至少需要绑定两个数据源字段，才能生成 TRUE/FALSE 比较结果。"
+                    if zh else
+                    f"{title}: bind at least two source fields so this comparison can produce TRUE/FALSE."
+                )
+        return errors
+
+    def _update_validation_text(self):
+        errors = self._validation_errors() if self.config.get("sources") else [
+            "当前还没有配置设备审核数据源。" if self.ui_language == LANG_ZH_CN else "No source table configured yet."
+        ]
+        if errors:
+            prefix = "配置需要处理：" if self.ui_language == LANG_ZH_CN else "Configuration requires attention: "
+            self.validation_label.setText(prefix + "  |  ".join(errors[:5]) + (" ..." if len(errors) > 5 else ""))
+            self.validation_label.setStyleSheet(f"color:{COLORS['warning']};font-weight:600;")
+        else:
+            active_count = sum(bool(source.get("enabled", True)) for source in self.config.get("sources", []))
+            comparison_count = len(self.config.get("comparisons", []))
+            if self.ui_language == LANG_ZH_CN:
+                text = f"就绪 · 已启用 {active_count} 个设备审核数据源 · {comparison_count} 个比较字段 · 数据源数量不设固定上限"
+            else:
+                text = f"Ready · {active_count} Equipment source(s) enabled · {comparison_count} comparison field(s) · no fixed source-count limit"
+            self.validation_label.setText(text)
+            self.validation_label.setStyleSheet(f"color:{COLORS['success']};font-weight:600;")
+
+    def _accept_config(self):
+        self._save_current_source_editor()
+        self._capture_rule_table()
+        errors = self._validation_errors()
+        if errors:
+            QMessageBox.warning(self, "Comparison Configuration", "Fix the following before saving:\n\n" + "\n".join(f"• {item}" for item in errors[:12]))
+            return
+        self.config = save_equipment_comparison_config(self.store, self.config, self.user_name)
+        mode = clean(self.profile_mode_combo.currentData()) if hasattr(self, "profile_mode_combo") else "local"
+        selected_profile = self._selected_profile_name() if mode == "inherit" else ""
+        if mode == "inherit" and not selected_profile:
+            QMessageBox.warning(
+                self, ui_tr("Comparison Configuration", self.ui_language),
+                ui_tr("Inheritance mode requires a reusable profile. Select a profile or switch Mode to Local.", self.ui_language)
+            )
+            return
+        if mode == "inherit":
+            profile = get_equipment_comparison_profile(selected_profile) or {}
+            # Persist only the inheritance relationship/sync marker. The site's
+            # concrete source paths remain entirely in its own configuration.
+            save_equipment_comparison_profile_link(
+                self.store,
+                mode="inherit",
+                profile_name=selected_profile,
+                profile_modified_at=clean(self._profile_pending_modified_at) or clean(profile.get("modified_at")),
+                synced_at=clean(self._profile_pending_synced_at) or datetime.now().isoformat(timespec="seconds"),
+            )
+        else:
+            save_equipment_comparison_profile_link(self.store, mode="local")
+        super().accept()
 
 
 class DerivedTableBuilderDialog(QDialog):
@@ -4111,7 +6015,7 @@ class IssueLifecycleDialog(QDialog):
 
 
 class RMUFullLifecycleDialog(QDialog):
-    """Read-only RMU-centric viewer combining RMU and child Signal cases."""
+    """Read-only equipment lifecycle viewer; RMU may additionally include child Signal cases."""
 
     def __init__(self, store: ProjectStore, rmu: str, parent=None, *, equipment_type: str = "RMU", display_name: str = ""):
         super().__init__(parent)
@@ -4120,7 +6024,7 @@ class RMUFullLifecycleDialog(QDialog):
         self.equipment_type = clean(equipment_type).upper() or "RMU"
         self.display_name = clean(display_name) or self.rmu
         self.include_signals = self.equipment_type == "RMU" and not self.rmu.upper().startswith("EQ::")
-        self.payload = store.rmu_full_lifecycle(self.rmu)
+        self.payload = (store.equipment_full_lifecycle(self.rmu) if hasattr(store, "equipment_full_lifecycle") else store.rmu_full_lifecycle(self.rmu))
         if not self.include_signals:
             # Non-RMU equipment reuses the durable legacy lifecycle engine but
             # intentionally excludes Signal Mapping rows from its equipment story.
@@ -4175,7 +6079,7 @@ class RMUFullLifecycleDialog(QDialog):
                 "Combined append-only history for this RMU and every Signal Mapping Needs Action case linked to it. "
                 "Independent RMU customer/reviewer comments are also included, including comments recorded before the first Needs Action case. "
                 if self.include_signals else
-                "Append-only equipment review history. Signal Mapping is intentionally excluded for non-RMU equipment. "
+                "Append-only equipment review history. Signal Mapping child cases are included only when this equipment is an RMU. "
             )
             + "The timeline preserves reopen/close cycles, Resolution choices, review comments, manual checks and validation-result changes."
         )
@@ -4576,7 +6480,40 @@ class MainWindow(QMainWindow):
         self._comparison_render_in_progress = False
         self._comparison_render_batch_size = 24
         self._comparison_render_context: dict | None = None
+        # v0.8.196 interaction cache.  Once a site's Equipment Review payload
+        # has been prepared, reviewer operations must not rebuild live Excel/CSV
+        # projections or requery whole SQLite maps.  Keep one canonical row/
+        # entry/review/resolution cache and use row hiding for search/filters.
+        self._comparison_row_cache: dict[str, dict] = {}
+        self._comparison_entry_cache: dict[str, dict] = {}
+        self._comparison_row_index_cache: dict[str, int] = {}
+        self._comparison_review_map_cache: dict[str, dict] = {}
+        self._comparison_resolution_map_cache: dict[str, dict] = {}
+        self._comparison_last_entries: list[dict] = []
+        self._comparison_action_tracking_keys: set[str] = set()
+        self._comparison_dataset_ready = False
         self.settings = QSettings()
+        # Equipment Data Review column widths are user presentation preferences.
+        # Persist them by stable column key so a reviewer can drag any header
+        # divider wider/narrower and keep that width across refreshes, site
+        # switches and application restarts even when the dynamic source-column
+        # order changes.  JSON avoids QVariant-map differences across PySide6
+        # versions and keeps the QSettings value portable.
+        try:
+            _saved_widths = json.loads(str(self.settings.value("comparison/column_widths_json", "{}") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            _saved_widths = {}
+        self.comparison_column_widths = {
+            str(key): max(55, min(2400, int(value)))
+            for key, value in (_saved_widths.items() if isinstance(_saved_widths, dict) else ())
+            if str(key).strip() and str(value).strip().lstrip("-").isdigit()
+        }
+        self._comparison_column_keys: list[str] = []
+        self._comparison_applying_column_widths = False
+        self._comparison_width_save_timer = QTimer(self)
+        self._comparison_width_save_timer.setSingleShot(True)
+        self._comparison_width_save_timer.setInterval(350)
+        self._comparison_width_save_timer.timeout.connect(self._persist_comparison_column_widths)
         self.ui_language = normalize_language(self.settings.value("ui/language", LANG_EN))
         # Keep runtime language in memory so custom-painted headers/dialogs do
         # not wait for QSettings disk synchronization before reflecting a switch.
@@ -5008,7 +6945,7 @@ class MainWindow(QMainWindow):
         rmu_cards = QGridLayout()
         rmu_cards.setHorizontalSpacing(12)
         rmu_cards.setVerticalSpacing(12)
-        self.metric_rmu_total = MetricCard("Total RMUs", "0", "#2365A8")
+        self.metric_rmu_total = MetricCard("Total Equipment", "0", "#2365A8")
         self.metric_rmu_pass = MetricCard("Pass", "0", "#12805C")
         self.metric_rmu_issues = MetricCard("With Issues", "0", "#C9871A")
         self.metric_rmu_reviewed = MetricCard("Closed / Issues", "0 / 0", "#2E7D32")
@@ -5238,10 +7175,11 @@ class MainWindow(QMainWindow):
         detail_box.addLayout(detail_top)
 
         note = QLabel(
-            "Each row is one real source table. CSV and Excel (.xlsx/.xlsm) are supported for every site source role. "
-            "Physical filenames are not business constraints: manual assignment plus field mapping is authoritative, and explicit Refresh can discover arbitrary filenames by schema fields. "
+            "Equipment Data Review is fully configurable per site: add any number of CSV/Excel tables, choose each table's key/index field, and define the fields to compare. "
+            "Every detected physical field is visible by default and may be hidden for that site. Source titles default to filenames and can be renamed. "
+            "Signal Mapping Review keeps its existing source roles and mapping workflow. "
             "AUTO still uses published V versions / detection rules as convenient discovery hints. Click Source File to return to AUTO, pin a version, or browse any supported table. "
-            "For Excel, Sheet defaults to AUTO (first usable sheet in workbook order) and can be pinned per site without changing the global field mapping. "
+            "For Excel, Sheet defaults to AUTO (the source-preferred business sheet when available, otherwise the first usable sheet) and can be pinned per site without changing the global field mapping. "
             "File Path shows the reviewer-facing location. Fields Used shows exactly which App fields this module reads from that file. "
             "Missing source fields stay blank. Changing one Source File re-reads only that table. "
             "Refresh Sources re-scans versions and re-reads changed files; Run Validation force re-reads all active files. "
@@ -5262,7 +7200,11 @@ class MainWindow(QMainWindow):
             module_box = QVBoxLayout(module_page)
             module_box.setContentsMargins(8, 10, 8, 8)
             module_box.setSpacing(8)
-            module_desc = QLabel(module.description)
+            module_description = (
+                "Equipment Data Review accepts any number of CSV/XLSX/XLSM tables. Each site independently defines source titles, worksheets, header rows, Key / Index fields, comparison rules and visible physical fields."
+                if module.key == "rmu_review" else module.description
+            )
+            module_desc = QLabel(module_description)
             module_desc.setObjectName("Muted")
             module_desc.setWordWrap(True)
             module_box.addWidget(module_desc)
@@ -5307,9 +7249,14 @@ class MainWindow(QMainWindow):
         self.repository_last_scan.setObjectName("Muted")
         footer.addWidget(self.repository_last_scan)
         footer.addStretch()
-        mapping_btn = QPushButton("Map Fields...")
+        comparison_config_btn = QPushButton("Configure Equipment Comparison...")
+        comparison_config_btn.setObjectName("Primary")
+        comparison_config_btn.setToolTip("Add/remove arbitrary Equipment Data Review source tables and configure each Key / Index, comparison field, title and site-local field visibility.")
+        comparison_config_btn.clicked.connect(self.open_equipment_comparison_config)
+        footer.addWidget(comparison_config_btn)
+        mapping_btn = QPushButton("Map Signal Fields...")
         mapping_btn.setObjectName("Primary")
-        mapping_btn.setToolTip("Map source fields to App columns, or add a new App column.")
+        mapping_btn.setToolTip("Map fields for the currently selected legacy Signal Mapping source. Equipment Data Review uses Configure Equipment Comparison.")
         mapping_btn.clicked.connect(self.open_source_mapping)
         footer.addWidget(mapping_btn)
         detail_box.addLayout(footer)
@@ -5388,14 +7335,14 @@ class MainWindow(QMainWindow):
         page, layout = self._page_container()
         layout.addWidget(PageHeader(
             "Equipment Data Review",
-            "Review every equipment type across SE, ZENON DB, ZENON SLD, ADMS DB and ADMS SLD. Every detected equipment type uses the same Analysis, Review Status, Resolution, Comments and Needs Action lifecycle workflow.",
+            "Compare any number of site-specific CSV/Excel tables. Choose the Key / Index field for every table, configure exactly which fields are compared, and keep the existing Review Status, Resolution, Comments and Needs Action lifecycle workflow.",
         ))
 
         controls = QFrame()
         controls.setObjectName("Card")
         cbox = QHBoxLayout(controls)
         cbox.setContentsMargins(14, 10, 14, 10)
-        self.equipment_profile_label = QLabel("Equipment Type")
+        self.equipment_profile_label = QLabel("Scope")
         self.equipment_profile_label.setObjectName("Muted")
         self.equipment_profile_combo = QComboBox()
         self.equipment_profile_combo.setMinimumWidth(220)
@@ -5404,7 +7351,7 @@ class MainWindow(QMainWindow):
         # review mode and is populated later from the same source-driven list.
         self.equipment_profile_combo.addItem("All Equipment", "__ALL__")
         self.equipment_profile_combo.setToolTip(
-            "Every equipment type is reviewed across SE / ZENON DB / ZENON SLD / ADMS DB / ADMS SLD using the same Analysis / Resolution / Comments / lifecycle workflow."
+            "Configurable comparison mode uses the union of the configured Key / Index values. Legacy projects retain the historical Equipment Type filters until a configurable source contract is saved."
         )
         self.equipment_profile_combo.currentIndexChanged.connect(self._on_equipment_profile_changed)
         self.comparison_search_field = QComboBox()
@@ -5417,9 +7364,9 @@ class MainWindow(QMainWindow):
         self._comparison_search_timer = QTimer(self)
         self._comparison_search_timer.setSingleShot(True)
         self._comparison_search_timer.setInterval(180)
-        self._comparison_search_timer.timeout.connect(self.refresh_comparison)
+        self._comparison_search_timer.timeout.connect(self._apply_comparison_filters_local)
         self.search_edit.textChanged.connect(lambda _text: self._comparison_search_timer.start())
-        self.comparison_search_field.currentIndexChanged.connect(self.refresh_comparison)
+        self.comparison_search_field.currentIndexChanged.connect(self._apply_comparison_filters_local)
         self._populate_comparison_search_fields()
         self.rmu_review_filter_combo = QComboBox()
         self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "UNREVIEWED", "CLOSED", "NEEDS ACTION"])
@@ -5427,7 +7374,7 @@ class MainWindow(QMainWindow):
             self.rmu_review_filter_combo.setItemData(i, key)
         mark_combo_for_translation(self.rmu_review_filter_combo)
         self.rmu_review_filter_combo.setToolTip("Filter only by the manual human Review state. Automated Analysis is filtered separately.")
-        self.rmu_review_filter_combo.currentIndexChanged.connect(self.refresh_comparison)
+        self.rmu_review_filter_combo.currentIndexChanged.connect(self._apply_comparison_filters_local)
         self.analysis_combo = QComboBox()
         for key in (
             "ALL ANALYSIS", "PASSED", "ANY MISMATCH",
@@ -5438,7 +7385,7 @@ class MainWindow(QMainWindow):
             self.analysis_combo.addItem(key, key)
         mark_combo_for_translation(self.analysis_combo)
         self.analysis_combo.setToolTip("Filter by Analysis result")
-        self.analysis_combo.currentIndexChanged.connect(self.refresh_comparison)
+        self.analysis_combo.currentIndexChanged.connect(self._apply_comparison_filters_local)
         self.comparison_show_all_btn = QPushButton("Show All")
         self.comparison_show_all_btn.setToolTip("Clear search and every Equipment Review/Analysis filter; keep column layout and review data unchanged.")
         self.comparison_show_all_btn.clicked.connect(self._show_all_comparison)
@@ -5449,8 +7396,12 @@ class MainWindow(QMainWindow):
         self.comparison_set_status_btn = review_btn
         review_btn.setToolTip("Set the selected equipment row(s) to Unreviewed, Closed or Needs Action. Structured Resolution remains available by double-clicking FALSE/Resolution cells.")
         review_btn.clicked.connect(self.set_comparison_review_status)
+        configure_sources_btn = QPushButton("Configure Sources")
+        configure_sources_btn.setObjectName("Primary")
+        configure_sources_btn.setToolTip("Add/remove arbitrary CSV/Excel tables, choose each Key / Index field, comparison fields, source titles and site-local source-field visibility")
+        configure_sources_btn.clicked.connect(self.open_equipment_comparison_config)
         columns_btn = QPushButton("Columns")
-        columns_btn.setToolTip("Show or hide Equipment Data Review groups and fields")
+        columns_btn.setToolTip("Show or hide application/meta columns. Physical source fields are shown/hidden in Configure Sources.")
         columns_btn.clicked.connect(self.open_comparison_columns)
         reset_btn = QPushButton("Reset Columns")
         reset_btn.setToolTip("Restore the default Equipment Data Review column visibility; filters are controlled by Show All")
@@ -5472,6 +7423,7 @@ class MainWindow(QMainWindow):
         cbox.addWidget(self.comparison_show_all_btn)
         cbox.addWidget(self.comparison_clear_selection_btn)
         cbox.addWidget(review_btn)
+        cbox.addWidget(configure_sources_btn)
         cbox.addWidget(columns_btn)
         cbox.addWidget(reset_btn)
         cbox.addStretch()
@@ -5507,7 +7459,7 @@ class MainWindow(QMainWindow):
         for color, label, tip in [
             ("#EAF7F0", "Pass", "No Analysis field is FALSE"),
             ("#FFF8D8", "Has Issues", "One or two Analysis fields are FALSE"),
-            ("#FDECEC", "Critical", "NAME is FALSE or three or more Analysis fields are FALSE"),
+            ("#FDECEC", "Critical", "Three or more Analysis fields are FALSE; a configured Analysis field titled NAME also keeps the historical critical priority"),
             ("#F7D7D7", "FALSE = mismatch", "All FALSE Analysis cells use the same mismatch highlight"),
         ]:
             swatch = QLabel()
@@ -5538,8 +7490,19 @@ class MainWindow(QMainWindow):
         self._register_spreadsheet_table(self.comparison_table)
         self.comparison_table.verticalHeader().setVisible(False)
         self.comparison_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        # v0.8.188: every Equipment Data Review business/source column is
+        # explicitly user-resizable.  Fixed mode made long values such as
+        # processed_name / Functional Location impossible to inspect without
+        # editing the schema.  Interactive mode keeps the existing initial
+        # widths but lets the reviewer drag any header divider at runtime.
+        self.comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.comparison_table.horizontalHeader().setMinimumSectionSize(55)
+        self.comparison_table.horizontalHeader().sectionResized.connect(self._on_comparison_column_resized)
+        # v0.8.190: double-clicking a header section returns that column to
+        # content-aware auto sizing.  This deliberately clears only that
+        # column's manual-width override; ordinary single-click/drag behavior
+        # remains unchanged.
+        self.comparison_table.horizontalHeader().sectionDoubleClicked.connect(self._auto_fit_comparison_section)
         self.comparison_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.comparison_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.comparison_table.setWordWrap(True)
@@ -5557,14 +7520,14 @@ class MainWindow(QMainWindow):
         self.comparison_locator = SpreadsheetTableWidget(0, 5)
         locator_groups = (("Row Locator", "#E8EDF3", (
             ("locator_no", "No.", 55),
-            ("locator_rmu", "Equipment Name", 110),
+            ("locator_rmu", "Index / Key", 150),
             ("locator_checked", "Checked", 74),
             ("locator_analysis", "Analysis", 115),
             ("locator_review", "Review", 115),
         )),)
         self.comparison_locator_header = GroupedReportHeader(locator_groups, self.comparison_locator)
         self.comparison_locator.setHorizontalHeader(self.comparison_locator_header)
-        self.comparison_locator.setHorizontalHeaderLabels(["No.", "Equipment Name", "Checked", "Analysis", "Review"])
+        self.comparison_locator.setHorizontalHeaderLabels(["No.", "Index / Key", "Checked", "Analysis", "Review"])
         self.comparison_locator.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.comparison_locator.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.comparison_locator.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -5572,11 +7535,11 @@ class MainWindow(QMainWindow):
         self.comparison_locator.verticalHeader().setDefaultSectionSize(32)
         self.comparison_locator.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.comparison_locator.setColumnWidth(0, 55)
-        self.comparison_locator.setColumnWidth(1, 110)
+        self.comparison_locator.setColumnWidth(1, 150)
         self.comparison_locator.setColumnWidth(2, 74)
         self.comparison_locator.setColumnWidth(3, 115)
         self.comparison_locator.setColumnWidth(4, 115)
-        self.comparison_locator.setFixedWidth(55 + 110 + 74 + 115 + 115 + 4)
+        self.comparison_locator.setFixedWidth(55 + 150 + 74 + 115 + 115 + 4)
         self.comparison_locator.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.comparison_locator.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.comparison_locator.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -5592,7 +7555,7 @@ class MainWindow(QMainWindow):
         self.comparison_table.itemSelectionChanged.connect(self._sync_comparison_locator_selection)
         self._comparison_lifecycle_timer = QTimer(self)
         self._comparison_lifecycle_timer.setSingleShot(True)
-        self._comparison_lifecycle_timer.setInterval(40)
+        self._comparison_lifecycle_timer.setInterval(220)
         self._comparison_lifecycle_timer.timeout.connect(self.refresh_selected_rmu_lifecycle)
         self.comparison_table.currentCellChanged.connect(
             lambda _row, _column, _prev_row, _prev_column: self._schedule_comparison_lifecycle_refresh()
@@ -5626,7 +7589,7 @@ class MainWindow(QMainWindow):
         self.comparison_locator_scroll_spacer = QWidget()
         self.comparison_locator_scroll_spacer.setFixedHeight(0)
         comparison_locator_layout.addWidget(self.comparison_locator_scroll_spacer, 0)
-        self.comparison_locator_host.setFixedWidth(55 + 90 + 74 + 115 + 115 + 4)
+        self.comparison_locator_host.setFixedWidth(55 + 150 + 74 + 115 + 115 + 4)
         grid_layout.addWidget(self.comparison_locator_host, 0)
         grid_layout.addWidget(self.comparison_table, 1)
         self.comparison_table.horizontalScrollBar().rangeChanged.connect(
@@ -5665,7 +7628,7 @@ class MainWindow(QMainWindow):
 
         self.comparison_lifecycle_table = QTableWidget(0, 6)
         self.comparison_lifecycle_table.setHorizontalHeaderLabels([
-            "Time", "Case", "Status", "Issue", "Comments", "User"
+            "Time", "Equipment Case", "Status", "Issue", "Comments", "User"
         ])
         _configure_table_base(self.comparison_lifecycle_table)
         self.comparison_lifecycle_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -5673,7 +7636,7 @@ class MainWindow(QMainWindow):
         self.comparison_lifecycle_table.setMinimumHeight(160)
         self.comparison_lifecycle_table.setMaximumHeight(310)
         _set_fixed_column(self.comparison_lifecycle_table, 0, 165)
-        _set_fixed_column(self.comparison_lifecycle_table, 1, 70)
+        _set_fixed_column(self.comparison_lifecycle_table, 1, 125)
         _set_fixed_column(self.comparison_lifecycle_table, 2, 105)
         _set_interactive_column(self.comparison_lifecycle_table, 3, 230)
         _set_stretch_column(self.comparison_lifecycle_table, 4)
@@ -5761,7 +7724,7 @@ class MainWindow(QMainWindow):
             selection_model.select(selection, QItemSelectionModel.SelectionFlag.Select)
 
     def _show_all_comparison(self) -> None:
-        """Clear every RMU filter and visibly prepare the full RMU grid."""
+        """Clear every Equipment filter without rebuilding the data grid."""
         widgets = [self.comparison_search_field, self.search_edit, self.rmu_review_filter_combo, self.analysis_combo]
         for widget in widgets:
             widget.blockSignals(True)
@@ -5773,26 +7736,13 @@ class MainWindow(QMainWindow):
         finally:
             for widget in widgets:
                 widget.blockSignals(False)
-        self.comparison_show_all_btn.setEnabled(False)
-        self._show_busy_operation(
-            "rmu-show-all",
-            "Loading all equipment rows...",
-            "Clearing filters and rebuilding the Equipment Data Review view. Please wait.",
-        )
-        # Yield one event-loop turn so the animated popup is painted before the
-        # first table-preparation pass begins. The actual row paint is already
-        # incremental and hides the popup when the final batch completes.
-        QTimer.singleShot(0, self._complete_show_all_comparison)
+        self._apply_comparison_filters_local()
+        self.statusBar().showMessage(ui_tr("Equipment filters cleared · showing all rows", self.ui_language), 2500)
 
     def _complete_show_all_comparison(self) -> None:
-        try:
-            self.refresh_comparison()
-            self.statusBar().showMessage(ui_tr("Equipment filters cleared · showing all rows", self.ui_language), 2500)
-        except Exception:
-            if hasattr(self, "comparison_show_all_btn"):
-                self.comparison_show_all_btn.setEnabled(True)
-            self._hide_busy_operation("rmu-show-all")
-            raise
+        # Compatibility hook retained for older tests/callers. Filtering is now
+        # local and does not reconstruct the comparison dataset.
+        self._apply_comparison_filters_local()
 
     def _sync_comparison_selection_from_locator(self) -> None:
         if getattr(self, "_syncing_comparison_selection", False):
@@ -5835,25 +7785,82 @@ class MainWindow(QMainWindow):
         )
 
     def _on_comparison_locator_check_passed_toggled(self, rmu: str, checked: bool) -> None:
-        """Persist the locator checkbox as a manual verification/pass record."""
+        """Queue one manual verification and return to Qt immediately.
+
+        Even a small SQLite commit can pause the GUI when a background refresh
+        briefly owns the database writer lock.  The checkbox itself is already
+        painted by Qt, so collect rapid reviewer clicks and persist them through
+        a separate ProjectStore connection in one short transaction.
+        """
         if getattr(self, "_rendering_comparison_checks", False) or not self.store:
             return
         rmu = clean(rmu)
         if not rmu:
             return
-        try:
-            self.store.update_rmu_check_passed(
-                rmu, bool(checked), self.user_name,
-                reason="RMU manually checked / passed in Row Locator",
-            )
-            self.refresh_changes()
-            self.refresh_site_history()
-            self.refresh_export_page()
-            state = "PASS" if checked else "cleared"
-            self.statusBar().showMessage(ui_tr(f"RMU {rmu} manual check {state} · saved", self.ui_language), 3500)
-        except Exception as exc:
-            QMessageBox.critical(self, "RMU Check", f"{type(exc).__name__}: {exc}")
+        pending = getattr(self, "_pending_equipment_checks", None)
+        if pending is None:
+            pending = {}
+            self._pending_equipment_checks = pending
+        pending[rmu] = bool(checked)
+
+        timer = getattr(self, "_equipment_check_flush_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(60)
+            timer.timeout.connect(self._flush_pending_equipment_checks)
+            self._equipment_check_flush_timer = timer
+        timer.start()
+        state = "PASS" if checked else "cleared"
+        self.statusBar().showMessage(
+            ui_tr(f"Equipment {rmu} manual check {state} · saving…", self.ui_language), 1800
+        )
+
+    def _flush_pending_equipment_checks(self) -> None:
+        if not self.store:
+            return
+        pending = getattr(self, "_pending_equipment_checks", None) or {}
+        timer = getattr(self, "_equipment_check_flush_timer", None)
+        if not pending:
+            return
+        if "equipment-check-batch" in self._background_tasks:
+            if timer is not None:
+                timer.start(80)
+            return
+
+        updates = list(pending.items())
+        self._pending_equipment_checks = {}
+        project_folder = str(self.store.folder)
+
+        def success(result):
+            saved = list((result or {}).get("saved") or [])
+            self._dirty_pages.update({0, 4, 6, 7})
+            if saved:
+                self.statusBar().showMessage(
+                    ui_tr(f"Equipment manual checks saved · {len(saved)} row(s)", self.ui_language), 2200
+                )
+            if getattr(self, "_pending_equipment_checks", None):
+                QTimer.singleShot(0, self._flush_pending_equipment_checks)
+
+        def failed(details: str):
+            # Merge the failed batch back only when the reviewer has not already
+            # changed that row again while the worker was running.
+            current = getattr(self, "_pending_equipment_checks", None) or {}
+            for key, value in updates:
+                current.setdefault(key, value)
+            self._pending_equipment_checks = current
+            last_line = next((line for line in reversed(details.strip().splitlines()) if line.strip()), details)
+            QMessageBox.critical(self, "Equipment Check", last_line)
+            # Reconcile visually only on the exceptional failure path.
             self.refresh_comparison()
+
+        self._start_background_task(
+            "equipment-check-batch",
+            "Saving Equipment Checks",
+            lambda: _background_equipment_check_batch_job(project_folder, updates, self.user_name),
+            success,
+            on_error=failed,
+        )
 
     def _clear_comparison_selection(self) -> None:
         self._syncing_comparison_selection = True
@@ -5901,7 +7908,7 @@ class MainWindow(QMainWindow):
         return clean(locator_item.text()) if locator_item is not None else ""
 
     def refresh_selected_rmu_lifecycle(self, *, force_clear: bool = False) -> None:
-        """Show the compact RMU-only review story only after Needs Action exists.
+        """Show the compact equipment review story only after Needs Action exists.
 
         Human comments are append-only even before Needs Action.  They remain
         hidden while an RMU has never had a formal Needs Action case; once the
@@ -5928,7 +7935,17 @@ class MainWindow(QMainWindow):
         data = self._comparison_row_by_rmu(rmu) or {}
         display_name = self._equipment_display_name(rmu, data)
         device_type = self._equipment_type_from_key(rmu, data)
-        payload = self.store.rmu_full_lifecycle(rmu)
+        # Most equipment has never entered formal Needs Action. Avoid opening
+        # several lifecycle/audit tables on every row click; the active review
+        # session already knows which keys have durable tracking history.
+        tracked_keys = getattr(self, "_comparison_action_tracking_keys", set()) or set()
+        if rmu not in tracked_keys:
+            table.setRowCount(0)
+            card.setVisible(False)
+            if open_btn is not None:
+                open_btn.setEnabled(False)
+            return
+        payload = (self.store.equipment_full_lifecycle(rmu) if hasattr(self.store, "equipment_full_lifecycle") else self.store.rmu_full_lifecycle(rmu))
         rmu_cases = [
             case for case in (payload.get("cases") or [])
             if clean(case.get("entity_type")).upper() == "RMU"
@@ -5977,6 +7994,11 @@ class MainWindow(QMainWindow):
 
         def formal_issue_text(event: dict, snapshot: dict) -> str:
             field = clean(event.get("field_name")).upper()
+            event_type = clean(event.get("event_type")).upper()
+            if event_type == "SOURCE_VALUE_CHANGED":
+                # A source-version diff is its own audit fact. Do not replace it
+                # with whichever Analysis mismatch happens to remain active.
+                return field or "SOURCE DATA CHANGED"
             if field.startswith("RESOLUTION."):
                 field = field.split(".", 1)[1]
             failed = failed_fields(snapshot)
@@ -5984,14 +8006,13 @@ class MainWindow(QMainWindow):
                 failed.insert(0, field)
             if failed:
                 return " / ".join(f"{name} mismatch" for name in dict.fromkeys(failed))
-            event_type = clean(event.get("event_type")).upper()
             if event_type == "CASE_CLOSED":
                 return "Needs Action closed"
             if event_type in {"CASE_OPENED", "STATUS_CHANGED"}:
                 return "Manual / Site Review"
             if event_type == "VALIDATION_CHANGED":
                 return "Validation changed"
-            return field or "RMU review"
+            return field or "Equipment review"
 
         def formal_comments_text(event: dict) -> str:
             event_type = clean(event.get("event_type")).upper()
@@ -6055,7 +8076,7 @@ class MainWindow(QMainWindow):
                 case_no = int(event.get("case") or 0)
                 values = [
                     event.get("time"),
-                    f"#{case_no:03d}" if case_no else "—",
+                    f"{display_name}-{case_no:03d}" if case_no else "—",
                     event.get("status"),
                     event.get("issue"),
                     event.get("comments"),
@@ -6154,7 +8175,7 @@ class MainWindow(QMainWindow):
         if not rmu:
             QMessageBox.information(self, "Equipment Lifecycle", "Select exactly one equipment row to view its full lifecycle.")
             return
-        payload = self.store.rmu_full_lifecycle(rmu)
+        payload = (self.store.equipment_full_lifecycle(rmu) if hasattr(self.store, "equipment_full_lifecycle") else self.store.rmu_full_lifecycle(rmu))
         if not payload.get("case_count"):
             data = self._comparison_row_by_rmu(rmu) or {}
             QMessageBox.information(
@@ -6347,7 +8368,7 @@ class MainWindow(QMainWindow):
             locator_host.setVisible(True)
         if hasattr(self, "comparison_review_progress"):
             self.comparison_review_progress.setToolTip(
-                "Every equipment type uses the five-source Analysis plus Unreviewed / Closed / Needs Action, Resolution, Comments and lifecycle workflow."
+                "Configured comparison fields use the same Unreviewed / Closed / Needs Action, Resolution, Comments and lifecycle workflow as the historical review."
             )
 
     def _on_equipment_profile_changed(self, _index: int = -1) -> None:
@@ -6363,8 +8384,8 @@ class MainWindow(QMainWindow):
         self.refresh_comparison()
 
     def _comparison_groups(self):
-        # One source-faithful five-source layout for every equipment class.
-        # RMU keeps its historical storage key, but not a separate UI schema.
+        # v0.8.178 generates the layout from the active site's configured source
+        # tables/rules; legacy sites retain the historical layout until migrated.
         return equipment_source_review_groups(self.store)
 
     def _comparison_columns(self):
@@ -6385,6 +8406,43 @@ class MainWindow(QMainWindow):
         self.comparison_search_field.setCurrentIndex(restore if restore >= 0 else 0)
         self.comparison_search_field.blockSignals(False)
 
+    def _comparison_source_group_names(self) -> set[str]:
+        if self.store:
+            config = get_equipment_comparison_config(self.store, bootstrap=False)
+            if config.get("sources"):
+                names = set()
+                for source in config.get("sources", []):
+                    path = configurable_source_path(self.store, source)
+                    names.add(clean(source.get("title")) or (path.stem if path else "Source"))
+                return names
+        return {"SE", "ZENON DB", "ZENON SLD", "ADMS DB", "ADMS SLD"}
+
+    def _refresh_analysis_filter_options(self) -> None:
+        if not hasattr(self, "analysis_combo"):
+            return
+        current = clean(self.analysis_combo.currentData()) or "ALL ANALYSIS"
+        self.analysis_combo.blockSignals(True)
+        self.analysis_combo.clear()
+        for label, key in (
+            ("ALL ANALYSIS", "ALL ANALYSIS"), ("PASSED", "PASSED"),
+            ("ANY MISMATCH", "ANY MISMATCH"), ("1 ISSUE", "1 ISSUE"),
+            ("2 ISSUES", "2 ISSUES"), ("MULTIPLE ISSUES", "MULTIPLE ISSUES"),
+            ("CRITICAL", "CRITICAL"),
+        ):
+            self.analysis_combo.addItem(label, key)
+        config = get_equipment_comparison_config(self.store, bootstrap=False) if self.store else {"sources": []}
+        if config.get("sources"):
+            for rule in config.get("comparisons", []):
+                rule_id = clean(rule.get("id"))
+                if rule_id:
+                    self.analysis_combo.addItem(f"{clean(rule.get('title')) or 'Comparison'} MISMATCH", f"RULE::{rule_id.upper()}")
+        else:
+            for field in ("NAME", "FEEDER", "SMART", "TYPE", "IP"):
+                self.analysis_combo.addItem(f"{field} MISMATCH", f"{field} MISMATCH")
+        restore = self.analysis_combo.findData(current)
+        self.analysis_combo.setCurrentIndex(restore if restore >= 0 else 0)
+        self.analysis_combo.blockSignals(False)
+
     def _comparison_search_text(self, data: dict, field_key: str, review_text: str) -> str:
         if field_key == "comments":
             return clean(review_text)
@@ -6402,7 +8460,7 @@ class MainWindow(QMainWindow):
         self.comparison_table.setColumnCount(len(columns))
         if hasattr(self.comparison_table, "set_source_group_boundaries"):
             self.comparison_table.set_source_group_boundaries(
-                groups, {"SE", "ZENON DB", "ZENON SLD", "ADMS DB", "ADMS SLD"}
+                groups, self._comparison_source_group_names()
             )
 
         # Visibility is computed from the explicit hidden set every time the
@@ -6411,23 +8469,211 @@ class MainWindow(QMainWindow):
         # hid remain hidden.
         current_keys = {key for key, _label, _width in columns}
         protected_keys = equipment_review_protected_column_keys(self.store) & current_keys
+        source_group_names = self._comparison_source_group_names()
+        source_review_keys = {
+            key
+            for group, _color, group_columns in groups
+            if group in source_group_names
+            for key, _label, _width in group_columns
+        }
+        # v0.8.168: Source Mapping's Show checkbox is the single source-of-truth
+        # for physical source-column visibility.  equipment_source_review_groups
+        # already removes rows hidden in Map Fields, so every remaining source
+        # key must be visible here.  Purge legacy review-level hides to avoid a
+        # contradictory state where Map Fields says Show but Review hides it.
+        stale_source_hides = self.comparison_hidden_keys & source_review_keys
+        if stale_source_hides:
+            self.comparison_hidden_keys -= source_review_keys
         # A protected SYSTEM field can never remain hidden, including when an
         # older release persisted it in the explicit hidden set.
         stale_protected = self.comparison_hidden_keys & protected_keys
         if stale_protected:
             self.comparison_hidden_keys -= protected_keys
+        if stale_source_hides or stale_protected:
             save_review_hidden_columns(self.comparison_hidden_keys, "rmu_data_review")
-        self.comparison_visible_keys = (current_keys - self.comparison_hidden_keys) | protected_keys
+        self.comparison_visible_keys = (current_keys - self.comparison_hidden_keys) | protected_keys | source_review_keys
 
         self.comparison_table.setHorizontalHeaderLabels([label for _key, label, _width in columns])
+        self._comparison_column_keys = [key for key, _label, _width in columns]
         self._populate_comparison_search_fields()
-        for index, (key, label, width) in enumerate(columns):
-            self.comparison_table.setColumnWidth(index, max(70, int(width * 1.05)))
-            item = self.comparison_table.horizontalHeaderItem(index)
-            if item:
-                group = next((g for g, _c, cols in groups if any(k == key for k, _l, _w in cols)), "")
-                item.setToolTip(f"{group} / {label}" if group and group != "Index" else label)
+        self._refresh_analysis_filter_options()
+        # Applying schema/default widths must not overwrite a manual width while
+        # the table is being rebuilt.  Saved widths win by stable column key;
+        # columns first seen at this site use the schema's normal initial width.
+        self._comparison_applying_column_widths = True
+        try:
+            for index, (key, label, width) in enumerate(columns):
+                initial_width = max(70, int(width * 1.05))
+                target_width = self.comparison_column_widths.get(key, initial_width)
+                self.comparison_table.setColumnWidth(index, max(55, min(2400, int(target_width))))
+                item = self.comparison_table.horizontalHeaderItem(index)
+                if item:
+                    group = next((g for g, _c, cols in groups if any(k == key for k, _l, _w in cols)), "")
+                    base_tip = f"{group} / {label}" if group and group != "Index" else label
+                    resize_tip = ui_tr(
+                        "Drag the header divider to resize; double-click the header to fit content",
+                        self.ui_language,
+                    )
+                    item.setToolTip(f"{base_tip}\n\n{resize_tip}")
+        finally:
+            self._comparison_applying_column_widths = False
         self._apply_comparison_column_visibility()
+
+    @staticmethod
+    def _comparison_width_sample(records, limit: int = 180) -> list[dict]:
+        """Return a bounded, evenly distributed sample for column auto-fit.
+
+        Equipment sites commonly contain 2,000+ rows and tens of dynamic
+        source fields.  Qt's resizeColumnToContents() scans every cell and can
+        make the UI noticeably stall.  Sampling from the whole unfiltered data
+        set keeps widths representative and stable across filter/search changes
+        while bounding GUI-thread work.
+        """
+        rows = list(records or [])
+        if len(rows) <= max(1, int(limit)):
+            return rows
+        limit = max(2, int(limit))
+        last = len(rows) - 1
+        indexes = {round(i * last / (limit - 1)) for i in range(limit)}
+        return [rows[index] for index in sorted(indexes)]
+
+    def _comparison_auto_width_for_column(
+        self, key: str, label: str, schema_width: int, records: list[dict], shown: list[dict] | None = None
+    ) -> int:
+        """Calculate a practical content width for one Equipment Review column.
+
+        Width starts from the existing schema default, expands for the header
+        and sampled values, and is capped so one abnormal long cell cannot make
+        the rest of the review grid unusable.
+        """
+        table_metrics = QFontMetrics(self.comparison_table.font())
+        header_metrics = QFontMetrics(self.comparison_table.horizontalHeader().font())
+        minimum = max(70, int(schema_width * 1.05))
+        maximum = 520
+        target = max(minimum, header_metrics.horizontalAdvance(clean(label)) + 32)
+
+        if key == "comments" and shown:
+            source_records = list(shown)
+            value_getter = lambda entry: clean(entry.get("resolution_display"))
+            sampled_records = self._comparison_width_sample(source_records, 120)
+        else:
+            source_records = list(records)
+            value_getter = lambda record: clean(record.get(key, ""))
+            sampled_records = self._comparison_width_sample(source_records, 180)
+
+        # Always include the longest textual value from the full data set in
+        # addition to the evenly distributed sample.  This avoids missing a
+        # rare long processed_name / Functional Location near an unsampled row
+        # while still keeping expensive font-metric work bounded.
+        longest_record = max(
+            source_records,
+            key=lambda record: max((len(line) for line in value_getter(record).splitlines()), default=0),
+            default=None,
+        )
+        if longest_record is not None and longest_record not in sampled_records:
+            sampled_records.append(longest_record)
+        values = [value_getter(record) for record in sampled_records]
+
+        for value in values:
+            if not value:
+                continue
+            # A multiline Resolution/Remarks cell should fit its longest useful
+            # line, not the full joined string.  Measuring a bounded prefix also
+            # protects against pasted blobs while the 520 px cap keeps layout
+            # readable.
+            for line in str(value).splitlines()[:6]:
+                line = line.replace("\t", "    ")[:180]
+                if not line:
+                    continue
+                target = max(target, table_metrics.horizontalAdvance(line) + 30)
+                if target >= maximum:
+                    return maximum
+        return max(55, min(maximum, int(target)))
+
+    def _auto_fit_comparison_columns(
+        self, rows: list[dict] | None = None, shown: list[dict] | None = None, only_keys: set[str] | None = None
+    ) -> None:
+        """Auto-size non-manual Equipment Review columns from real content.
+
+        Manual widths saved by v0.8.188 always win.  Columns without a manual
+        override are fitted from the header plus an evenly distributed sample
+        of the *full* current equipment data set, so changing a search/filter
+        does not make widths jump around.
+        """
+        if not hasattr(self, "comparison_table"):
+            return
+        columns = list(self._comparison_columns())
+        if not columns:
+            return
+        full_rows = list(rows if rows is not None else (getattr(self, "_comparison_last_rows", []) or []))
+        shown_rows = list(shown if shown is not None else (getattr(self, "_comparison_last_shown", []) or []))
+        requested = {clean(key) for key in (only_keys or set()) if clean(key)}
+
+        self._comparison_applying_column_widths = True
+        try:
+            for index, (key, label, schema_width) in enumerate(columns):
+                if requested and key not in requested:
+                    continue
+                # A user drag is an explicit presentation preference and must
+                # never be silently overwritten by automatic sizing.
+                if key in self.comparison_column_widths:
+                    continue
+                target = self._comparison_auto_width_for_column(
+                    key, label, schema_width, full_rows, shown_rows
+                )
+                self.comparison_table.setColumnWidth(index, target)
+        finally:
+            self._comparison_applying_column_widths = False
+
+    def _auto_fit_comparison_section(self, logical_index: int) -> None:
+        """Reset one manually resized column back to content-aware auto-fit."""
+        if logical_index < 0 or logical_index >= len(self._comparison_column_keys):
+            return
+        key = clean(self._comparison_column_keys[logical_index])
+        if not key:
+            return
+        if key in self.comparison_column_widths:
+            self.comparison_column_widths.pop(key, None)
+            self._comparison_width_save_timer.start()
+        self._auto_fit_comparison_columns(only_keys={key})
+        self.statusBar().showMessage(
+            ui_tr("Column width fitted to current content", self.ui_language), 2500
+        )
+
+    def _on_comparison_column_resized(self, logical_index: int, _old_size: int, new_size: int) -> None:
+        """Remember reviewer-driven Equipment Data Review column widths.
+
+        QHeaderView emits sectionResized continuously while the mouse is being
+        dragged.  Keep those updates in memory immediately, but debounce the
+        QSettings write so a wide-column drag stays smooth even on slower field
+        laptops.
+        """
+        if self._comparison_applying_column_widths:
+            return
+        # Hiding/showing a section can emit a transient zero-width resize.
+        # That is not a reviewer drag and must not destroy the remembered width.
+        if int(new_size) < 55:
+            return
+        if logical_index < 0 or logical_index >= len(self._comparison_column_keys):
+            return
+        key = clean(self._comparison_column_keys[logical_index])
+        if not key:
+            return
+        self.comparison_column_widths[key] = max(55, min(2400, int(new_size)))
+        self._comparison_width_save_timer.start()
+
+    def _persist_comparison_column_widths(self) -> None:
+        if not hasattr(self, "settings"):
+            return
+        payload = {
+            str(key): int(width)
+            for key, width in self.comparison_column_widths.items()
+            if str(key).strip() and int(width) >= 55
+        }
+        self.settings.setValue(
+            "comparison/column_widths_json",
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        )
 
     def _apply_comparison_column_visibility(self):
         if not hasattr(self, "comparison_table"):
@@ -6438,10 +8684,17 @@ class MainWindow(QMainWindow):
         header.viewport().update()
 
     def open_comparison_columns(self):
-        current_keys = {key for key, _label, _width in self._comparison_columns()}
+        all_groups = self._comparison_groups()
+        source_group_names = self._comparison_source_group_names()
+        # v0.8.168: physical source-field visibility is controlled only in Map
+        # Fields.  The generic Columns dialog remains for App/meta columns such
+        # as Index, Source Coverage, Analysis, Remarks and Resolution, avoiding
+        # two conflicting visibility controls for the same source column.
+        dialog_groups = tuple(group for group in all_groups if group[0] not in source_group_names)
+        current_keys = {key for _group, _color, cols in dialog_groups for key, _label, _width in cols}
         protected_keys = equipment_review_protected_column_keys(self.store) & current_keys
         dialog = ColumnVisibilityDialog(
-            self._comparison_groups(), self.comparison_visible_keys, protected_keys, self
+            dialog_groups, self.comparison_visible_keys, protected_keys, self
         )
         translate_widget_tree(dialog, self.ui_language)
         if dialog.exec() != QDialog.Accepted:
@@ -7199,11 +9452,12 @@ class MainWindow(QMainWindow):
                 reason="Signal manually checked / passed in Row Locator",
                 metadata=signal_review_metadata(self.db_smart_report, row),
             )
-            self.refresh_changes()
-            self.refresh_site_history()
-            self.refresh_export_page()
+            # Keep checkbox interaction immediate.  Audit/history/export are
+            # secondary views and refresh lazily on navigation instead of
+            # synchronously rebuilding large tables for every single tick.
+            self._dirty_pages.update({0, 4, 6, 7})
             state = "PASS" if checked else "cleared"
-            self.statusBar().showMessage(ui_tr(f"Signal manual check {state} · RMU {clean(rmu) or '—'} · saved", self.ui_language), 3500)
+            self.statusBar().showMessage(ui_tr(f"Signal manual check {state} · RMU {clean(rmu) or '—'} · saved", self.ui_language), 2500)
         except Exception as exc:
             QMessageBox.critical(self, "Signal Check", f"{type(exc).__name__}: {exc}")
             self._render_db_smart_rows()
@@ -8281,7 +10535,7 @@ class MainWindow(QMainWindow):
         self.site_history_site_label = QLabel("Site: —")
         self.site_history_revision_label = QLabel("Latest revision: —")
         self.site_history_issue_label = QLabel("Issue / Action items: 0")
-        self.site_history_tracking_label = QLabel("RMU Follow-up: Open 0 · Closed 0")
+        self.site_history_tracking_label = QLabel("Equipment Follow-up: Open 0 · Closed 0")
         self.site_history_lifecycle_label = QLabel("Lifecycle: Open 0 · Closed 0")
         self.site_history_audit_label = QLabel("Audit records: 0")
         self.site_history_report_label = QLabel("Sign-off PDFs: 0")
@@ -8385,29 +10639,30 @@ class MainWindow(QMainWindow):
         tracking_box = QVBoxLayout(tracking_tab)
         tracking_box.setContentsMargins(0, 10, 0, 0)
         tracking_note = QLabel(
-            "Once an RMU enters Needs Action it stays in this follow-up register until that RMU is explicitly Closed. "
+            "Once any equipment enters Needs Action it stays in this follow-up register until that equipment is explicitly Closed. "
             "A later source refresh or Unreviewed reset does not silently remove the open follow-up item."
         )
         tracking_note.setObjectName("Muted")
         tracking_note.setWordWrap(True)
         tracking_box.addWidget(tracking_note)
-        self.site_rmu_tracking_table = QTableWidget(0, 9)
+        self.site_rmu_tracking_table = QTableWidget(0, 10)
         self.site_rmu_tracking_table.setHorizontalHeaderLabels([
-            "RMU", "Status", "First Needs Action", "Last Needs Action", "Closed At",
+            "Equipment", "Type", "Status", "First Needs Action", "Last Needs Action", "Closed At",
             "Open Count", "Opened By", "Closed By", "Last Reason"
         ])
         _configure_table_base(self.site_rmu_tracking_table)
-        _set_fixed_column(self.site_rmu_tracking_table, 0, 105)
-        _set_fixed_column(self.site_rmu_tracking_table, 1, 95)
-        _set_fixed_column(self.site_rmu_tracking_table, 2, 175)
+        _set_interactive_column(self.site_rmu_tracking_table, 0, 150)
+        _set_fixed_column(self.site_rmu_tracking_table, 1, 110)
+        _set_fixed_column(self.site_rmu_tracking_table, 2, 95)
         _set_fixed_column(self.site_rmu_tracking_table, 3, 175)
         _set_fixed_column(self.site_rmu_tracking_table, 4, 175)
-        _set_fixed_column(self.site_rmu_tracking_table, 5, 95)
-        _set_fixed_column(self.site_rmu_tracking_table, 6, 120)
+        _set_fixed_column(self.site_rmu_tracking_table, 5, 175)
+        _set_fixed_column(self.site_rmu_tracking_table, 6, 95)
         _set_fixed_column(self.site_rmu_tracking_table, 7, 120)
-        _set_stretch_column(self.site_rmu_tracking_table, 8)
+        _set_fixed_column(self.site_rmu_tracking_table, 8, 120)
+        _set_stretch_column(self.site_rmu_tracking_table, 9)
         tracking_box.addWidget(self.site_rmu_tracking_table)
-        tabs.addTab(tracking_tab, "RMU Needs Action Tracking")
+        tabs.addTab(tracking_tab, "Equipment Needs Action Tracking")
 
         audit_tab = QWidget()
         audit_box = QVBoxLayout(audit_tab)
@@ -8492,7 +10747,7 @@ class MainWindow(QMainWindow):
         self.export_readiness_label = QLabel("Delivery status: —")
         self.export_readiness_label.setObjectName("Muted")
         self.export_readiness_label.setWordWrap(True)
-        self.export_path_label = QLabel("Report folder: —")
+        self.export_path_label = QLabel("Export location: choose a path when exporting")
         self.export_path_label.setWordWrap(True)
         self.export_path_label.setObjectName("Muted")
         box.addWidget(self.export_project_label)
@@ -8625,26 +10880,51 @@ class MainWindow(QMainWindow):
         detection_title.setObjectName("SectionTitle")
         detection_box.addWidget(detection_title)
         detection_desc = QLabel(
-            "Recommended filenames are not mandatory. Configure comma-separated filename keywords here; "
-            "the detector also checks CSV/XLSX column structure. Ambiguous files remain unmapped until assigned manually."
+            "These rules are optional recognition hints, not source requirements. Filenames may be arbitrary; manual file selection, Key/Index and field mapping are authoritative. "
+            "Built-in categories help legacy AUTO discovery, and you may add any number of extra categories for your own site/file families."
         )
         detection_desc.setWordWrap(True)
         detection_desc.setObjectName("Muted")
         detection_box.addWidget(detection_desc)
-        detection_form = QFormLayout()
-        current_keywords = load_source_detection_keywords()
-        self.source_detection_keyword_edits = {}
-        for definition in SOURCE_DEFINITIONS:
-            edit = QLineEdit(", ".join(current_keywords.get(definition.key, [])))
-            edit.setPlaceholderText("comma-separated filename keywords")
-            self.source_detection_keyword_edits[definition.key] = edit
-            detection_form.addRow(definition.label, edit)
-        detection_box.addLayout(detection_form)
+
+        self.source_detection_table = QTableWidget(0, 3)
+        self.source_detection_table.setHorizontalHeaderLabels(["Category / Source Hint", "Filename Keywords", "Type"])
+        _configure_table_base(self.source_detection_table)
+        self.source_detection_table.verticalHeader().setVisible(False)
+        self.source_detection_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.source_detection_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.source_detection_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.source_detection_table.setColumnWidth(0, 220)
+        self.source_detection_table.setColumnWidth(2, 120)
+        self.source_detection_table.setMinimumHeight(220)
+        categories = load_source_detection_categories()
+        self.source_detection_table.setRowCount(len(categories))
+        for row, category in enumerate(categories):
+            label_item = QTableWidgetItem(clean(category.get("label")) or clean(category.get("key")))
+            label_item.setData(Qt.ItemDataRole.UserRole, clean(category.get("key")))
+            label_item.setData(Qt.ItemDataRole.UserRole + 1, bool(category.get("built_in")))
+            keyword_item = QTableWidgetItem(", ".join(category.get("keywords") or []))
+            kind_item = QTableWidgetItem("Built-in hint" if category.get("built_in") else "Custom hint")
+            kind_item.setFlags(kind_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if category.get("built_in"):
+                kind_item.setForeground(QColor(COLORS["muted"]))
+            self.source_detection_table.setItem(row, 0, label_item)
+            self.source_detection_table.setItem(row, 1, keyword_item)
+            self.source_detection_table.setItem(row, 2, kind_item)
+        detection_box.addWidget(self.source_detection_table)
+
         detection_actions = QHBoxLayout()
+        add_detection_btn = QPushButton("Add Category")
+        add_detection_btn.clicked.connect(self._add_source_detection_category)
+        remove_detection_btn = QPushButton("Remove Category")
+        remove_detection_btn.clicked.connect(self._remove_source_detection_category)
         save_detection_btn = QPushButton("Save Detection Rules")
+        save_detection_btn.setObjectName("Primary")
         save_detection_btn.clicked.connect(self.save_detection_rules)
-        detection_actions.addWidget(save_detection_btn)
+        detection_actions.addWidget(add_detection_btn)
+        detection_actions.addWidget(remove_detection_btn)
         detection_actions.addStretch()
+        detection_actions.addWidget(save_detection_btn)
         detection_box.addLayout(detection_actions)
         layout.addWidget(detection_card)
 
@@ -8700,18 +10980,66 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
-    def save_detection_rules(self):
-        if not hasattr(self, "source_detection_keyword_edits"):
+    def _add_source_detection_category(self):
+        if not hasattr(self, "source_detection_table"):
             return
-        payload = {
-            key: [part.strip() for part in edit.text().split(",") if part.strip()]
-            for key, edit in self.source_detection_keyword_edits.items()
-        }
-        save_source_detection_keywords(payload)
+        name, ok = QInputDialog.getText(
+            self, "Add Source Recognition Category",
+            "Category name (for recognition/display only):"
+        )
+        name = clean(name)
+        if not ok or not name:
+            return
+        row = self.source_detection_table.rowCount()
+        self.source_detection_table.insertRow(row)
+        label_item = QTableWidgetItem(name)
+        label_item.setData(Qt.ItemDataRole.UserRole, "")
+        label_item.setData(Qt.ItemDataRole.UserRole + 1, False)
+        self.source_detection_table.setItem(row, 0, label_item)
+        self.source_detection_table.setItem(row, 1, QTableWidgetItem(""))
+        kind_item = QTableWidgetItem("Custom hint")
+        kind_item.setFlags(kind_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.source_detection_table.setItem(row, 2, kind_item)
+        self.source_detection_table.setCurrentCell(row, 1)
+        self.source_detection_table.editItem(self.source_detection_table.item(row, 1))
+
+    def _remove_source_detection_category(self):
+        if not hasattr(self, "source_detection_table"):
+            return
+        row = self.source_detection_table.currentRow()
+        if row < 0:
+            return
+        label_item = self.source_detection_table.item(row, 0)
+        built_in = bool(label_item.data(Qt.ItemDataRole.UserRole + 1)) if label_item else False
+        if built_in:
+            QMessageBox.information(
+                self, "Source Detection Rules",
+                "Built-in recognition categories are kept for backward-compatible AUTO discovery. Clear their keywords to disable the filename hint; they are never mandatory."
+            )
+            return
+        self.source_detection_table.removeRow(row)
+
+    def save_detection_rules(self):
+        if not hasattr(self, "source_detection_table"):
+            return
+        categories = []
+        for row in range(self.source_detection_table.rowCount()):
+            label_item = self.source_detection_table.item(row, 0)
+            keyword_item = self.source_detection_table.item(row, 1)
+            label = clean(label_item.text() if label_item else "")
+            if not label:
+                continue
+            categories.append({
+                "key": clean(label_item.data(Qt.ItemDataRole.UserRole) if label_item else ""),
+                "label": label,
+                "keywords": [part.strip() for part in clean(keyword_item.text() if keyword_item else "").split(",") if part.strip()],
+                "built_in": bool(label_item.data(Qt.ItemDataRole.UserRole + 1)) if label_item else False,
+            })
+        save_source_detection_categories(categories)
         self._site_source_status_cache.clear()
         self._schema_validation_cache.clear()
         self.refresh_site_repository(force=True)
-        self.statusBar().showMessage("Source detection rules saved and repository re-scanned", 5000)
+        self.statusBar().showMessage("Source recognition hints saved. Filenames remain unrestricted.", 5000)
 
     def _refresh_standard_reference_ui(self):
         if not hasattr(self, "settings_standard_label"):
@@ -9384,6 +11712,17 @@ class MainWindow(QMainWindow):
             self._hide_busy_operation("nav-review-load")
 
     def _mark_site_pages_dirty(self) -> None:
+        # Site/source changes invalidate the in-memory Equipment Review session.
+        # Ordinary reviewer edits use _dirty_pages.update(...) directly and keep
+        # this session hot, so only true site/source invalidation clears it.
+        self._comparison_dataset_ready = False
+        self._comparison_row_cache.clear()
+        self._comparison_entry_cache.clear()
+        self._comparison_row_index_cache.clear()
+        self._comparison_review_map_cache.clear()
+        self._comparison_resolution_map_cache.clear()
+        self._comparison_last_entries = []
+        self._comparison_action_tracking_keys.clear()
         # Site Data Sources itself is refreshed immediately because the reviewer
         # is usually selecting a site from that page.  Everything else can wait
         # until its module is opened.
@@ -9919,12 +12258,11 @@ class MainWindow(QMainWindow):
         self.repository_sites = scan_repository(self.repository_root, deep=bool(deep)) if self.repository_root else []
         if hasattr(self, "repository_root_edit"):
             self.repository_root_edit.setText(str(self.repository_root) if self.repository_root else "")
-        ready = sum(1 for site in self.repository_sites if site.ready)
         if hasattr(self, "repository_summary"):
             self.repository_summary.setText(
-                f"{len(self.repository_sites)} 个站点 · {ready} 个就绪"
+                f"{len(self.repository_sites)} 个站点 · 数据源数量按站点自由配置"
                 if self.ui_language == LANG_ZH_CN else
-                f"{len(self.repository_sites)} sites · {ready} ready"
+                f"{len(self.repository_sites)} sites · source count is configurable per site"
             )
         if hasattr(self, "repository_last_scan"):
             self.repository_last_scan.setText(ui_tr("Last scan: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.ui_language))
@@ -9945,32 +12283,26 @@ class MainWindow(QMainWindow):
             if term and term not in site.name.casefold():
                 continue
             visible_sites.append(site)
-            manual_keys = set()
+            # Equipment Data Review uses a configurable source count.
+            # The station list reports only whether tabular files are available
+            # or a configurable review is already defined; no fixed-role count
+            # or legacy missing-role list is rendered.
+            # A site may organize inputs under arbitrary nested folders.
+            # Never derive this status from the legacy root-only source-role
+            # resolver; recursively inspect the actual site tree instead.
+            has_tabular_files = site_has_tabular_files(site.path)
+            current_site_configured = False
             if (
                 self.store
                 and self.store.config.get("repository_site", "").casefold() == site.name.casefold()
             ):
-                manual_keys = {
-                    key for key in self.store.manual_source_overrides()
-                    if self.store.source_path(key) is not None
-                }
-            effective_sources = set(site.sources) | manual_keys
-            present = len(effective_sources)
-            required_keys = {definition.key for definition in SOURCE_DEFINITIONS if definition.required}
-            missing_required = sorted(required_keys - effective_sources)
-            ready = not missing_required
-            missing_bits = list(missing_required)
-            status = "READY" if ready else "PARTIAL"
+                current_config = get_equipment_comparison_config(self.store, bootstrap=False)
+                current_site_configured = bool(current_config.get("sources"))
+            status = "CONFIGURED" if current_site_configured else ("CONFIGURABLE" if has_tabular_files else "NO TABULAR FILES")
             display_status = ui_tr(status, self.ui_language)
-            if self.ui_language == LANG_ZH_CN:
-                missing = "" if ready else " · 未映射 " + ", ".join(missing_bits)
-                source_count_text = f"{present}/{len(SOURCE_DEFINITIONS)} 个数据源"
-            else:
-                missing = "" if ready else " · unmapped " + ", ".join(missing_bits)
-                source_count_text = f"{present}/{len(SOURCE_DEFINITIONS)} sources"
-            item = QListWidgetItem(f"{site.name}\n{display_status} · {source_count_text}{missing}")
+            item = QListWidgetItem(f"{site.name}\n{display_status}")
             item.setData(Qt.ItemDataRole.UserRole, site.name)
-            item.setForeground(QColor(COLORS["success"] if ready else COLORS["warning"]))
+            item.setForeground(QColor(COLORS["success"] if (current_site_configured or has_tabular_files) else COLORS["warning"]))
             self.site_list.addItem(item)
             if preferred_name and site.name.casefold() == str(preferred_name).casefold():
                 selected_row = self.site_list.count() - 1
@@ -10061,11 +12393,42 @@ class MainWindow(QMainWindow):
             self._site_source_status_cache[site.name.casefold()] = (status_cache_key, statuses)
 
         effective_present = {key for key, info in statuses.items() if info.get("path")}
+        if active_store:
+            for signal_role in ("ioa", "adms_sld"):
+                assigned = resolve_configurable_signal_assignment(active_store, signal_role)
+                if assigned is not None and Path(assigned).exists():
+                    effective_present.add(signal_role)
         required_keys = {definition.key for definition in SOURCE_DEFINITIONS if definition.required}
         pending_source_mappings = dict((active_store.config.get("pending_source_mappings", {}) or {}) if active_store else {})
+
+        # v0.8.178: once this site has an explicit configurable Equipment Data
+        # Review definition, the old SE/ZENON/ADMS equipment-role filenames are
+        # no longer prerequisites for site readiness.  Signal Mapping remains
+        # untouched and therefore continues to require only its own historical
+        # site sources (for example IOA + ADMS SLD).
+        comparison_config = get_equipment_comparison_config(active_store, bootstrap=False) if active_store else {"sources": []}
+        configured_equipment_ready = True
+        if comparison_config.get("sources"):
+            signal_module = next((item for item in MODULE_SOURCE_GROUPS if item.key == "signal_mapping"), None)
+            signal_required = {
+                ref.source_type for ref in (signal_module.tables if signal_module else ())
+                if ref.source_type != "standard_reference"
+            }
+            required_keys = required_keys & signal_required
+            configured_status = configurable_comparison_status(active_store, comparison_config)
+            enabled_configured_status = [
+                item for item in configured_status
+                if bool((item.get("source") or {}).get("enabled", True))
+            ]
+            configured_equipment_ready = (
+                bool(enabled_configured_status)
+                and bool(comparison_config.get("comparisons"))
+                and all(clean(item.get("status")).upper() == "READY" for item in enabled_configured_status)
+            )
+
         pending_required = required_keys & set(pending_source_mappings)
-        effective_ready = required_keys.issubset(effective_present) and not pending_required
-        self.site_status_label.setText("READY" if effective_ready else "PARTIAL")
+        effective_ready = required_keys.issubset(effective_present) and not pending_required and configured_equipment_ready
+        self.site_status_label.setText(ui_tr("READY" if effective_ready else "PARTIAL", self.ui_language))
         self.site_status_label.setStyleSheet(
             f"font-weight:700;color:{COLORS['success'] if effective_ready else COLORS['warning']};"
         )
@@ -10084,6 +12447,67 @@ class MainWindow(QMainWindow):
 
         for module in MODULE_SOURCE_GROUPS:
             table = self.module_source_tables[module.key]
+
+            # v0.8.178: Equipment Data Review no longer exposes five fixed App
+            # source roles. The table is generated from this site's own arbitrary
+            # CSV/XLSX source configuration. Signal Mapping keeps its historical
+            # source contract unchanged.
+            if module.key == "rmu_review":
+                config = get_equipment_comparison_config(active_store, bootstrap=False) if active_store else {"sources": [], "comparisons": []}
+                configured_rows = configurable_comparison_status(active_store, config) if active_store and config.get("sources") else []
+                if not configured_rows:
+                    table.setRowCount(1)
+                    name_item = QTableWidgetItem(ui_tr("Configurable Equipment Comparison", self.ui_language))
+                    name_item.setData(Qt.ItemDataRole.UserRole, "equipment_configurable")
+                    table.setItem(0, 0, name_item)
+                    configure_btn = QPushButton(ui_tr("Configure Sources...", self.ui_language))
+                    configure_btn.setObjectName("InlineSourceFile")
+                    configure_btn.clicked.connect(self.open_equipment_comparison_config)
+                    table.setCellWidget(0, 1, configure_btn)
+                    table.setItem(0, 2, QTableWidgetItem(ui_tr("Any CSV / Excel", self.ui_language)))
+                    table.setItem(0, 3, QTableWidgetItem(ui_tr("Add any number of files; each site has its own configuration", self.ui_language)))
+                    table.setItem(0, 4, QTableWidgetItem(ui_tr("Choose each table's Key / Index and define any comparison fields. All source fields show by default.", self.ui_language)))
+                    status_item = QTableWidgetItem(ui_tr("NOT CONFIGURED", self.ui_language))
+                    status_item.setForeground(QColor(COLORS["warning"]))
+                    table.setItem(0, 5, status_item)
+                else:
+                    table.setRowCount(len(configured_rows))
+                    for row, info in enumerate(configured_rows):
+                        source = info.get("source") or {}
+                        path = info.get("path")
+                        title = clean(source.get("title")) or (Path(path).stem if path else "Source")
+                        columns = tuple(info.get("columns") or ())
+                        key_id = clean(source.get("key_column"))
+                        key_label = next((column.label for column in columns if column.id == key_id), ui_tr("Key not set", self.ui_language))
+                        hidden = set(source.get("hidden_columns") or [])
+                        shown_count = sum(column.id not in hidden for column in columns)
+                        source_item = QTableWidgetItem(title)
+                        source_item.setData(Qt.ItemDataRole.UserRole, source.get("id"))
+                        table.setItem(row, 0, source_item)
+                        configure_btn = QPushButton(Path(path).name if path else ui_tr("Configure Sources...", self.ui_language))
+                        configure_btn.setObjectName("InlineSourceFile")
+                        configure_btn.setToolTip(ui_tr("Open the site-local configurable comparison editor", self.ui_language))
+                        configure_btn.clicked.connect(self.open_equipment_comparison_config)
+                        table.setCellWidget(row, 1, configure_btn)
+                        sheet_text = clean(source.get("sheet_name")) or ("CSV" if path and Path(path).suffix.lower() == ".csv" else "AUTO")
+                        table.setItem(row, 2, QTableWidgetItem(sheet_text))
+                        table.setItem(row, 3, QTableWidgetItem(str(path or "—")))
+                        compare_count = int(info.get("compare_count") or 0)
+                        detail = (
+                            f"主键：{key_label} · 比较规则：{compare_count} · 显示字段：{shown_count}/{len(columns)}"
+                            if self.ui_language == LANG_ZH_CN else
+                            f"Key: {key_label} · Compare rules: {compare_count} · Shown: {shown_count}/{len(columns)} fields"
+                        )
+                        table.setItem(row, 4, QTableWidgetItem(detail))
+                        status_text = clean(info.get("status")) or "READY"
+                        status_item = QTableWidgetItem(ui_tr(status_text, self.ui_language))
+                        status_item.setForeground(QColor(COLORS["success"] if status_text == "READY" else COLORS["warning"] if status_text != "MISSING" else COLORS["danger"]))
+                        status_item.setToolTip(clean(info.get("error")))
+                        table.setItem(row, 5, status_item)
+                if table.rowCount() and table.currentRow() < 0:
+                    table.setCurrentCell(0, 0)
+                continue
+
             table.setRowCount(len(module.tables))
             for row, ref in enumerate(module.tables):
                 source_type = ref.source_type
@@ -10231,7 +12655,7 @@ class MainWindow(QMainWindow):
                 elif path and Path(path).suffix.lower() in {".xlsx", ".xlsm"}:
                     preferred_sheet = active_store.source_sheet_name(source_type) if active_store and hasattr(active_store, "source_sheet_name") else ""
                     try:
-                        resolved_sheet = resolve_excel_sheet_name(Path(path), preferred_sheet or None)
+                        resolved_sheet = resolve_source_excel_sheet_name(source_type, Path(path), preferred_sheet or None)
                         sheet_display = (f"MANUAL → {resolved_sheet}" if preferred_sheet and resolved_sheet.casefold() == preferred_sheet.casefold() else f"AUTO → {resolved_sheet}")
                     except Exception:
                         sheet_display = "SHEET ERROR"
@@ -10351,13 +12775,26 @@ class MainWindow(QMainWindow):
         return None
 
     def _detect_live_source_changes(self) -> tuple[SiteInfo | None, list[str], tuple]:
-        """Cheap stat-only change detection for the active site's live inputs."""
+        """Cheap change detection for the active site's live inputs.
+
+        Configurable sources are direct file links. Their watcher compares the
+        real file path/size/mtime (including AUTO-family path switches) and never
+        compares or refreshes a workspace copy. Legacy projects retain the old
+        snapshot-compatible watcher until they save a configurable source set.
+        """
         if not self.repository_root or not self.selected_site or not self.store:
             return None, [], ()
         try:
             site = _load_repository_site(self.repository_root, self.selected_site.name, deep=False)
         except Exception:
             return None, [], ()
+
+        configurable = get_equipment_comparison_config(self.store, bootstrap=False)
+        if configurable.get("sources"):
+            changed, direct_signature = configured_live_source_changes(self.store)
+            signature = (site.name, "DIRECT", direct_signature, tuple(changed))
+            return site, list(changed), signature
+
         baseline = dict(self.store.config.get("live_source_metadata", {}) or {})
         changed: list[str] = []
         signature_parts = []
@@ -10387,9 +12824,6 @@ class MainWindow(QMainWindow):
                 ):
                     changed.append(key)
                 continue
-            # Upgrade compatibility: older workspaces have no live_source_metadata.
-            # Their internal snapshot was created with copy2(), so size/mtime are
-            # enough to detect whether the live file changed since it was loaded.
             if stored is None:
                 changed.append(key)
                 continue
@@ -10420,9 +12854,85 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Source change detected · " + ", ".join(changed) + " · refreshing in background", 5000
         )
-        self._reload_live_sources(
-            changed, task_key="source-auto-refresh", quiet=True,
-            label=f"Refreshing changed {site.name} sources",
+        configurable = get_equipment_comparison_config(self.store, bootstrap=False) if self.store else {}
+        if configurable.get("sources"):
+            self._reload_configurable_live_sources(
+                changed, task_key="source-auto-refresh", quiet=True,
+                label=f"Refreshing changed {site.name} live sources",
+            )
+        else:
+            self._reload_live_sources(
+                changed, task_key="source-auto-refresh", quiet=True,
+                label=f"Refreshing changed {site.name} sources",
+            )
+
+    def _reload_configurable_live_sources(
+        self, changed_keys, *, task_key: str = "source-auto-refresh", quiet: bool = False, label: str = ""
+    ) -> bool:
+        """Re-read configured files in place; never import/copy a source file."""
+        keys = [clean(key) for key in changed_keys if clean(key)]
+        if not keys or not self.selected_site or not self.repository_root:
+            return False
+        if self._source_pipeline_busy():
+            if not quiet:
+                self.statusBar().showMessage(
+                    ui_tr("Source processing is already running. Please wait for it to finish.", self.ui_language), 4000
+                )
+            return False
+        self._activate_site_workspace(self.selected_site)
+        if not self.store:
+            return False
+        site_name = self.selected_site.name
+        project_folder = str(self.store.folder)
+        repository_root = str(self.repository_root)
+        task_label = label or f"Refreshing {len(keys)} live source(s)"
+
+        def success(result: dict):
+            result_site = result.get("site")
+            if result_site is None:
+                return
+            report = result.get("signal_report")
+            if self.selected_site and self.selected_site.name == site_name:
+                self._reopen_active_store_after_worker(result_site)
+                self._active_site_signature = self._site_metadata_signature(result_site)
+                self._site_source_status_cache.clear()
+                self._schema_validation_cache.clear()
+                if report is not None:
+                    self.db_smart_report = report
+                    self._db_smart_report_site = site_name
+                    self._db_smart_ui_ready = False
+                self._mark_site_pages_dirty()
+                self._refresh_site_source_table(validate_schema=False)
+                self.refresh_dashboard()
+                self._dirty_pages.discard(0)
+                current_index = self.stack.currentIndex() if hasattr(self, "stack") else 1
+                if current_index in {2, 3}:
+                    self._refresh_page_if_dirty(current_index)
+                if current_index == 4:
+                    self.refresh_changes()
+            self._source_watch_last_trigger = ()
+            changed_text = ", ".join(result.get("changed_keys") or keys)
+            self.statusBar().showMessage(
+                ui_tr(f"Live source refreshed · {changed_text} · Validation required", self.ui_language),
+                7000,
+            )
+
+        def failed(details: str):
+            self._source_watch_last_trigger = ()
+            last_line = next((line for line in reversed(details.strip().splitlines()) if line.strip()), details)
+            if quiet:
+                self.statusBar().showMessage(
+                    ui_tr(f"Automatic live-source refresh failed · {last_line}", self.ui_language), 9000
+                )
+            else:
+                QMessageBox.warning(self, "Live Source", f"Direct source reload failed:\n{last_line}")
+
+        return self._start_background_task(
+            task_key, task_label,
+            lambda progress: _background_reload_configurable_live_sources_job(
+                project_folder, repository_root, site_name, keys, progress
+            ),
+            success, on_error=failed, with_progress=True,
         )
 
     def _reload_live_sources(
@@ -10658,7 +13168,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Source Sheet", "The workbook contains no worksheets.")
             return
         preferred = self.store.source_sheet_name(source_type) if hasattr(self.store, "source_sheet_name") else ""
-        auto_name = resolve_excel_sheet_name(Path(path), None)
+        auto_name = resolve_source_excel_sheet_name(source_type, Path(path), None)
         labels = [f"AUTO → {auto_name}"]
         values = [None]
         for info in sheets:
@@ -10673,7 +13183,7 @@ class MainWindow(QMainWindow):
                     break
         selected_label, ok = QInputDialog.getItem(
             self, "Source Sheet",
-            f"{label}\n\nAUTO uses the first usable sheet in workbook order. "
+            f"{label}\n\nAUTO uses the source-preferred business sheet when available; otherwise it uses the first usable sheet in workbook order. "
             "A manual sheet selection applies only to this site/source file; global App-field mappings are unchanged.",
             labels, start_index, False,
         )
@@ -10905,6 +13415,11 @@ class MainWindow(QMainWindow):
             return
         if dialog.exec() != QDialog.Accepted:
             return
+        # Visibility/display-name edits are presentation metadata and can update
+        # the open Equipment Data Review header immediately; the authoritative
+        # source-data reload continues in the background below.
+        if hasattr(self, "comparison_table"):
+            self._configure_comparison_headers()
         try:
             after_custom_keys = {
                 clean(item.get("field_key"))
@@ -10926,11 +13441,55 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Source Mapping", f"{type(exc).__name__}: {exc}")
 
+    def open_equipment_comparison_config(self, *_args):
+        """Edit this site's arbitrary Equipment Data Review source contract."""
+        if not self.selected_site or not self.store:
+            QMessageBox.information(self, "Equipment Comparison", "Select a site first.")
+            return
+        try:
+            dialog = ConfigurableEquipmentComparisonDialog(self.store, self.user_name, self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Equipment Comparison", f"{type(exc).__name__}: {exc}")
+            return
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            rows, _summary = build_equipment_source_view(self.store, "__ALL__")
+            # Replace the persisted projection even when the new configuration
+            # currently yields zero rows, so stale rows from the previous source
+            # contract can never remain visible.
+            self.store.save_comparison(rows)
+            remember_configured_live_source_metadata(self.store)
+            self._mark_site_pages_dirty()
+            self._dirty_pages.add(2)
+            self._refresh_site_source_table(validate_schema=False)
+            if hasattr(self, "comparison_table"):
+                self._refresh_equipment_profile_options(force=True)
+                self._refresh_analysis_filter_options()
+                self._configure_comparison_headers()
+            if hasattr(self, "stack") and self.stack.currentIndex() == 2:
+                self.refresh_comparison()
+            self.refresh_dashboard()
+            config = get_equipment_comparison_config(self.store, bootstrap=False)
+            source_count = sum(bool(item.get("enabled", True)) for item in config.get("sources", []))
+            comparison_count = len(config.get("comparisons", []))
+            message = (
+                f"设备对比已更新 · 已启用 {source_count} 个数据源 · {comparison_count} 个比较字段 · {len(rows)} 条索引记录"
+                if self.ui_language == LANG_ZH_CN else
+                f"Equipment comparison updated · {source_count} enabled source(s) · {comparison_count} comparison field(s) · {len(rows)} key row(s)"
+            )
+            self.statusBar().showMessage(message, 7000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Equipment Comparison", f"Configuration was saved, but rebuilding the review failed:\n{type(exc).__name__}: {exc}")
+
     def open_source_mapping(self, *_args):
         if not self.selected_site or not self.store:
             QMessageBox.information(self, "Source Mapping", "Select a site first.")
             return
         module, ref, _table = self._current_module_source_selection()
+        if module is not None and module.key == "rmu_review":
+            self.open_equipment_comparison_config()
+            return
         if ref is None:
             QMessageBox.information(self, "Source Mapping", "Select a table in the current module first.")
             return
@@ -10960,6 +13519,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Source Mapping", f"{type(exc).__name__}: {exc}")
             return
         if dialog.exec() == QDialog.Accepted:
+            # Apply Map Fields Show/Hide and App-label changes to the review
+            # header immediately.  Data values are refreshed asynchronously.
+            if hasattr(self, "comparison_table"):
+                self._configure_comparison_headers()
             after_custom_keys = {
                 clean(item.get("field_key"))
                 for item in (self.store.custom_source_fields(source_type) or [])
@@ -11259,11 +13822,21 @@ class MainWindow(QMainWindow):
 
             changed = ", ".join(result.get("changed_keys") or []) or "none"
             issue_fields = result.get("issue_fields") or {}
-            breakdown = " · ".join(
-                f"{name} {issue_fields.get(name, 0)}"
-                for name in ("NAME", "FEEDER", "SMART", "TYPE", "IP")
-                if issue_fields.get(name, 0)
-            ) or "No analysis mismatches"
+            issue_labels = result.get("issue_field_labels") or {}
+            issue_order = list(result.get("issue_field_order") or [])
+            if issue_order:
+                ordered_issue_ids = issue_order + [key for key in issue_fields if key not in issue_order]
+                breakdown = " · ".join(
+                    f"{issue_labels.get(field_id) or field_id} {issue_fields.get(field_id, 0)}"
+                    for field_id in ordered_issue_ids
+                    if issue_fields.get(field_id, 0)
+                ) or "No analysis mismatches"
+            else:
+                breakdown = " · ".join(
+                    f"{name} {issue_fields.get(name, 0)}"
+                    for name in ("NAME", "FEEDER", "SMART", "TYPE", "IP")
+                    if issue_fields.get(name, 0)
+                ) or "No analysis mismatches"
             report_obj = result.get("signal_report")
             if report_obj is not None:
                 signal_text = (
@@ -11315,6 +13888,9 @@ class MainWindow(QMainWindow):
         if not self.store:
             return None
         key = clean(rmu)
+        cached = getattr(self, "_comparison_row_cache", {}).get(key)
+        if cached is not None:
+            return dict(cached)
         # Prefer the universal five-source row currently rendered. RMU still
         # uses its historical raw review key, while other classes use EQ::<TYPE>
         # namespaces, so no prior review history can collide or be lost.
@@ -11356,17 +13932,18 @@ class MainWindow(QMainWindow):
         return "RMU"
 
     def _refresh_comparison_resolution_progress_only(self) -> None:
-        """Refresh Resolution counters from the current universal review rows."""
-        if not self.store or not hasattr(self, "comparison_review_progress"):
+        """Refresh Resolution counters entirely from the active in-memory session."""
+        if not hasattr(self, "comparison_review_progress"):
             return
-        rows = list(getattr(self, "_comparison_last_rows", []) or [])
-        if not rows:
+        entries = list(getattr(self, "_comparison_last_entries", []) or [])
+        if not entries:
             return
-        all_resolutions = self.store.rmu_resolution_map()
+        all_resolutions = getattr(self, "_comparison_resolution_map_cache", {}) or {}
         total_issue_decisions = resolved_issue_decisions = needs_action_decisions = 0
-        for row in rows:
-            review_key = clean(row.get("review_key") or row.get("rmu"))
-            state = analysis_review_state(row)
+        for entry in entries:
+            data = (entry or {}).get("data") or {}
+            review_key = clean(data.get("review_key") or data.get("rmu"))
+            state = (entry or {}).get("state") or analysis_review_state(data)
             saved = all_resolutions.get(review_key, {}) if isinstance(all_resolutions, dict) else {}
             for field in state.false_fields:
                 total_issue_decisions += 1
@@ -11396,38 +13973,42 @@ class MainWindow(QMainWindow):
         data = self._comparison_row_by_rmu(rmu)
         if not data:
             return
-        review_record = self.store.rmu_review_map().get(rmu, {})
+        review_record = self.store.rmu_review_record(rmu)
+        self._comparison_review_map_cache[clean(rmu)] = dict(review_record or {})
         review_status = rmu_review_display_status(data, review_record)
         state = analysis_review_state(data)
-        summary = self.store.rmu_resolution_review_text(rmu) if state.issue_count > 0 else clean(review_record.get("manual_comment"))
+        if state.issue_count > 0:
+            latest_resolution = self.store.rmu_resolution_map(rmu)
+            self._comparison_resolution_map_cache[clean(rmu)] = dict(latest_resolution or {})
+            summary = self.store.rmu_resolution_review_text(rmu)
+        else:
+            summary = clean(review_record.get("manual_comment"))
+        entry = (getattr(self, "_comparison_entry_cache", {}) or {}).get(clean(rmu))
+        if isinstance(entry, dict):
+            entry["review_status"] = review_status
+            entry["manual_review_comment"] = clean(review_record.get("manual_comment"))
+            entry["resolution_summary"] = summary if state.issue_count > 0 else ""
+            entry["resolution_display"] = summary
 
         columns = self._comparison_columns()
         rmu_col = next((i for i, (key, _label, _width) in enumerate(columns) if key == "rmu"), -1)
         comments_col = next((i for i, (key, _label, _width) in enumerate(columns) if key == "comments"), -1)
-        target_row = -1
-        if rmu_col >= 0:
+        target_row = int((getattr(self, "_comparison_row_index_cache", {}) or {}).get(clean(rmu), -1))
+        if target_row < 0 and rmu_col >= 0:
             for row_index in range(self.comparison_table.rowCount()):
                 item = self.comparison_table.item(row_index, rmu_col)
                 item_key = clean(item.data(Qt.UserRole) if item else "") or clean(item.text() if item else "")
                 if item_key == clean(rmu):
                     target_row = row_index
+                    self._comparison_row_index_cache[clean(rmu)] = row_index
                     break
         if target_row < 0:
             if refresh_progress:
                 self._refresh_comparison_resolution_progress_only()
             return
 
-        # If the user is viewing a specific Review filter and the saved state no
-        # longer belongs in that filter, remove only that row immediately.
-        active_filter = clean(self.rmu_review_filter_combo.currentData()) if hasattr(self, "rmu_review_filter_combo") else "ALL REVIEWS"
-        if active_filter != "ALL REVIEWS" and review_status != active_filter:
-            self.comparison_table.removeRow(target_row)
-            if hasattr(self, "comparison_locator") and target_row < self.comparison_locator.rowCount():
-                self.comparison_locator.removeRow(target_row)
-            self._sync_comparison_locator_geometry()
-            if refresh_progress:
-                self._refresh_comparison_resolution_progress_only()
-            return
+        # Filters are presentation-only in v0.8.196. Never remove physical rows
+        # from the cached session; local filtering will hide/show this row.
 
         if comments_col >= 0:
             item = self.comparison_table.item(target_row, comments_col) or QTableWidgetItem()
@@ -11466,34 +14047,113 @@ class MainWindow(QMainWindow):
 
         if refresh_progress:
             self._refresh_comparison_resolution_progress_only()
+        self._apply_comparison_filters_local()
         # Audit, history, report and dashboard are now stale, but there is no
         # reason to rebuild the currently visible RMU grid. They refresh lazily
         # when opened.
         self._dirty_pages.update({0, 4, 5, 6, 7})
 
-    def _refresh_comparison_summary_only(self) -> None:
-        """Refresh universal Equipment Review counters without rebuilding source cells."""
-        if not self.store or not hasattr(self, "comparison_summary"):
+    @staticmethod
+    def _comparison_analysis_filter_match(entry: dict, analysis_filter: str) -> bool:
+        analysis_filter = clean(analysis_filter) or "ALL ANALYSIS"
+        if analysis_filter == "ALL ANALYSIS":
+            return True
+        data = (entry or {}).get("data") or {}
+        state = (entry or {}).get("state") or analysis_review_state(data)
+        false_keys = {clean(value).upper() for value in state.false_fields}
+        if analysis_filter == "PASSED":
+            return state.is_pass
+        if analysis_filter == "ANY MISMATCH":
+            return state.issue_count > 0
+        if analysis_filter == "1 ISSUE":
+            return state.issue_count == 1
+        if analysis_filter == "2 ISSUES":
+            return state.issue_count == 2
+        if analysis_filter == "MULTIPLE ISSUES":
+            return state.issue_count >= 3
+        if analysis_filter == "CRITICAL":
+            return state.is_critical
+        if analysis_filter.startswith("RULE::"):
+            return analysis_filter.split("::", 1)[1].upper() in false_keys
+        if analysis_filter.endswith(" MISMATCH"):
+            return analysis_filter.removesuffix(" MISMATCH") in false_keys
+        return True
+
+    def _apply_comparison_filters_local(self, *_args) -> None:
+        """Apply search/review/analysis filters by hiding existing rows only.
+
+        No source parse, SQLite map scan, worker process, QTableWidgetItem rebuild
+        or Analysis recalculation is allowed on this hot interaction path.
+        """
+        if not getattr(self, "_comparison_dataset_ready", False):
             return
-        rows = list(getattr(self, "_comparison_last_rows", []) or [])
-        if not rows:
+        if not hasattr(self, "comparison_table"):
+            return
+        entries = list(getattr(self, "_comparison_last_entries", []) or [])
+        if len(entries) != self.comparison_table.rowCount():
+            return
+        term_cf = self.search_edit.text().strip().casefold() if hasattr(self, "search_edit") else ""
+        search_field = (self.comparison_search_field.currentData() if hasattr(self, "comparison_search_field") else "*") or "*"
+        review_filter = clean(self.rmu_review_filter_combo.currentData()) if hasattr(self, "rmu_review_filter_combo") else "ALL REVIEWS"
+        analysis_filter = clean(self.analysis_combo.currentData()) if hasattr(self, "analysis_combo") else "ALL ANALYSIS"
+        columns = tuple(self._comparison_columns())
+        column_keys = [clean(item[0]) for item in columns if item]
+        review_map = getattr(self, "_comparison_review_map_cache", {}) or {}
+        visible_count = 0
+        for row_index, entry in enumerate(entries):
+            data = (entry or {}).get("data") or {}
+            review_key = clean(data.get("review_key") or data.get("rmu"))
+            review_status = rmu_review_display_status(data, review_map.get(review_key, {}))
+            matches = review_filter in {"", "ALL REVIEWS"} or review_status == review_filter
+            if matches:
+                matches = self._comparison_analysis_filter_match(entry, analysis_filter)
+            if matches and term_cf:
+                review_text = clean((entry or {}).get("resolution_display"))
+                if search_field == "comments":
+                    searchable = review_text
+                elif search_field and search_field != "*":
+                    searchable = clean(data.get(search_field))
+                else:
+                    searchable = " | ".join(clean(data.get(key)) for key in column_keys) + " | " + review_text
+                matches = term_cf in searchable.casefold()
+            hidden = not matches
+            if self.comparison_table.isRowHidden(row_index) != hidden:
+                self.comparison_table.setRowHidden(row_index, hidden)
+            if hasattr(self, "comparison_locator") and row_index < self.comparison_locator.rowCount():
+                if self.comparison_locator.isRowHidden(row_index) != hidden:
+                    self.comparison_locator.setRowHidden(row_index, hidden)
+            if matches:
+                visible_count += 1
+        self._refresh_comparison_summary_only(shown_override=visible_count)
+
+    def _refresh_comparison_summary_only(self, *, shown_override: int | None = None) -> None:
+        """Refresh Equipment Review counters from cached states/maps only."""
+        if not hasattr(self, "comparison_summary"):
+            return
+        entries = list(getattr(self, "_comparison_last_entries", []) or [])
+        if not entries:
             return
         profile = self._current_equipment_profile()
-        review_map = self.store.rmu_review_map()
-        review_counts = Counter(
-            rmu_review_display_status(
-                row, review_map.get(clean(row.get("review_key") or row.get("rmu")), {})
-            )
-            for row in rows
-        )
-        pass_rows = sum(analysis_review_state(row).is_pass for row in rows)
-        issue_rows = sum(analysis_review_state(row).issue_count > 0 for row in rows)
-        shown = self.comparison_table.rowCount() if hasattr(self, "comparison_table") else len(rows)
-        coverage_counts = Counter(clean(row.get("equipment_source_count")) or "0/5" for row in rows)
+        review_map = getattr(self, "_comparison_review_map_cache", {}) or {}
+        review_counts = Counter()
+        pass_rows = issue_rows = 0
+        coverage_counts = Counter()
+        for entry in entries:
+            row = (entry or {}).get("data") or {}
+            key = clean(row.get("review_key") or row.get("rmu"))
+            review_counts[rmu_review_display_status(row, review_map.get(key, {}))] += 1
+            state = (entry or {}).get("state") or analysis_review_state(row)
+            pass_rows += int(bool(state.is_pass))
+            issue_rows += int(state.issue_count > 0)
+            coverage_counts[clean(row.get("equipment_source_count")) or "0/0"] += 1
+        if shown_override is None:
+            shown = sum(not self.comparison_table.isRowHidden(i) for i in range(self.comparison_table.rowCount()))
+        else:
+            shown = int(shown_override)
         coverage_text = " · ".join(f"{key} {value}" for key, value in sorted(coverage_counts.items(), reverse=True))
         label = "ALL EQUIPMENT" if profile == "__ALL__" else profile
         summary = (
-            f"{label} · Total {len(rows)} · Shown {shown} · Pass {pass_rows} · With Issues {issue_rows} · "
+            f"{label} · Total {len(entries)} · Shown {shown} · Pass {pass_rows} · With Issues {issue_rows} · "
             f"Unreviewed {review_counts.get('UNREVIEWED', 0)} · Closed {review_counts.get('CLOSED', 0)} · "
             f"Needs Action {review_counts.get('NEEDS ACTION', 0)} · Sources {coverage_text or 'No source coverage'}"
         )
@@ -11533,7 +14193,9 @@ class MainWindow(QMainWindow):
                 self._refresh_comparison_resolution_row(rmu)
                 self._select_comparison_rmu(rmu)
                 self._schedule_comparison_lifecycle_refresh()
-                self.refresh_site_history()
+                # Site History can contain thousands of audit/lifecycle cells.
+                # Mark it dirty and rebuild only when that page is opened.
+                self._dirty_pages.update({0, 4, 5, 6, 7})
             self.statusBar().showMessage(
                 f"{self._equipment_type_from_key(rmu, data)} {display_name} Resolution saved · Review: {result.get('review_status', '')} · {result.get('summary', '')}",
                 7000,
@@ -11597,20 +14259,60 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Add Equipment Review Comment", f"{type(exc).__name__}: {exc}")
             return False
 
+        # A comment changes neither automatic Analysis nor Review counters.
+        # Patch only the selected row and selected-equipment timeline; expensive
+        # history/dashboard/report pages are refreshed lazily on navigation.
         self._refresh_comparison_resolution_row(rmu, refresh_progress=False)
-        self._refresh_comparison_summary_only()
-        self._refresh_comparison_resolution_progress_only()
         self._select_comparison_rmu(rmu)
-        self.refresh_site_history()
         self._schedule_comparison_lifecycle_refresh()
+        self._dirty_pages.update({0, 4, 5, 6, 7})
         total = len(history) + 1
         self.statusBar().showMessage(
             f"{device_type} {display_name} Review comment added · history {total} record(s) · previous comments retained", 6000
         )
         return True
 
+    def _patch_cached_review_status(self, review_key: str, status: str) -> None:
+        """Optimistically patch one visible review status without touching SQLite."""
+        key = clean(review_key)
+        if not key:
+            return
+        value = normalize_review_status(status)
+        record = dict((getattr(self, "_comparison_review_map_cache", {}) or {}).get(key, {}))
+        record.update({
+            "rmu": key,
+            "review_status": value,
+            "reviewed_by": self.user_name or "User",
+            "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        self._comparison_review_map_cache[key] = record
+        entry = (getattr(self, "_comparison_entry_cache", {}) or {}).get(key)
+        if isinstance(entry, dict):
+            entry["review_status"] = value
+        row_index = (getattr(self, "_comparison_row_index_cache", {}) or {}).get(key, -1)
+        if row_index is None or row_index < 0:
+            return
+        if hasattr(self, "comparison_locator") and row_index < self.comparison_locator.rowCount():
+            data = (entry or {}).get("data") if isinstance(entry, dict) else self._comparison_row_cache.get(key, {})
+            data = data or {}
+            state = (entry or {}).get("state") if isinstance(entry, dict) else None
+            state = state or analysis_review_state(data)
+            label, review_fill, review_text = _review_visual(value)
+            item = self.comparison_locator.item(row_index, 4) or QTableWidgetItem()
+            item.setText(label)
+            item.setBackground(review_fill)
+            item.setForeground(review_text)
+            item.setTextAlignment(Qt.AlignCenter)
+            font = item.font(); font.setBold(True); item.setFont(font)
+            item.setToolTip(
+                f"{self._equipment_type_from_key(key, data)} {self._equipment_display_name(key, data)} · "
+                f"Analysis: {state.row_label} · Review: {value}"
+                + (f" · Mismatch: {', '.join(state.false_fields)}" if state.false_fields else "")
+            )
+            self.comparison_locator.setItem(row_index, 4, item)
+
     def set_comparison_review_status(self, requested_status: str | None = None):
-        """Set one of the three Equipment Data Review states."""
+        """Set Equipment Review state optimistically, then persist in background."""
         if not self.store:
             return
         rmus = self._selected_comparison_rmus()
@@ -11619,18 +14321,14 @@ class MainWindow(QMainWindow):
             return
 
         options = ["Unreviewed", "Closed", "Needs Action"]
-        value_by_label = {
-            "Unreviewed": "UNREVIEWED",
-            "Closed": "CLOSED",
-            "Needs Action": "NEEDS ACTION",
-        }
+        value_by_label = {"Unreviewed": "UNREVIEWED", "Closed": "CLOSED", "Needs Action": "NEEDS ACTION"}
+        review_map = getattr(self, "_comparison_review_map_cache", {}) or {}
         if requested_status:
             value = normalize_review_status(requested_status)
             choice = next((label for label, code in value_by_label.items() if code == value), "Unreviewed")
         else:
-            review_map = self.store.rmu_review_map()
             current_values = {
-                rmu_review_display_status(self._comparison_row_by_rmu(key) or {}, review_map.get(key, {}))
+                rmu_review_display_status(self._comparison_row_cache.get(key, {}), review_map.get(key, {}))
                 for key in rmus
             }
             current_value = next(iter(current_values)) if len(current_values) == 1 else "UNREVIEWED"
@@ -11649,25 +14347,70 @@ class MainWindow(QMainWindow):
             "CLOSED": "Equipment Data Review marked Closed",
             "NEEDS ACTION": "Equipment Data Review marked Needs Action",
         }
-        # Persist the whole selection in one SQLite transaction.  Review state
-        # does not alter source/Analysis data, so repaint only the affected RMU
-        # rows instead of calling refresh_all()/refresh_comparison().
+        # UI first: all visible rows/counters update before any lifecycle/audit
+        # SQLite writes. A worker transaction then durably saves the selection.
         for rmu in rmus:
-            self.store.update_rmu_review_status(
-                rmu, value, self.user_name, reason=reason_by_value[value], _commit=False
-            )
-        self.store.db.commit()
-        self.refresh_site_history()
-
-        for rmu in rmus:
-            self._refresh_comparison_resolution_row(rmu, refresh_progress=False)
-        self._refresh_comparison_summary_only()
-        self._refresh_comparison_resolution_progress_only()
+            self._patch_cached_review_status(rmu, value)
+            if value == "NEEDS ACTION":
+                self._comparison_action_tracking_keys.add(clean(rmu))
+        self._apply_comparison_filters_local()
+        self._dirty_pages.update({0, 4, 5, 6, 7})
         if len(rmus) == 1:
             self._select_comparison_rmu(rmus[0])
         self.statusBar().showMessage(
-            f"Equipment Review updated: {len(rmus)} row(s) → {choice}", 6000
+            ui_tr(f"Equipment Review updated locally: {len(rmus)} row(s) → {choice} · saving…", self.ui_language), 2200
         )
+
+        project_folder = str(self.store.folder)
+        site_name = self.selected_site.name if self.selected_site else ""
+        updates = [(key, value, reason_by_value[value]) for key in rmus]
+        task_key = f"review-status:{site_name}"
+
+        # If another status transaction is already running, queue/merge this
+        # latest choice per equipment instead of blocking the GUI.
+        pending = getattr(self, "_pending_review_status_updates", None)
+        if pending is None:
+            pending = {}
+            self._pending_review_status_updates = pending
+        for key, status, reason in updates:
+            pending[key] = (status, reason)
+
+        if task_key in self._background_tasks:
+            return
+
+        def flush_pending():
+            if not self.store or (self.selected_site and self.selected_site.name != site_name):
+                return
+            queued = getattr(self, "_pending_review_status_updates", {}) or {}
+            if not queued:
+                return
+            batch = [(key, val[0], val[1]) for key, val in queued.items()]
+            self._pending_review_status_updates = {}
+
+            def success(result: dict):
+                self._dirty_pages.update({0, 4, 5, 6, 7})
+                if len(batch) == 1:
+                    self._schedule_comparison_lifecycle_refresh()
+                self.statusBar().showMessage(
+                    ui_tr(f"Equipment Review saved · {int((result or {}).get('count') or 0)} row(s)", self.ui_language), 2200
+                )
+                if getattr(self, "_pending_review_status_updates", None):
+                    QTimer.singleShot(0, flush_pending)
+
+            def failed(details: str):
+                last_line = next((line for line in reversed(details.strip().splitlines()) if line.strip()), details)
+                QMessageBox.critical(self, "Equipment Review", last_line)
+                # Durable state is authoritative on failure; rebuild once only on
+                # this exceptional path to reconcile the optimistic UI.
+                self.refresh_comparison()
+
+            self._start_background_task(
+                task_key, "Saving Equipment Review Status",
+                lambda: _background_review_status_batch_job(project_folder, batch, self.user_name),
+                success, on_error=failed,
+            )
+
+        flush_pending()
 
     def edit_comparison_cell(self, row_index: int, column_index: int):
         if not self.store:
@@ -11681,8 +14424,8 @@ class MainWindow(QMainWindow):
         rmu = clean(rmu_item.data(Qt.UserRole)) or rmu_item.text()
         value = value_item.text() if value_item else ""
         analysis_fields = {
-            "analysis_name", "analysis_feeder", "analysis_smart",
-            "analysis_type", "analysis_ip",
+            key for key, _label, _width in self._comparison_columns()
+            if key.startswith("analysis__") or key in {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
         }
         if field == "comments":
             data = self._comparison_row_by_rmu(rmu)
@@ -11800,15 +14543,100 @@ class MainWindow(QMainWindow):
                         return revision
         return self.store.latest_site_revision()
 
+    def _confirm_review_draft_export(self, artifact_label: str) -> tuple[bool, bool]:
+        """Allow historical review-draft export while protecting formal handover.
+
+        Older deployed builds allowed reviewers to export while the project state
+        was VALIDATION REQUIRED.  Later builds accidentally turned the validation
+        marker into a hard export gate even though the Report Export page still
+        stated that review-draft export was available.  Keep the warning, but let
+        the reviewer explicitly continue with a clearly identified draft.
+        """
+        validation_pending = bool(self.store.config.get("validation_required_after_source_import", False)) if self.store else False
+        delivery_state = clean(getattr(self, "project_delivery_state", ""))
+        draft_required = validation_pending or delivery_state != "READY FOR EXPORT"
+        if not draft_required:
+            return True, False
+
+        label = clean(artifact_label) or "report"
+        if self.ui_language == LANG_ZH_CN:
+            title = "导出审核草稿"
+            if validation_pending:
+                reason = (
+                    "一个或多个当前 Excel/CSV 数据源，或当前 STANDARD 工作簿，在上次校验后发生了变化。\n\n"
+                    "仍然可以导出审核草稿，但草稿使用的是当前项目数据库中最近一次已计算的审核结果；"
+                    "在重新运行“校验”之前，它可能不会反映刚刚变更的数据源。"
+                )
+            else:
+                reason = f"当前交付状态为：{delivery_state or '审核未完成'}。"
+            message = (
+                reason
+                + "\n\n该文件仅用于内部审核/沟通，不应作为最终正式交付或签字依据。"
+                + f"\n\n是否继续导出 {label} 审核草稿？"
+            )
+        else:
+            title = "Export Review Draft"
+            if validation_pending:
+                reason = (
+                    "One or more active Excel/CSV sources or the active STANDARD workbook changed after the last Validation.\n\n"
+                    "You can still export a review draft, but it uses the most recently calculated review data currently stored in the project database. "
+                    "Until Validation is run again, the draft may not reflect the newly changed source file(s)."
+                )
+            else:
+                reason = f"Current delivery state: {delivery_state or 'Review incomplete'}."
+            message = (
+                reason
+                + "\n\nThis file is for internal review/coordination only and must not be treated as the final formal handover or signed acceptance."
+                + f"\n\nExport the {label} review draft now?"
+            )
+
+        answer = QMessageBox.question(
+            self, title, message,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes, True
+
+    @staticmethod
+    def _safe_export_filename(text: str) -> str:
+        value = re.sub(r'[<>:"/\\|?*]+', '_', clean(text)).strip(' ._')
+        return value or "MigrationReport"
+
+    def _choose_export_target(self, caption: str, filename: str, file_filter: str, suffix: str) -> Path | None:
+        """Require an explicit Save As decision for every formal export.
+
+        A suggested filename is provided for convenience, but no file is written
+        until the reviewer confirms a location in the native Save dialog.
+        """
+        suggested_root = Path.home()
+        if self.selected_site and getattr(self.selected_site, "path", None):
+            try:
+                suggested_root = Path(self.selected_site.path)
+            except Exception:
+                pass
+        selected, _ = QFileDialog.getSaveFileName(
+            self, caption, str(suggested_root / filename), file_filter
+        )
+        if not selected:
+            return None
+        target = Path(selected)
+        if target.suffix.lower() != suffix.lower():
+            target = target.with_suffix(suffix)
+        return target
+
     def export_signoff_pdf(self):
         if not self.require_site():
             return
-        if bool(self.store.config.get("validation_required_after_source_import", False)):
-            QMessageBox.warning(
-                self, "Validation Required",
-                "One or more active Excel/CSV source selections or the active STANDARD workbook changed after the last Validation.\n\n"
-                "Run Validation first. The PDF is only generated from the currently selected source files after they have been recalculated."
+        if self.store.comparison_row_count() <= 0:
+            title = "无可导出的审核数据" if self.ui_language == LANG_ZH_CN else "No review data"
+            message = (
+                "当前项目还没有任何已计算的设备审核数据。至少需要先成功运行一次校验，然后才能导出 PDF。"
+                if self.ui_language == LANG_ZH_CN
+                else "The project does not contain any calculated equipment review data yet. Run Validation successfully at least once before exporting a PDF."
             )
+            QMessageBox.warning(self, title, message)
+            return
+        proceed, review_draft = self._confirm_review_draft_export("PDF")
+        if not proceed:
             return
 
         # Prepared By is a formal report field, not an inferred application value.
@@ -11828,6 +14656,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Prepared By Required", "Enter a name before exporting the PDF report.")
 
         revision = self._selected_site_revision()
+        site_name = self._safe_export_filename(
+            self.store.config.get("site_name") or self.store.config.get("repository_site") or self.store.folder.name
+        )
+        revision_name = self._safe_export_filename(clean((revision or {}).get("revision_name")) or f"v{APP_VERSION}")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        draft_token = "_DRAFT" if review_draft else ""
+        target_path = self._choose_export_target(
+            "Choose Sign-off PDF Save Location",
+            f"{site_name}_{revision_name}_Issue_Closure{draft_token}_{stamp}.pdf",
+            "PDF Files (*.pdf)",
+            ".pdf",
+        )
+        if target_path is None:
+            return
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             target, snapshot = export_site_signoff_pdf(
@@ -11835,12 +14678,15 @@ class MainWindow(QMainWindow):
                 revision=revision,
                 prepared_by=prepared_by,
                 company="NARI",
+                review_draft=review_draft,
+                target_path=target_path,
             )
             self.store.record_signoff_report(
                 revision_id=revision.get("id") if revision else None,
                 path=target,
                 snapshot=snapshot,
                 created_by=self.user_name,
+                report_type="SITE_SIGNOFF_DRAFT" if review_draft else "SITE_SIGNOFF",
             )
         except Exception as exc:
             QMessageBox.critical(self, "PDF export failed", f"{type(exc).__name__}: {exc}")
@@ -11849,10 +14695,28 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.refresh_site_history()
         self.refresh_export_page()
+        generated_title = (
+            "审核草稿 PDF 已生成"
+            if review_draft and self.ui_language == LANG_ZH_CN
+            else "Review Draft PDF generated"
+            if review_draft
+            else "签字 PDF 已生成"
+            if self.ui_language == LANG_ZH_CN
+            else "Sign-off PDF generated"
+        )
+        generated_message = (
+            f"审核草稿 PDF 已保存：\n\n{target}\n\n该文件不是正式交付/签字版本。是否现在打开？"
+            if review_draft and self.ui_language == LANG_ZH_CN
+            else f"Review-draft PDF saved successfully:\n\n{target}\n\nThis is not the formal handover/signature version. Open the PDF now?"
+            if review_draft
+            else f"可打印签字 PDF 已保存：\n\n{target}\n\n是否现在打开？"
+            if self.ui_language == LANG_ZH_CN
+            else f"Printable sign-off PDF saved successfully:\n\n{target}\n\nOpen the PDF now?"
+        )
         answer = QMessageBox.question(
             self,
-            "Sign-off PDF generated",
-            f"Printable sign-off PDF saved successfully:\n\n{target}\n\nOpen the PDF now?",
+            generated_title,
+            generated_message,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
@@ -11880,6 +14744,24 @@ class MainWindow(QMainWindow):
         report = self._selected_signoff_report()
         if not report:
             QMessageBox.information(self, "Select report", "Select a generated PDF record first.")
+            return
+        try:
+            report_snapshot = json.loads(clean(report.get("snapshot_json")) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            report_snapshot = {}
+        if clean(report_snapshot.get("document_status")).upper() == "REVIEW DRAFT":
+            if self.ui_language == LANG_ZH_CN:
+                QMessageBox.warning(
+                    self, "审核草稿不能作为正式签字版本",
+                    "所选 PDF 是在校验/审核未完成时生成的 REVIEW DRAFT。\n\n"
+                    "请先重新运行“校验”并完成需要的人工审核，然后重新生成正式签字 PDF。"
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Review draft cannot be signed",
+                    "The selected PDF was generated as a REVIEW DRAFT while Validation or Human Review was incomplete.\n\n"
+                    "Run Validation, complete the required review, and generate a formal sign-off PDF before attaching a signed copy."
+                )
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
@@ -11913,44 +14795,63 @@ class MainWindow(QMainWindow):
     def export_excel(self):
         if not self.require_site():
             return
-        if bool(self.store.config.get("validation_required_after_source_import", False)):
-            QMessageBox.warning(
-                self, "Validation Required",
-                "One or more active Excel/CSV source selections or the active STANDARD workbook changed after the last Validation.\n\n"
-                "Run Validation first. The Excel report is only exported from the currently selected source files after they have been recalculated."
+        if self.store.comparison_row_count() <= 0:
+            title = "无可导出的审核数据" if self.ui_language == LANG_ZH_CN else "No review data"
+            message = (
+                "当前项目还没有任何已计算的设备审核数据。至少需要先成功运行一次校验，然后才能导出 Excel。"
+                if self.ui_language == LANG_ZH_CN
+                else "The project does not contain any calculated equipment review data yet. Run Validation successfully at least once before exporting Excel."
             )
+            QMessageBox.warning(self, title, message)
             return
-        if not self.store.rows():
-            QMessageBox.warning(self, "No RMU review data", "Run Validation before exporting.")
+        proceed, review_draft = self._confirm_review_draft_export("Excel")
+        if not proceed:
             return
-        delivery_state = getattr(self, "project_delivery_state", "")
-        if delivery_state != "READY FOR EXPORT":
-            answer = QMessageBox.question(
-                self, "Review not complete",
-                f"Current delivery state: {delivery_state or 'Review incomplete'}\n\n"
-                "The workbook can still be exported as a review draft, but it should not be used as the final handover until Validation Coverage is complete, all exception Review items are resolved, and no Needs Action remains.\n\nExport review draft now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            target = export_report(self.store)
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", f"{type(exc).__name__}: {exc}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        answer = QMessageBox.question(
-            self,
-            "Export complete",
-            f"Report saved successfully:\n\n{target}\n\nOpen the report now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+        site_name = self._safe_export_filename(
+            self.store.config.get("site_name") or self.store.config.get("repository_site") or self.store.folder.name
         )
-        self.refresh_dashboard()
-        if answer == QMessageBox.Yes:
-            self._open_path(target)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        draft_token = "-DRAFT" if review_draft else ""
+        target_path = self._choose_export_target(
+            "Choose Migration Report Save Location",
+            f"{site_name}-REVIEW{draft_token}-{stamp}.xlsx",
+            "Excel Workbook (*.xlsx)",
+            ".xlsx",
+        )
+        if target_path is None:
+            return
+        project_folder = str(self.store.folder)
+
+        def success(result):
+            target = Path(str(result))
+            # Formal Excel exports may live anywhere the reviewer chooses.
+            # Persist the actual external target so Dashboard readiness does not
+            # depend on scanning the legacy internal reports/ directory.
+            self.store.config["last_migration_report_export_path"] = str(target)
+            self.store.config["last_migration_report_export_at"] = datetime.now().isoformat(timespec="seconds")
+            self.store.save_config()
+            answer = QMessageBox.question(
+                self,
+                "Export complete",
+                f"Report saved successfully:\n\n{target}\n\nOpen the report now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            self._dirty_pages.add(0)
+            if answer == QMessageBox.Yes:
+                self._open_path(target)
+
+        def failed(details: str):
+            last_line = next((line for line in reversed(details.strip().splitlines()) if line.strip()), details)
+            QMessageBox.critical(self, "Export failed", last_line)
+
+        self._start_background_task(
+            "excel-export",
+            "Exporting Migration Report",
+            lambda: _background_excel_export_job(project_folder, str(target_path)),
+            success,
+            on_error=failed,
+        )
 
     def open_folder(self):
         if not self.require_site():
@@ -12009,6 +14910,9 @@ class MainWindow(QMainWindow):
             return state.issue_count >= 3
         if selected == "CRITICAL":
             return state.is_critical
+        if selected.startswith("RULE::"):
+            wanted = selected.split("::", 1)[1].upper()
+            return wanted in {clean(value).upper() for value in false_keys}
         if selected.endswith(" MISMATCH"):
             return selected.removesuffix(" MISMATCH") in false_keys
         return True
@@ -12108,13 +15012,15 @@ class MainWindow(QMainWindow):
         self._apply_equipment_profile_ui_mode()
         self._configure_comparison_headers()
         profile = self._current_equipment_profile()
-        mode_label = "five-source equipment review"
+        mode_label = "configured equipment review" if get_equipment_comparison_config(self.store, bootstrap=False).get("sources") else "legacy equipment review"
         self._set_comparison_loading(True, f"Loading {mode_label} in background... Please wait.")
-        term = self.search_edit.text().strip()
-        search_field = self.comparison_search_field.currentData() if hasattr(self, "comparison_search_field") else "*"
-        search_field = search_field or "*"
-        review_filter = clean(self.rmu_review_filter_combo.currentData()) if hasattr(self, "rmu_review_filter_combo") else "ALL REVIEWS"
-        analysis_filter = clean(self.analysis_combo.currentData()) if hasattr(self, "analysis_combo") else "ALL ANALYSIS"
+        # Build the canonical dataset once. Search/review/analysis filters are
+        # presentation-only and are applied locally by hiding rows, so changing
+        # a filter never spawns a worker or reconstructs thousands of cells.
+        term = ""
+        search_field = "*"
+        review_filter = "ALL REVIEWS"
+        analysis_filter = "ALL ANALYSIS"
         columns = tuple(self._comparison_columns())
         project_folder = str(self.store.folder)
 
@@ -12133,8 +15039,24 @@ class MainWindow(QMainWindow):
             shown = list(payload.get("shown") or [])
             rows = list(payload.get("rows") or [])
             self._comparison_last_rows = rows
+            self._comparison_last_shown = shown
             review_map = dict(payload.get("review_map") or {})
             all_resolutions = dict(payload.get("all_resolutions") or {})
+            self._comparison_last_entries = shown
+            self._comparison_review_map_cache = review_map
+            self._comparison_resolution_map_cache = all_resolutions
+            self._comparison_action_tracking_keys = {clean(value) for value in (payload.get("action_tracking_keys") or []) if clean(value)}
+            self._comparison_row_cache = {
+                clean((row or {}).get("review_key") or (row or {}).get("rmu")): row
+                for row in rows
+                if clean((row or {}).get("review_key") or (row or {}).get("rmu"))
+            }
+            self._comparison_entry_cache = {
+                clean(((entry or {}).get("data") or {}).get("review_key") or ((entry or {}).get("data") or {}).get("rmu")): entry
+                for entry in shown
+                if clean(((entry or {}).get("data") or {}).get("review_key") or ((entry or {}).get("data") or {}).get("rmu"))
+            }
+            self._comparison_dataset_ready = False
             mode = clean(payload.get("mode")) or "equipment_review"
             self.comparison_table.setRowCount(len(shown))
             if hasattr(self, "comparison_locator"):
@@ -12216,17 +15138,19 @@ class MainWindow(QMainWindow):
                         item.setTextAlignment(Qt.AlignCenter)
                         item.setToolTip(clean(data.get("equipment_source_presence_detail")) or value)
                         try:
-                            count = int(value.split("/", 1)[0])
+                            present_text, total_text = value.split("/", 1)
+                            present_count = int(present_text)
+                            total_count = max(1, int(total_text))
                         except Exception:
-                            count = 0
-                        if count >= 5:
+                            present_count, total_count = 0, 1
+                        if present_count >= total_count:
                             item.setBackground(QColor("#EAF7F0"))
-                        elif count >= 3:
+                        elif present_count * 2 >= total_count:
                             item.setBackground(QColor("#FFF8D8"))
                         else:
                             item.setBackground(QColor("#FDECEC"))
                     elif key == "equipment_missing_sources":
-                        item.setToolTip(clean(data.get("equipment_source_presence_detail")) or value or "All five sources contain this equipment name.")
+                        item.setToolTip(clean(data.get("equipment_source_presence_detail")) or value or "All configured sources contain this key.")
                     else:
                         item.setToolTip(value)
                     if key in {"no", "rmu", "equipment_device_type", "equipment_source_count"}:
@@ -12247,7 +15171,10 @@ class MainWindow(QMainWindow):
 
         review_map = ctx["review_map"]
         all_resolutions = ctx["all_resolutions"]
-        analysis_keys = {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
+        analysis_keys = {
+            key for key, _label, _width in columns
+            if key.startswith("analysis__") or key in {"analysis_name", "analysis_feeder", "analysis_smart", "analysis_type", "analysis_ip"}
+        }
         neutral_review_keys = analysis_keys | {"remarks", "comments"}
 
         for r in range(start, end):
@@ -12275,7 +15202,7 @@ class MainWindow(QMainWindow):
                     item.setData(Qt.UserRole, review_key)
                 item.setBackground(QColor("#FFFFFF") if key in neutral_review_keys else row_fill)
                 if key in analysis_keys:
-                    detail = clean(data.get(f"{key}_detail", ""))
+                    detail = clean(data.get(f"{key}__detail", "") or data.get(f"{key}_detail", ""))
                     item.setToolTip(detail or value)
                     analysis_fill = self._analysis_cell_fill(key, value)
                     if analysis_fill:
@@ -12286,7 +15213,8 @@ class MainWindow(QMainWindow):
                     if key == "comments":
                         if state.issue_count > 0:
                             lines = []
-                            for field in ("NAME", "FEEDER", "SMART", "TYPE", "IP"):
+                            field_order = [clean(value).upper() for value in (data.get("analysis_field_order") or []) if clean(value)] or ["NAME", "FEEDER", "SMART", "TYPE", "IP"]
+                            for field in field_order:
                                 record = saved_resolution.get(field) or {}
                                 if clean(record.get("decision_type")):
                                     lines.append(resolution_display_text(record))
@@ -12342,6 +15270,13 @@ class MainWindow(QMainWindow):
         if mode in {"rmu", "equipment_review"}:
             self._sync_comparison_locator_geometry()
         self._apply_comparison_column_visibility()
+        # v0.8.190: once all rows are available, automatically expand every
+        # column that the reviewer has never manually resized.  Sampling uses
+        # the full unfiltered data set, so widths stay stable while filters and
+        # search terms change.
+        self._auto_fit_comparison_columns(
+            rows=list(ctx.get("rows") or []), shown=list(ctx.get("shown") or [])
+        )
         self._restore_comparison_selection_keys(ctx.get("captured_selection") or [])
         self.comparison_table.setUpdatesEnabled(True)
         self.comparison_table.viewport().update()
@@ -12355,7 +15290,17 @@ class MainWindow(QMainWindow):
             self.comparison_review_progress.setText(ctx.get("progress_text", ""))
 
         shown_count = len(ctx.get("shown") or [])
+        self._comparison_row_index_cache = {}
+        for row_index, entry in enumerate(self._comparison_last_entries):
+            data = (entry or {}).get("data") or {}
+            key = clean(data.get("review_key") or data.get("rmu"))
+            if key:
+                self._comparison_row_index_cache[key] = row_index
+        self._comparison_dataset_ready = True
         self._comparison_render_context = None
+        # Apply whichever filters/search the reviewer currently selected while
+        # the dataset was loading. This only toggles row visibility.
+        self._apply_comparison_filters_local()
         self._set_comparison_loading(False)
         self._hide_busy_operation("rmu-show-all")
         if mode in {"rmu", "equipment_review"}:
@@ -12464,7 +15409,7 @@ class MainWindow(QMainWindow):
             self.site_history_site_label.setText("Site: —")
             self.site_history_revision_label.setText("Latest revision: —")
             self.site_history_issue_label.setText("Issue / Action items: 0")
-            self.site_history_tracking_label.setText("RMU Follow-up: Open 0 · Closed 0")
+            self.site_history_tracking_label.setText("Equipment Follow-up: Open 0 · Closed 0")
             self.site_history_lifecycle_label.setText("Lifecycle: Open 0 · Closed 0")
             self.site_history_audit_label.setText("Audit records: 0")
             self.site_history_report_label.setText("Sign-off PDFs: 0")
@@ -12486,8 +15431,8 @@ class MainWindow(QMainWindow):
         issues = self.store.issue_actions()
         changes = self.store.changes()
         reports = self.store.signoff_reports()
-        tracking = self.store.rmu_action_tracking()
-        tracking_counts = self.store.rmu_action_tracking_counts()
+        tracking = (self.store.equipment_action_tracking() if hasattr(self.store, "equipment_action_tracking") else self.store.rmu_action_tracking())
+        tracking_counts = (self.store.equipment_action_tracking_counts() if hasattr(self.store, "equipment_action_tracking_counts") else self.store.rmu_action_tracking_counts())
         lifecycle = self.store.issue_cases()
         lifecycle_counts = self.store.issue_lifecycle_counts()
         latest = revisions[0] if revisions else None
@@ -12498,7 +15443,7 @@ class MainWindow(QMainWindow):
         )
         self.site_history_issue_label.setText(f"Issue / Action items: {len(issues)}")
         self.site_history_tracking_label.setText(
-            f"RMU Follow-up: Open {tracking_counts.get('OPEN', 0)} · Closed {tracking_counts.get('CLOSED', 0)}"
+            f"Equipment Follow-up: Open {tracking_counts.get('OPEN', 0)} · Closed {tracking_counts.get('CLOSED', 0)}"
         )
         self.site_history_lifecycle_label.setText(
             f"Lifecycle: Open {lifecycle_counts.get('OPEN', 0)} · Closed {lifecycle_counts.get('CLOSED', 0)}"
@@ -12553,8 +15498,13 @@ class MainWindow(QMainWindow):
 
         self.site_lifecycle_table.setRowCount(len(lifecycle))
         for r, case in enumerate(lifecycle):
+            entity_type = clean(case.get("entity_type")).upper()
+            entity_key = clean(case.get("entity_key"))
+            linked_row = self._comparison_row_by_rmu(entity_key) if entity_type == "RMU" else None
+            display_entity_type = self._equipment_type_from_key(entity_key, linked_row or {}) if entity_type == "RMU" else entity_type
+            display_equipment = self._equipment_display_name(entity_key, linked_row or {}) if entity_type == "RMU" else clean(case.get("rmu"))
             values = [
-                f"#{int(case.get('case_no') or 0):03d}", case.get("entity_type"), case.get("rmu"),
+                f"#{int(case.get('case_no') or 0):03d}", display_entity_type, display_equipment,
                 case.get("point_no"), case.get("signal_name"), case.get("status"), case.get("opened_at"),
                 case.get("opened_by"), case.get("closed_at"), case.get("closed_by"),
                 case.get("participant_count"), case.get("event_count"), case.get("last_event_at") or case.get("updated_at"),
@@ -12573,15 +15523,22 @@ class MainWindow(QMainWindow):
                 self.site_lifecycle_table.setItem(r, c, cell)
 
         self.site_rmu_tracking_table.setRowCount(len(tracking))
-        tracking_keys = [
-            "rmu", "tracking_status", "first_need_action_at", "last_need_action_at", "closed_at",
-            "open_count", "opened_by", "closed_by", "last_reason"
-        ]
         for r, data in enumerate(tracking):
-            for c, key in enumerate(tracking_keys):
-                cell = QTableWidgetItem(clean(data.get(key, "")))
+            equipment_key = clean(data.get("equipment_key") or data.get("rmu"))
+            row_data = self._comparison_row_by_rmu(equipment_key) or {}
+            display_name = self._equipment_display_name(equipment_key, row_data)
+            equipment_type = self._equipment_type_from_key(equipment_key, row_data)
+            values = [
+                display_name, equipment_type, data.get("tracking_status"),
+                data.get("first_need_action_at"), data.get("last_need_action_at"), data.get("closed_at"),
+                data.get("open_count"), data.get("opened_by"), data.get("closed_by"), data.get("last_reason"),
+            ]
+            for c, value in enumerate(values):
+                cell = QTableWidgetItem(clean(value))
                 cell.setToolTip(cell.text())
-                if c == 1:
+                if c == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, equipment_key)
+                if c == 2:
                     status = clean(data.get("tracking_status")).upper()
                     if status == "OPEN":
                         cell.setBackground(QColor("#FDECEC"))
@@ -12674,7 +15631,7 @@ class MainWindow(QMainWindow):
         """Refresh delivery stage using business-record Human Review progress.
 
         Project Overview deliberately counts review *objects*, not low-level
-        Resolution decisions: one affected RMU is one RMU review object, and one
+        Resolution decisions: one affected equipment row is one equipment review object, and one
         mismatched signal is one Signal review object.  A multi-issue RMU counts
         as reviewed only after every active FALSE field has a Resolution decision.
         Per-field decision counts stay inside RMU Data Review where they are useful.
@@ -12740,22 +15697,40 @@ class MainWindow(QMainWindow):
             "done" if (report_exported and review_complete and validation_coverage_complete) else ("current" if review_complete and validation_coverage_complete else "pending"),
         )
 
-        module_review = (
-            f"Human Review · RMU {rmu_reviewed}/{rmu_review_total} · "
-            f"Signal {signal_reviewed}/{signal_review_total}"
-        )
-        if not sources_complete:
-            detail = "Complete the required RMU and Signal Mapping source tables."
-        elif not validation_complete:
-            detail = "Sources are ready. Run Validation to calculate RMU and Signal Mapping results."
-        elif needs_action:
-            detail = f"{module_review} · {review_pct}% · {needs_action} Needs Action"
-        elif review_complete and report_exported:
-            detail = f"{module_review} · Review complete · current Migration Report export is up to date."
-        elif review_complete:
-            detail = f"{module_review} · Review complete · Migration Report is ready for export."
+        if self.ui_language == LANG_ZH_CN:
+            module_review = (
+                f"人工审核 · 设备 {rmu_reviewed}/{rmu_review_total} · "
+                f"信号 {signal_reviewed}/{signal_review_total}"
+            )
+            if not sources_complete:
+                detail = "请完成当前站点已配置的设备审核数据源以及信号映射所需数据源。"
+            elif not validation_complete:
+                detail = "数据源已就绪。请运行校验以计算设备审核和信号映射结果。"
+            elif needs_action:
+                detail = f"{module_review} · {review_pct}% · {needs_action} 项需处理"
+            elif review_complete and report_exported:
+                detail = f"{module_review} · 审核已完成 · 当前迁移报告已是最新导出版本。"
+            elif review_complete:
+                detail = f"{module_review} · 审核已完成 · 迁移报告可以导出。"
+            else:
+                detail = f"{module_review} · {review_pct}% · 剩余 {unreviewed} 个审核对象"
         else:
-            detail = f"{module_review} · {review_pct}% · {unreviewed} review object(s) remaining"
+            module_review = (
+                f"Human Review · Equipment {rmu_reviewed}/{rmu_review_total} · "
+                f"Signal {signal_reviewed}/{signal_review_total}"
+            )
+            if not sources_complete:
+                detail = "Complete the configured Equipment Data Review sources and required Signal Mapping sources."
+            elif not validation_complete:
+                detail = "Sources are ready. Run Validation to calculate Equipment Data Review and Signal Mapping results."
+            elif needs_action:
+                detail = f"{module_review} · {review_pct}% · {needs_action} Needs Action"
+            elif review_complete and report_exported:
+                detail = f"{module_review} · Review complete · current Migration Report export is up to date."
+            elif review_complete:
+                detail = f"{module_review} · Review complete · Migration Report is ready for export."
+            else:
+                detail = f"{module_review} · {review_pct}% · {unreviewed} review object(s) remaining"
         self.workflow_detail.setText(detail)
 
     def refresh_dashboard(self):
@@ -12845,14 +15820,16 @@ class MainWindow(QMainWindow):
             and (normalize_review_status(rmu_review_map.get(clean(row.get("rmu")), {}).get("review_status")) == "NEEDS ACTION")
         )
         rmu_needs = rmu_required_needs + rmu_optional_needs
-        # Keep the legacy RMU metric RMU-specific even though v0.8.156 reuses
-        # the same durable tracking table for namespaced non-RMU equipment.
-        legacy_tracking_rows = [
-            item for item in self.store.rmu_action_tracking()
-            if not clean((item or {}).get("rmu")).upper().startswith("EQ::")
-        ]
-        rmu_followup_open = sum(clean(item.get("tracking_status")).upper() == "OPEN" for item in legacy_tracking_rows)
-        rmu_followup_closed = sum(clean(item.get("tracking_status")).upper() == "CLOSED" for item in legacy_tracking_rows)
+        # Equipment Data Review uses one durable lifecycle register for every
+        # equipment class. Historical DB/table names remain for compatibility,
+        # but dashboard follow-up counts include every equipment Needs Action.
+        equipment_tracking_rows = (
+            self.store.equipment_action_tracking()
+            if hasattr(self.store, "equipment_action_tracking")
+            else self.store.rmu_action_tracking()
+        )
+        rmu_followup_open = sum(clean(item.get("tracking_status")).upper() == "OPEN" for item in equipment_tracking_rows)
+        rmu_followup_closed = sum(clean(item.get("tracking_status")).upper() == "CLOSED" for item in equipment_tracking_rows)
         rmu_unreviewed = max(0, rmu_review_total - rmu_reviewed)
         rmu_review_pct = int(round((rmu_reviewed / rmu_review_total * 100.0) if rmu_review_total else 100.0))
 
@@ -12864,7 +15841,7 @@ class MainWindow(QMainWindow):
         self.dashboard_rmu_review_progress.setValue(rmu_review_pct)
         self.dashboard_rmu_review_progress.setFormat(f"{rmu_review_pct}%")
         self.dashboard_rmu_review_summary.setText(
-            f"RMU Review: {rmu_reviewed} / {rmu_review_total} · {rmu_review_pct}% · "
+            f"Equipment Review: {rmu_reviewed} / {rmu_review_total} · {rmu_review_pct}% · "
             f"Remaining {rmu_unreviewed} · Closed {rmu_closed} · Current Needs Action {rmu_needs} · "
             f"Follow-up Open {rmu_followup_open} / Closed {rmu_followup_closed}"
         )
@@ -12878,7 +15855,7 @@ class MainWindow(QMainWindow):
         if rmu_no_analysis:
             issue_parts.append(f"NO ANALYSIS {rmu_no_analysis}")
         self.dashboard_rmu_issue_summary.setText(
-            "Affected RMUs by field: " + (" · ".join(issue_parts) if issue_parts else "None")
+            "Affected equipment by field: " + (" · ".join(issue_parts) if issue_parts else "None")
         )
         if hasattr(self, "dashboard_rmu_issues_button"):
             if not rmu_total:
@@ -13191,18 +16168,43 @@ class MainWindow(QMainWindow):
             key for key, _meta in SOURCE_TYPES.items()
             if self.store.source_path(key) is not None
         )
-        required_keys = {definition.key for definition in SOURCE_DEFINITIONS if definition.required}
-        base_sources_ready = required_keys.issubset(effective_source_keys)
-        signal_sources_ready = bool("ioa" in effective_source_keys and "adms_sld" in effective_source_keys and standard_path.exists())
-        sources_complete = base_sources_ready and signal_sources_ready
+        # Equipment Data Review is fully configurable and has no fixed source-count
+        # requirement.  When a configurable contract exists, readiness depends on
+        # the enabled configured sources + comparison rules, not on the historical
+        # six repository roles.  Legacy projects keep their old fallback until they
+        # explicitly save a configurable contract.
+        comparison_config = get_equipment_comparison_config(self.store, bootstrap=False)
+        if comparison_config.get("sources"):
+            comparison_status = configurable_comparison_status(self.store, comparison_config)
+            enabled_status = [
+                item for item in comparison_status
+                if bool((item.get("source") or {}).get("enabled", True))
+            ]
+            equipment_sources_ready = (
+                bool(enabled_status)
+                and bool(comparison_config.get("comparisons"))
+                and all(clean(item.get("status")).upper() == "READY" for item in enabled_status)
+            )
+        else:
+            legacy_equipment_required = {"se_list", "zenon_db", "zenon_sld", "adms_db", "adms_sld"}
+            equipment_sources_ready = legacy_equipment_required.issubset(effective_source_keys)
+
+        ioa_path = resolve_configurable_signal_assignment(self.store, "ioa") or self.store.source_path("ioa")
+        signal_adms_path = resolve_configurable_signal_assignment(self.store, "adms_sld") or self.store.source_path("adms_sld")
+        signal_sources_ready = bool(
+            ioa_path and Path(ioa_path).exists()
+            and signal_adms_path and Path(signal_adms_path).exists()
+            and standard_path.exists()
+        )
+        sources_complete = equipment_sources_ready and signal_sources_ready
         validation_complete = (
             bool(rows)
             and (signal_report is not None or int(persisted_signal_summary.get("total") or 0) > 0)
             and not bool(self.store.config.get("validation_required_after_source_import", False))
         )
         # Project-level Human Review uses business objects so Dashboard totals
-        # stay intuitive: one affected RMU + one mismatched signal.  RMU
-        # per-field decisions remain an implementation/detail view inside the RMU
+        # stay intuitive: one affected equipment item + one mismatched signal.
+        # Per-field decisions remain an implementation/detail view inside Equipment Data Review
         # module and are deliberately not mixed into Overview progress.
         review_total = equipment_review_total_all + signal_review_total
         signal_required_needs = signal_review_counts["NEEDS ACTION"] if signal_report is not None else signal_needs
@@ -13231,6 +16233,19 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         report_times = []
+        # v0.8.186 formal exports are Save-As anywhere, so the delivery state
+        # must follow the recorded external export rather than only the legacy
+        # internal reports/ directory. Keep the directory scan for backward
+        # compatibility with older projects.
+        recorded_export_at = clean(self.store.config.get("last_migration_report_export_at"))
+        recorded_export_path = clean(self.store.config.get("last_migration_report_export_path"))
+        if recorded_export_at and recorded_export_path:
+            try:
+                external_path = Path(recorded_export_path)
+                if external_path.exists():
+                    report_times.append(datetime.fromisoformat(recorded_export_at).timestamp())
+            except Exception:
+                pass
         if self.store.reports_dir.exists():
             for report_path in self.store.reports_dir.glob("*.xlsx"):
                 try:
@@ -13256,7 +16271,7 @@ class MainWindow(QMainWindow):
             self.export_project_label.setText("Saudi ADMS Site: —")
             self.export_readiness_label.setText("Delivery status: select a site and run validation")
             self.export_readiness_label.setStyleSheet("")
-            self.export_path_label.setText("Report folder: —")
+            self.export_path_label.setText("Export location: choose a path when exporting")
             if hasattr(self, "export_signoff_status_label"):
                 self.export_signoff_status_label.setText("Sign-off history: —")
         else:
@@ -13270,7 +16285,7 @@ class MainWindow(QMainWindow):
                     f"Delivery status: {state} · Export is available as a review draft; complete Human Review before formal handover."
                 )
                 self.export_readiness_label.setStyleSheet(f"color:{COLORS['warning']};font-weight:650;")
-            self.export_path_label.setText(f"Report folder: {self.store.reports_dir}")
+            self.export_path_label.setText("Export location: choose a save path for every Excel/PDF export")
             if hasattr(self, "export_signoff_status_label"):
                 reports = self.store.signoff_reports()
                 signed = sum(1 for item in reports if clean(item.get("report_status")).upper() == "SIGNED")

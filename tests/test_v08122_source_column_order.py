@@ -10,6 +10,7 @@ from migration_report_tool.services.schema_service import (
     get_source_column_order,
     set_source_column_order,
     rmu_review_groups,
+    set_hidden_source_fields,
 )
 
 
@@ -40,6 +41,9 @@ class SourceColumnOrderV08122Tests(unittest.TestCase):
             other_store.db.close()
 
     def test_rmu_review_adms_group_follows_saved_app_field_order(self):
+        # Ordering test needs optional fields visible explicitly under the
+        # v0.8.172 default-hide presentation policy.
+        set_hidden_source_fields(self.store, "adms_db", set(), "tester")
         set_source_column_order(
             self.store,
             "adms_db",

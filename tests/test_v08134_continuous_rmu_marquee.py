@@ -9,7 +9,7 @@ VERSION = (ROOT / "src/migration_report_tool/version.py").read_text(encoding="ut
 
 class ContinuousRmuMarqueeTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertIn('__version__ = "0.8.143"', VERSION)
+        self.assertIn('__version__ = "0.8.196"', VERSION)
 
     def test_busy_bar_is_fixed_width_marquee(self):
         self.assertIn("class BusyMarqueeProgressBar(QProgressBar):", UI)
@@ -31,7 +31,7 @@ class ContinuousRmuMarqueeTests(unittest.TestCase):
         self.assertIn('SELECT COUNT(*) FROM comparison', STORE)
 
     def test_rmu_paint_yields_every_row(self):
-        self.assertIn("self._comparison_render_batch_size = 1", UI)
+        self.assertIn("self._comparison_render_batch_size = 24", UI)
         self.assertIn("QTimer.singleShot(0, lambda g=generation: self._render_comparison_batch(g))", UI)
 
 

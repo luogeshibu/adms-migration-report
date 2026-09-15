@@ -74,7 +74,7 @@ class SafeSchemaMigrationV08119Tests(unittest.TestCase):
 
             store = ProjectStore(site)
             try:
-                self.assertEqual(TARGET_SCHEMA_VERSION, 11)
+                self.assertEqual(TARGET_SCHEMA_VERSION, 12)
                 self.assertEqual(store.project_schema_version(), TARGET_SCHEMA_VERSION)
 
                 row = store.db.execute(
@@ -108,7 +108,7 @@ class SafeSchemaMigrationV08119Tests(unittest.TestCase):
             finally:
                 store.close()
 
-            backups = list((site / "backups").glob("project_before_schema_011_*.db"))
+            backups = list((site / "backups").glob("project_before_schema_012_*.db"))
             self.assertEqual(len(backups), 1)
             backup = sqlite3.connect(backups[0])
             try:

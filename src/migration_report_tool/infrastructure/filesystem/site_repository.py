@@ -121,24 +121,147 @@ def save_last_site(site_name: str) -> None:
     _save_repository_config(payload)
 
 
-def load_source_detection_keywords() -> dict[str, list[str]]:
-    payload = _load_repository_config().get("source_detection_keywords", {}) or {}
-    result: dict[str, list[str]] = {}
-    for definition in SOURCE_DEFINITIONS:
-        configured = payload.get(definition.key)
-        values = configured if isinstance(configured, list) else list(DEFAULT_SOURCE_KEYWORDS.get(definition.key, ()))
-        result[definition.key] = [str(value).strip() for value in values if str(value).strip()]
+def _detection_category_key(label: str, existing: set[str] | None = None) -> str:
+    """Create a stable custom detection-hint key from a reviewer label.
+
+    Built-in source keys remain unchanged for backward compatibility. Custom
+    categories are presentation/discovery hints only and never become mandatory
+    business source roles.
+    """
+    label = str(label or "").strip()
+    token = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "category"
+    base = f"custom::{token}"
+    used = set(existing or ())
+    if base not in used:
+        return base
+    index = 2
+    while f"{base}_{index}" in used:
+        index += 1
+    return f"{base}_{index}"
+
+
+def load_source_detection_categories() -> list[dict]:
+    """Return every optional filename-recognition category.
+
+    The historical six source roles are seeded as built-ins so legacy AUTO
+    discovery keeps working. Reviewers may add any number of extra categories;
+    those custom categories are hints for file-pool classification only and do
+    not constrain filenames or force a file into Equipment/Signal review.
+    """
+    config = _load_repository_config()
+    payload = config.get("source_detection_keywords", {}) or {}
+    labels = config.get("source_detection_labels", {}) or {}
+    builtin_by_key = {definition.key: definition for definition in SOURCE_DEFINITIONS}
+    ordered_keys = [definition.key for definition in SOURCE_DEFINITIONS]
+    for key in payload:
+        key = str(key or "").strip()
+        if key and key not in ordered_keys:
+            ordered_keys.append(key)
+    result: list[dict] = []
+    for key in ordered_keys:
+        definition = builtin_by_key.get(key)
+        configured = payload.get(key)
+        defaults = list(DEFAULT_SOURCE_KEYWORDS.get(key, ())) if definition else []
+        values = configured if isinstance(configured, list) else defaults
+        clean_values = [str(value).strip() for value in values if str(value).strip()]
+        label = str(labels.get(key) or (definition.label if definition else key.removeprefix("custom::").replace("_", " ").strip().title()) or key).strip()
+        result.append({
+            "key": key,
+            "label": label,
+            "keywords": clean_values,
+            "built_in": bool(definition),
+        })
     return result
 
 
-def save_source_detection_keywords(keywords: dict[str, list[str]]) -> None:
-    payload = _load_repository_config()
-    cleaned = {}
+def save_source_detection_categories(categories: list[dict]) -> None:
+    """Persist built-in and reviewer-defined optional recognition categories."""
+    config = _load_repository_config()
+    existing_keys: set[str] = set()
+    cleaned_keywords: dict[str, list[str]] = {}
+    cleaned_labels: dict[str, str] = {}
+    builtin_keys = {definition.key for definition in SOURCE_DEFINITIONS}
+
+    # Always keep built-in keys available for legacy AUTO source resolution.
+    incoming_by_key = {str(item.get("key") or "").strip(): dict(item) for item in (categories or []) if str(item.get("key") or "").strip()}
     for definition in SOURCE_DEFINITIONS:
-        values = keywords.get(definition.key, [])
-        cleaned[definition.key] = [str(value).strip() for value in values if str(value).strip()]
-    payload["source_detection_keywords"] = cleaned
-    _save_repository_config(payload)
+        item = incoming_by_key.get(definition.key, {})
+        values = item.get("keywords", DEFAULT_SOURCE_KEYWORDS.get(definition.key, ()))
+        cleaned_keywords[definition.key] = [str(value).strip() for value in (values or []) if str(value).strip()]
+        cleaned_labels[definition.key] = str(item.get("label") or definition.label).strip()
+        existing_keys.add(definition.key)
+
+    for raw in categories or []:
+        key = str(raw.get("key") or "").strip()
+        label = str(raw.get("label") or "").strip()
+        if key in builtin_keys:
+            continue
+        if not label and not key:
+            continue
+        if not key or key in existing_keys:
+            key = _detection_category_key(label or key, existing_keys)
+        values = raw.get("keywords", []) or []
+        cleaned_keywords[key] = [str(value).strip() for value in values if str(value).strip()]
+        cleaned_labels[key] = label or key.removeprefix("custom::").replace("_", " ").strip().title()
+        existing_keys.add(key)
+
+    config["source_detection_keywords"] = cleaned_keywords
+    config["source_detection_labels"] = cleaned_labels
+    _save_repository_config(config)
+
+
+def load_source_detection_keywords() -> dict[str, list[str]]:
+    return {
+        str(item.get("key")): list(item.get("keywords") or [])
+        for item in load_source_detection_categories()
+        if str(item.get("key") or "").strip()
+    }
+
+
+def save_source_detection_keywords(keywords: dict[str, list[str]]) -> None:
+    """Backward-compatible save used by older UI/tests.
+
+    Unknown keys are retained as custom hint categories instead of being
+    discarded, removing the historical fixed-six-category UI limitation.
+    """
+    current = {item["key"]: item for item in load_source_detection_categories()}
+    categories: list[dict] = []
+    for key, values in (keywords or {}).items():
+        key = str(key or "").strip()
+        if not key:
+            continue
+        item = dict(current.get(key) or {"key": key, "label": key, "built_in": key in SOURCE_BY_KEY})
+        item["keywords"] = list(values or [])
+        categories.append(item)
+    # Preserve categories omitted by the caller, because recognition is now a
+    # freely extensible preference rather than a fixed form contract.
+    seen = {item.get("key") for item in categories}
+    categories.extend(item for key, item in current.items() if key not in seen)
+    save_source_detection_categories(categories)
+
+
+def classify_source_detection_hint(path: Path) -> list[dict]:
+    """Return optional filename-category hints for one arbitrary tabular file.
+
+    This helper never rejects or auto-enrols a file. It merely ranks configured
+    filename hints so the configurable source pool can show useful suggestions.
+    Manual source selection and field/key mapping remain authoritative.
+    """
+    path = Path(path)
+    ranked: list[dict] = []
+    for category in load_source_detection_categories():
+        hits = [kw for kw in (category.get("keywords") or []) if _keyword_matches(path, kw)]
+        if not hits:
+            continue
+        ranked.append({
+            "key": category.get("key"),
+            "label": category.get("label") or category.get("key"),
+            "keywords": hits,
+            "score": max(1, len(hits)),
+            "built_in": bool(category.get("built_in")),
+        })
+    ranked.sort(key=lambda item: (-int(item.get("score") or 0), 0 if item.get("built_in") else 1, str(item.get("label") or "").casefold()))
+    return ranked
 
 
 def _manual_assignment_bucket(site_dir: Path) -> tuple[dict, str]:
@@ -216,6 +339,51 @@ def _first_existing(files: dict[str, Path], names: Iterable[str]) -> Path | None
 
 
 TABULAR_SOURCE_EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
+
+
+def site_tabular_files(site_dir: Path) -> tuple[Path, ...]:
+    """Return all supported tabular files below one site folder recursively.
+
+    Site folders are reviewer-managed and may organize sources in arbitrary
+    nested subfolders (for example ``Equipment/`` and ``SignalMapping/``).
+    Discovery therefore must never be root-only.  Temporary Office lock files
+    and clearly archival/hidden folders are ignored so they cannot make an
+    otherwise empty site look configurable.
+    """
+    root = Path(site_dir)
+    if not root.exists() or not root.is_dir():
+        return ()
+    found: list[Path] = []
+    for candidate in root.rglob("*"):
+        try:
+            if not candidate.is_file() or candidate.suffix.lower() not in TABULAR_SOURCE_EXTENSIONS:
+                continue
+            if candidate.name.startswith("~$"):
+                continue
+            rel = candidate.relative_to(root)
+            parent_parts = rel.parts[:-1]
+            if any(
+                part.startswith(".")
+                or part.casefold() in {"archive", "backup", "backups", "__pycache__"}
+                for part in parent_parts
+            ):
+                continue
+            found.append(candidate)
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(
+        found,
+        key=lambda path: (
+            len(path.relative_to(root).parts),
+            str(path.relative_to(root)).casefold(),
+        ),
+    ))
+
+
+def site_has_tabular_files(site_dir: Path) -> bool:
+    """Cheap semantic helper used by station-list availability status."""
+    return bool(site_tabular_files(site_dir))
+
 
 def _source_extensions(source_type: str) -> set[str]:
     # v0.8.155: every site source role accepts either CSV or modern Excel.

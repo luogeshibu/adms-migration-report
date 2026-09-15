@@ -71,7 +71,12 @@ def _run_selftest_isolated():
                     issue_rmu, field, "ACCEPT_EXCEPTION", "selftest",
                     analysis_fingerprint=store._rmu_field_fingerprint(issue_row, field),
                 )
-        store.sync_rmu_review_from_resolutions(issue_rmu, issue_row, "selftest")
+        # Resolution choices never derive Review Status. Close this self-test issue
+        # explicitly so export verification covers the reviewer-owned Closed state.
+        store.update_rmu_review_status(
+            issue_rmu, "CLOSED", "selftest",
+            reason="Explicit self-test closure after Resolution decisions",
+        )
         # Pass RMUs default to Closed in the three-state Review workflow; an explicit
         # Closed decision and comment must remain persisted/exported without changing Analysis.
         manual_pass_row = next(

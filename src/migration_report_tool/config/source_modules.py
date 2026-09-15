@@ -33,7 +33,7 @@ MODULE_SOURCE_GROUPS: tuple[ModuleSourceGroup, ...] = (
     ModuleSourceGroup(
         "rmu_review",
         "Equipment Data Review",
-        "Review every equipment type across SE, ZENON DB, ZENON SLD, ADMS DB and ADMS SLD. Every detected equipment type uses the same Analysis, Review Status, Resolution, Comments and Needs Action lifecycle workflow.",
+        "Equipment Data Review supports any number of configured CSV/XLSX/XLSM source tables. Each site chooses its own source files, Key / Index fields, comparison fields and visible columns while keeping the existing Analysis, Review Status, Resolution, Comments and Needs Action lifecycle workflow.",
         (
             ModuleTableRef(
                 "se_list", "SE Equipment", "RMU / feeder / SMART reference", "SE.xlsx",
@@ -63,8 +63,16 @@ MODULE_SOURCE_GROUPS: tuple[ModuleSourceGroup, ...] = (
                 ("rmu", "gss_fid", "y1", "y2", "y3", "y4", "q1", "q2", "rmu_type", "smart", "channel_ip", "channel_port"),
             ),
             ModuleTableRef(
-                "adms_sld", "ADMS SLD", "ADMS equipment type / subtype / SMART reference", "ADMS-SLD.csv",
-                ("rmu", "rmu_type", "device_type", "smart", "feeder", "ip"),
+                "adms_sld", "ADMS SLD", "ADMS all-equipment main-device inventory / symbol-validation reference", "ADMS-SLD.xlsx",
+                (
+                    "rmu", "device_type", "rmu_type", "smart", "feeder", "ip",
+                    "g_file", "fac_id", "is_smart", "smart_source", "device_form",
+                    "parent_rmu", "device_subtype", "profile_device_type", "xml_element",
+                    "element_id", "key_id", "key_name", "p_name_string", "standard_file",
+                    "standard_devref", "actual_devref", "symbol_validation", "validation_issue",
+                    "name_source", "name_confidence", "display_label", "display_label_distance",
+                    "quality_status", "x", "y", "w", "h",
+                ),
             ),
         ),
     ),

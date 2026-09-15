@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QSplashScreen
 from ..core import APP_NAME, APP_VERSION, resource_root
 from ..utils.paths import bundled_standard_reference_path
 from ..ui import APP_QSS, MainWindow
+from ..ui.input_guards import install_selection_wheel_guard
 
 
 def configure_windows_identity():
@@ -103,6 +104,9 @@ def main():
     app.setOrganizationName("NARI")
     app.setStyle("Fusion")
     app.setStyleSheet(APP_QSS)
+    # Safety rule: wheel scrolling must never change a drop-down/spin selection.
+    # Installed on QApplication so every current/future dialog is covered.
+    install_selection_wheel_guard(app)
 
     icon = runtime_app_icon()
     if not icon.isNull():

@@ -10,11 +10,11 @@ from migration_report_tool.version import __version__
 
 class IssueLifecycleTests(unittest.TestCase):
     def test_version_and_schema(self):
-        self.assertEqual(__version__, "0.8.143")
+        self.assertEqual(__version__, "0.8.196")
         with tempfile.TemporaryDirectory() as td:
             store = ProjectStore(Path(td) / "site")
             try:
-                self.assertEqual(store.project_schema_version(), 11)
+                self.assertEqual(store.project_schema_version(), 12)
                 names = {row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertIn("issue_cases", names)
                 self.assertIn("issue_events", names)
@@ -119,7 +119,7 @@ class IssueLifecycleTests(unittest.TestCase):
             db.commit(); db.close()
 
             version, backup = migrate_project_database(db_path, backups)
-            self.assertEqual(version, 11)
+            self.assertEqual(version, 12)
             self.assertIsNotNone(backup)
             db = sqlite3.connect(db_path)
             try:

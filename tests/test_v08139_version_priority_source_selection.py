@@ -23,7 +23,7 @@ class V08139VersionPrioritySourceSelectionTests(unittest.TestCase):
     def test_release_version(self):
         root = Path(__file__).resolve().parents[1]
         version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "0.8.143"', version)
+        self.assertIn('__version__ = "0.8.196"', version)
 
     def test_explicit_version_recognition_is_strict(self):
         self.assertTrue(has_explicit_source_version(Path("ZENON-SLD-V1.csv")))

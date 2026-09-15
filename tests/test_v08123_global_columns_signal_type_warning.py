@@ -10,6 +10,7 @@ from migration_report_tool.services.schema_service import (
     get_source_display_names,
     set_source_display_names,
     rmu_review_groups,
+    set_hidden_source_fields,
 )
 from migration_report_tool.services.rmu_review_service import rmu_type_issue_map
 
@@ -51,6 +52,9 @@ class GlobalColumnsAndSignalTypeWarningV08123Tests(unittest.TestCase):
             b_fields = b.custom_source_fields("adms_db")
             self.assertEqual([(x["field_key"], x["display_name"]) for x in b_fields], [("backup_ip", "IP-BAK")])
             self.assertEqual(b_fields[0]["actual_column"], "NET_DESCRIPTION1")
+            # Optional USER fields are hidden by default from v0.8.172;
+            # explicitly show all to verify the global definition/mapping.
+            set_hidden_source_fields(b, "adms_db", set(), "tester")
             groups = {group: list(columns) for group, _color, columns in rmu_review_groups(b)}
             self.assertTrue(any(label == "IP-BAK" for _key, label, _width in groups["ADMS DB"]))
         finally:

@@ -13,7 +13,7 @@ def _function_block(source: str, name: str, next_name: str) -> str:
 
 
 def test_pdf_rmu_open_list_has_no_comments_column():
-    assert '<th>Modification Item</th>' in PDF
+    assert '<th>Issue Type</th>' in PDF
     assert '<th>Original Value</th>' in PDF
     assert '<th>Target Value</th>' in PDF
     assert '<th>Source</th>' in PDF

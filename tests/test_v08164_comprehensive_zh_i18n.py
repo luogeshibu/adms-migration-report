@@ -7,7 +7,7 @@ VERSION = (ROOT / "src/migration_report_tool/version.py").read_text(encoding="ut
 
 
 def test_release_version_contract():
-    assert '__version__ = "0.8.164"' in VERSION
+    assert '__version__ = "0.8.196"' in VERSION
 
 
 def test_review_versions_and_site_history_have_chinese_meta_ui():

@@ -10,7 +10,7 @@ class V08127NonBlockingProcessLaunchTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.143"', self.version)
+        self.assertIn('__version__ = "0.8.196"', self.version)
 
     def test_process_spawn_is_launched_by_threadpool(self):
         block = self.ui[self.ui.index("def _start_process_background_task"):self.ui.index("def _reopen_active_store_after_worker")]
@@ -35,7 +35,7 @@ class V08127NonBlockingProcessLaunchTests(unittest.TestCase):
 
     def test_project_schema_unchanged(self):
         migrations = (self.root / "src" / "migration_report_tool" / "infrastructure" / "database" / "migrations.py").read_text(encoding="utf-8")
-        self.assertIn("TARGET_SCHEMA_VERSION = 11", migrations)
+        self.assertIn("TARGET_SCHEMA_VERSION = 12", migrations)
 
 
 if __name__ == "__main__":

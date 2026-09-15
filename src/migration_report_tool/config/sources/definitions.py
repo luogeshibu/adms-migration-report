@@ -26,7 +26,7 @@ SOURCE_SCHEMAS: dict[str, SourceSchema] = {
         F("feeder", "Feeder", "FEEDER", "FEEDR", required=True,
           description="Logical feeder identifier used by FEEDER Analysis."),
         F("rmu", "Equipment Name", "EQUIPMENT", "RMU", "RMU_NO", required=True,
-          description="Equipment identifier/name used to join the five source systems. RMU remains a supported legacy header alias."),
+          description="Equipment identifier/name used as the record identity for cross-source matching. RMU remains a supported legacy physical-header alias."),
         F("device_type", "Device Type", "DeviceType", "DEVICE TYPE", "DEVICE_TYPE", "EQUIPMENT CLASS", "EQUIPMENT_CLASS", "设备类型", "设备类别",
           warn_if_missing=False,
           description="Generic equipment family/class such as RMU/TRANSFORMER/LBS/FUSE/REC/SFI. This is intentionally separate from TYPE, which is the equipment subtype/cabinet type such as 2L1T/3L1T."),
@@ -74,7 +74,7 @@ SOURCE_SCHEMAS: dict[str, SourceSchema] = {
           warn_if_missing=False,
           description="Equipment class from the graphical inventory (RMU/CB/SFI/...). When present, the current RMU review profile filters DeviceType=RMU while retaining every other device row in the source inventory for future profiles."),
         F("rmu", "Equipment Name", "DeviceName", "RMU", "RMU_NO", required=True,
-          description="Stable equipment/device identifier. For the current RMU profile this is the RMU number/name used to join the other source systems."),
+          description="Stable equipment/device identifier used as the record identity for cross-source matching. RMU remains a legacy alias when the physical file uses that header."),
         # DeviceScope is deliberately preferred over Picture.  In Jeddah, for
         # example, Picture may be one station-level screen such as ADF110 while
         # DeviceScope carries the feeder identity (JED-CTL-ADF-16).  Picture is
@@ -145,19 +145,56 @@ SOURCE_SCHEMAS: dict[str, SourceSchema] = {
         F("q1", "Q1", "Q1"), F("q2", "Q2", "Q2"),
     )),
     "adms_sld": SourceSchema("adms_sld", "ADMS SLD", (
-        F("rmu", "Equipment Name", "环网柜名称", "设备名称", "RMU", "RMU_NO", "RMU_NAME", "NAME", "EQUIPMENT", "EQUIPMENT_NAME", required=True),
-        # Generic equipment class and physical subtype are separate contracts.
-        # `device_type` is the family (RMU/TRANSFORMER/FUSE/LBS/REC/...), while
-        # `rmu_type` remains the source TYPE/subtype field (2L1T/OH_TR/etc.).
-        F("device_type", "Device Type", "DeviceType", "DEVICE TYPE", "DEVICE_TYPE", "设备类型", "设备类别", warn_if_missing=False),
-        F("rmu_type", "Type / Subtype", "环网柜类型", "TYPE", "RMU_TYPE", "RMU TYPE", "柜型", "Subtype", "SUBTYPE"),
-        F("smart", "SMART", "是否智能", "智能标识", "SMART",
-          description="ADMS SLD SMART/NORMAL status. Prefer the explicit 是否智能 header when present; 智能标识 is retained only as a legacy alias."),
-        F("feeder", "Feeder", "FEEDER", "Feeder", "馈线", "馈线名称", "馈线名"),
-        F("link", "LINK", "LINK", "RMU可关联", "关联", "环网柜ID"),
+        # v0.8.165: G File Studio's ADMS-SLD workbook uses the all-equipment
+        # ``ADMS-SLD主设备`` sheet as the migration comparison source.  Keep the
+        # stable App/business keys used by Analysis, but map them to the real
+        # extractor headers and expose every remaining physical column as an
+        # optional built-in App field for review/traceability.
+        F("rmu", "Equipment Name", "DeviceName", "环网柜名称", "设备名称", "RMU", "RMU_NO", "RMU_NAME", "NAME", "EQUIPMENT", "EQUIPMENT_NAME", required=True,
+          description="Universal equipment identifier used as the record identity. ADMS-SLD主设备 DeviceName is the preferred header; legacy RMU/EQUIPMENT aliases remain supported."),
+        F("device_type", "Device Type", "DeviceType", "DEVICE TYPE", "DEVICE_TYPE", "设备类型", "设备类别", warn_if_missing=False,
+          description="Generic equipment family/class such as RMU/TRANSFORMER/LBS/FUSE/CB."),
+        F("rmu_type", "Type", "RMUType", "DeviceSubtype", "环网柜类型", "TYPE", "RMU_TYPE", "RMU TYPE", "柜型", "Subtype", "SUBTYPE",
+          description="Equipment subtype. For RMU rows ADMS-SLD主设备 RMUType is preferred (for example 2L1T/3L1T). DeviceSubtype is a fallback."),
+        F("smart", "SMART", "SmartType", "SMART", "是否智能", "智能标识",
+          description="Normalized SMART/NORMAL classification. ADMS-SLD主设备 SmartType is preferred; IsSmart is retained separately as source traceability."),
+        F("feeder", "Feeder", "facName", "FEEDER", "Feeder", "馈线", "馈线名称", "馈线名",
+          description="Feeder/scope identifier. ADMS-SLD主设备 facName is the preferred extractor field."),
+        F("link", "LINK", "LINK", "RMU可关联", "关联", "环网柜ID", warn_if_missing=False),
         F("ip", "IP", "IP", "IP_ADDRESS", "PRIMARY_IP", warn_if_missing=False,
-          description="Optional communication IP. If present it automatically participates in RMU Analysis IP consistency."),
-    )),
+          description="Optional communication IP. If present it participates in IP consistency Analysis."),
+
+        # Full ADMS-SLD主设备 traceability. These fields are presentation/reference
+        # inputs only unless promoted into SYSTEM_LOGIC_FIELD_KEYS later. They are
+        # therefore visible in Equipment Data Review and can be hidden by users.
+        F("g_file", "G File", "GFile", warn_if_missing=False),
+        F("fac_id", "Facility ID", "facID", warn_if_missing=False),
+        F("is_smart", "Is Smart", "IsSmart", warn_if_missing=False),
+        F("smart_source", "Smart Source", "SmartSource", warn_if_missing=False),
+        F("device_form", "Device Form", "DeviceForm", warn_if_missing=False),
+        F("parent_rmu", "Parent RMU", "ParentRMU", warn_if_missing=False),
+        F("device_subtype", "Device Subtype", "DeviceSubtype", warn_if_missing=False),
+        F("profile_device_type", "Profile Device Type", "ProfileDeviceType", warn_if_missing=False),
+        F("xml_element", "XML Element", "XML Element", "XMLElement", warn_if_missing=False),
+        F("element_id", "Element ID", "ElementID", warn_if_missing=False),
+        F("key_id", "Key ID", "keyid", "KeyID", warn_if_missing=False),
+        F("key_name", "Key Name", "key_name", "KeyName", warn_if_missing=False),
+        F("p_name_string", "p_NameString", "p_NameString", "PNameString", warn_if_missing=False),
+        F("standard_file", "Standard File", "StandardFile", warn_if_missing=False),
+        F("standard_devref", "Standard Devref", "StandardDevref", warn_if_missing=False),
+        F("actual_devref", "Actual Devref", "ActualDevref", warn_if_missing=False),
+        F("symbol_validation", "Symbol Validation", "SymbolValidation", warn_if_missing=False),
+        F("validation_issue", "Validation Issue", "ValidationIssue", warn_if_missing=False),
+        F("name_source", "Name Source", "NameSource", warn_if_missing=False),
+        F("name_confidence", "Name Confidence", "NameConfidence", warn_if_missing=False),
+        F("display_label", "Display Label", "DisplayLabel", warn_if_missing=False),
+        F("display_label_distance", "Display Label Distance", "DisplayLabelDistance", warn_if_missing=False),
+        F("quality_status", "Quality Status", "QualityStatus", warn_if_missing=False),
+        F("x", "X", "x", "X", warn_if_missing=False),
+        F("y", "Y", "y", "Y", warn_if_missing=False),
+        F("w", "Width", "w", "W", warn_if_missing=False),
+        F("h", "Height", "h", "H", warn_if_missing=False),
+    ), sheet_name="ADMS-SLD主设备"),
     "ioa": SourceSchema("ioa", "ZENON-ADMS IOA", (
         F("rmu", "RMU", "RMU_NO", "RMU", required=True),
         F("zenon_gss_fid", "ZENON_GSS-FID", "ZENON_GSS-FID", "ZENON_GSS_FID"),

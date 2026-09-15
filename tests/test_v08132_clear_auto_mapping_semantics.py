@@ -10,16 +10,16 @@ class ClearAutoMappingSemanticsTest(unittest.TestCase):
         cls.version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.143"', self.version)
+        self.assertIn('__version__ = "0.8.196"', self.version)
 
     def test_auto_option_is_stable_mode_with_visible_resolution(self):
         self.assertIn('auto_label = f"Auto → {auto_resolved}" if auto_resolved else "Auto · No match"', self.ui)
         self.assertIn('combo.addItem(auto_label, "")', self.ui)
-        self.assertIn('Auto currently resolves this App field to Source Field', self.ui)
+        self.assertIn('Automatic mapping. Current resolved Source Field:', self.ui)
 
     def test_auto_resolution_is_explained_in_tooltip(self):
-        self.assertIn('Auto currently resolves this App field to Source Field', self.ui)
-        self.assertIn('Choose Auto to remove the manual mapping', self.ui)
+        self.assertIn('Automatic mapping. Current resolved Source Field:', self.ui)
+        self.assertIn('# Auto is represented by no override at all.', self.ui)
         self.assertNotIn('auto_column=', self.ui)
 
 

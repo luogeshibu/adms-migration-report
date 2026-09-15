@@ -28,7 +28,7 @@ def _feeder_row():
     }
 
 
-def test_resolution_batch_saves_and_derives_review_in_one_public_call():
+def test_resolution_batch_saves_without_deriving_review_status():
     with tempfile.TemporaryDirectory() as td:
         store = ProjectStore(Path(td) / "site")
         try:
@@ -48,9 +48,9 @@ def test_resolution_batch_saves_and_derives_review_in_one_public_call():
                 },
                 "tester",
             )
-            assert status == "CLOSED"
+            assert status == "UNREVIEWED"
             assert "approved feeder assignment" in summary
-            assert store.rmu_review_map()["27547"]["review_status"] == "CLOSED"
+            assert store.rmu_review_map()["27547"]["review_status"] == "UNREVIEWED"
         finally:
             store.close()
 

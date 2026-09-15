@@ -16,6 +16,8 @@ from ..infrastructure.database.global_settings_store import (
     source_field_overrides as global_source_field_overrides,
     replace_source_field_overrides as replace_global_source_field_overrides,
     ensure_source_field_overrides as ensure_global_source_field_overrides,
+    source_hidden_fields as global_source_hidden_fields,
+    replace_source_hidden_fields as replace_global_source_hidden_fields,
 )
 
 
@@ -169,6 +171,12 @@ SIGNAL_REVIEW_DISPLAY_BINDINGS: dict[str, tuple[str, str]] = {
 # These fields are protected in Source Mapping.  Other built-in presentation
 # fields may be hidden/restored by the user without changing parsing or
 # validation algorithms.
+#
+# IMPORTANT: the historical internal key ``rmu`` is retained for database and
+# project compatibility, but for equipment sources its canonical SYSTEM meaning
+# is **Equipment Name / Record Identity**, not "RMU".  User-facing SYSTEM
+# mapping UI must use the canonical FieldSpec label rather than legacy review
+# presentation labels.
 SYSTEM_LOGIC_FIELD_KEYS: dict[str, set[str]] = {
     "se_list": {"rmu", "device_type", "feeder", "smart", "rmu_type", "ip"},
     "zenon_db": {"rmu", "device_type", "feeder", "rmu_type", "smart", "ip", "port"},
@@ -196,6 +204,19 @@ def equipment_review_protected_column_keys(store=None) -> set[str]:
     Optional/reference App fields and USER-added App columns remain reviewer
     controlled.
     """
+    if store is not None:
+        try:
+            from .configurable_comparison_service import get_config, analysis_column_key
+            configurable = get_config(store, bootstrap=False)
+            if configurable.get("sources"):
+                return {
+                    "no", "rmu", "equipment_source_count", "equipment_missing_sources",
+                    "remarks", "comments",
+                    *{analysis_column_key(rule.get("id")) for rule in configurable.get("comparisons", []) if rule.get("id")},
+                }
+        except Exception:
+            pass
+
     protected = {
         "no", "rmu", "equipment_device_type",
         "equipment_source_count", "equipment_missing_sources",
@@ -211,29 +232,87 @@ def equipment_review_protected_column_keys(store=None) -> set[str]:
 
 
 def get_hidden_source_fields(store, source_type: str) -> set[str]:
+    """Return application-global source fields hidden from Equipment Data Review.
+
+    v0.8.175 makes Map Fields visibility a true App-wide preference.  Mapping,
+    App display names, Show/Hide and App-column order are shared by source type
+    across every station.  A legacy per-site ``project.json`` visibility choice
+    is promoted only when no global choice exists; after that, stale choices in
+    other stations can never overwrite the global setting.
+
+    Until any visibility preference exists, v0.8.171's compact default remains:
+    optional fields start hidden while SYSTEM calculation fields stay visible.
+    """
+    source_type = str(source_type or "").strip()
+    locked = system_logic_field_keys(source_type)
+
+    try:
+        global_values = global_source_hidden_fields(source_type)
+    except Exception:
+        global_values = None
+    if global_values is not None:
+        return {str(value).strip() for value in global_values if str(value).strip()} - locked
+
+    # Upgrade path: an explicit old site-local visibility choice becomes the
+    # initial global choice.  This is merge-once semantics: once global state
+    # exists, opening another station with stale project.json cannot replace it.
+    if store:
+        root = store.config.get("hidden_source_fields", {}) or {}
+        if source_type in root:
+            values = {str(value).strip() for value in (root.get(source_type, []) or []) if str(value).strip()} - locked
+            try:
+                replace_global_source_hidden_fields(source_type, values, "migration")
+            except Exception:
+                pass
+            return values
+
     if not store:
         return set()
-    root = store.config.get("hidden_source_fields", {}) or {}
-    values = root.get(source_type, []) or []
-    return {str(value).strip() for value in values if str(value).strip()}
+
+    # No explicit visibility preference has ever been saved for this source.
+    # Default-hide every optional built-in field plus every source-driven USER
+    # field. SYSTEM calculation fields stay visible and cannot be hidden.
+    schema = schema_for(source_type)
+    hidden: set[str] = set()
+    if schema is not None:
+        hidden.update(spec.key for spec in schema.fields if spec.key not in locked)
+    try:
+        hidden.update(
+            str(item.get("field_key") or "").strip()
+            for item in (store.custom_source_fields(source_type) or [])
+            if str(item.get("field_key") or "").strip()
+        )
+    except Exception:
+        pass
+    return hidden
 
 
 def set_hidden_source_fields(store, source_type: str, field_keys, modified_by: str = "") -> None:
-    if not store:
-        return
+    """Save Show/Hide globally while keeping the current project's legacy copy.
+
+    The global settings database is authoritative.  Updating the current site's
+    project.json is only for backward compatibility/audit safety; other station
+    databases do not need to be rewritten because they read the shared setting
+    on demand.
+    """
+    source_type = str(source_type or "").strip()
     locked = system_logic_field_keys(source_type)
     cleaned = sorted({str(value).strip() for value in (field_keys or []) if str(value).strip()} - locked)
-    root = store.config.setdefault("hidden_source_fields", {})
     before = sorted(get_hidden_source_fields(store, source_type))
-    root[source_type] = cleaned
-    store.save_config()
-    if before != cleaned and hasattr(store, "record_schema_mapping_change"):
-        store.record_schema_mapping_change(
-            source_type,
-            {"hidden_optional_fields": before},
-            {"hidden_optional_fields": cleaned},
-            modified_by,
-        )
+
+    replace_global_source_hidden_fields(source_type, cleaned, modified_by)
+
+    if store:
+        root = store.config.setdefault("hidden_source_fields", {})
+        root[source_type] = cleaned
+        store.save_config()
+        if before != cleaned and hasattr(store, "record_schema_mapping_change"):
+            store.record_schema_mapping_change(
+                source_type,
+                {"hidden_optional_fields": before},
+                {"hidden_optional_fields": cleaned},
+                modified_by,
+            )
 
 
 def get_source_column_order(store, source_type: str) -> list[str] | None:
@@ -332,7 +411,10 @@ def module_field_mapping_lines(module_key: str, source_type: str, store, validat
         except Exception:
             custom = []
         for item in custom or []:
-            app_name = str((item or {}).get("display_name") or (item or {}).get("field_key") or "").strip()
+            field_key = str((item or {}).get("field_key") or "").strip()
+            if field_key in hidden:
+                continue
+            app_name = str((item or {}).get("display_name") or field_key).strip()
             actual = str((item or {}).get("actual_column") or "").strip()
             if app_name:
                 lines.append(f"{app_name} ← {actual or '—'}")
@@ -416,6 +498,23 @@ def _presentation_default_labels() -> dict[tuple[str, str], str]:
 
 def default_display_name(source_type: str, field_key: str, fallback: str = "") -> str:
     return _presentation_default_labels().get((str(source_type), str(field_key)), fallback) or fallback
+
+
+def canonical_system_field_label(source_type: str, field_key: str, fallback: str = "") -> str:
+    """Return the canonical business semantic shown in SYSTEM mapping UI.
+
+    Presentation/App labels may intentionally mirror a physical header or a
+    historical review-table name (for example ``RMU``).  SYSTEM assignments
+    must not use those presentation aliases because the protected semantic is
+    the generic record identity.  For equipment sources the legacy internal
+    key ``rmu`` therefore renders as ``Equipment Name``.
+    """
+    schema = schema_for(str(source_type or ""))
+    if schema is not None:
+        spec = next((item for item in schema.fields if item.key == str(field_key or "")), None)
+        if spec is not None and str(spec.label or "").strip():
+            return str(spec.label).strip()
+    return str(fallback or field_key or "").strip()
 
 
 def get_source_display_names(store, source_type: str) -> dict[str, str]:
@@ -537,6 +636,8 @@ def rmu_review_groups(store):
             display_name = str((item or {}).get("display_name") or field_key).strip()
             if not field_key or not display_name:
                 continue
+            if field_key in hidden_by_source.get(source_type, set()):
+                continue
             review_key = custom_review_column_key(source_type, field_key)
             custom_field_by_review_key[review_key] = field_key
             custom_by_group.setdefault(group_name, []).append((review_key, display_name, 130))
@@ -590,14 +691,167 @@ def validate_required_source(source_type: str, path: Path, store=None):
 
 
 
-def equipment_source_review_groups(store):
-    """Return the universal five-source Equipment Data Review layout.
+def _live_review_source_validation(store, source_type: str):
+    """Return cached validation for the active physical source used by Review.
 
-    Every visible App field in Source Mapping is a candidate review column.
-    The fixed core columns keep their established keys/order, while additional
-    built-in optional fields and USER App columns are appended using stable
-    source-scoped keys.  Reviewer visibility is handled separately by the
-    Columns dialog; this function only defines which App fields exist.
+    v0.8.168: Equipment Data Review must mirror the *current physical header*,
+    not the static canonical schema.  Cache by file metadata + sheet + mapping
+    overrides so repeated header/layout refreshes never repeatedly reopen a
+    large workbook when nothing changed.
+    """
+    if not store or not hasattr(store, "source_path"):
+        return None
+    try:
+        path = store.source_path(source_type)
+    except Exception:
+        path = None
+    if not path:
+        return None
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        stat = path.stat()
+        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return None
+    sheet_name = ""
+    if path.suffix.lower() in {".xlsx", ".xlsm"} and hasattr(store, "source_sheet_name"):
+        try:
+            sheet_name = str(store.source_sheet_name(source_type) or "")
+        except Exception:
+            sheet_name = ""
+    overrides = get_source_overrides(store, source_type)
+    override_key = tuple(sorted((str(k), str(v)) for k, v in dict(overrides or {}).items()))
+    cache_key = (str(source_type), str(path.resolve()), signature, sheet_name, override_key)
+    cache = getattr(_live_review_source_validation, "_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(_live_review_source_validation, "_cache", cache)
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        result = validate_source_file(
+            source_type, path, overrides,
+            sheet_name=sheet_name or None,
+        )
+    except Exception:
+        result = None
+    # Keep a small process-local cache.  Old metadata signatures are harmless,
+    # but pruning avoids unbounded growth during repeated Excel saves.
+    if len(cache) >= 64:
+        cache.clear()
+    cache[cache_key] = result
+    return result
+
+
+def _live_review_columns_for_source(store, source_type: str, validation):
+    """Build exactly one review column for each mapped live physical header.
+
+    This intentionally mirrors SourceMappingDialog's ownership rule: when one
+    physical header satisfies multiple legacy aliases, SYSTEM/required semantics
+    win and the header is rendered once.  Unmatched headers are represented by
+    persisted source-driven USER fields after Map Fields has saved them.
+    """
+    schema = schema_for(source_type)
+    if schema is None or validation is None:
+        return []
+    headers = [str(value).strip() for value in tuple(validation.headers or ()) if str(value).strip()]
+    if not headers:
+        return []
+    header_lookup = {value.casefold(): value for value in headers}
+    locked_fields = system_logic_field_keys(source_type)
+    candidates: dict[str, list[tuple[int, int, str]]] = {}
+    by_key = validation.mapping_by_key
+    for index, spec in enumerate(schema.fields):
+        mapping = by_key.get(spec.key)
+        actual = str(getattr(mapping, "actual_column", "") or "").strip()
+        hk = actual.casefold()
+        if not hk or hk not in header_lookup:
+            continue
+        priority = 0
+        if spec.key in locked_fields:
+            priority += 100
+        if spec.required:
+            priority += 20
+        if getattr(mapping, "kind", None) == MappingKind.EXACT:
+            priority += 5
+        candidates.setdefault(hk, []).append((-priority, index, spec.key))
+    owners = {hk: sorted(values)[0][2] for hk, values in candidates.items()}
+
+    try:
+        custom_fields = [dict(item or {}) for item in (store.custom_source_fields(source_type) or [])]
+    except Exception:
+        custom_fields = []
+    custom_by_header: dict[str, dict] = {}
+    for item in custom_fields:
+        actual = str(item.get("actual_column") or "").strip()
+        if actual:
+            custom_by_header.setdefault(actual.casefold(), item)
+
+    display_names = get_source_display_names(store, source_type)
+    hidden = get_hidden_source_fields(store, source_type)
+    rows: list[tuple[str, str, str, int]] = []  # field_key, review_key, label, width
+    for header in headers:
+        hk = header.casefold()
+        owner_key = owners.get(hk)
+        if owner_key:
+            # SYSTEM fields cannot be persisted hidden; keep the defensive check
+            # here so an old config can never suppress a calculation input.
+            if owner_key in hidden and owner_key not in locked_fields:
+                continue
+            review_key = equipment_review_column_key(source_type, owner_key)
+            label = str(display_names.get(owner_key) or header).strip() or header
+            width = 180 if any(token in owner_key for token in ("name", "destination", "location", "reason")) else 130
+            rows.append((owner_key, review_key, label, width))
+            continue
+
+        item = custom_by_header.get(hk)
+        if item is None:
+            # A brand-new source header first appears in Map Fields.  It becomes
+            # a review column after Save creates/persists its source-driven App
+            # row; until then there is no row-data key to render safely.
+            continue
+        field_key = str(item.get("field_key") or "").strip()
+        if not field_key or field_key in hidden:
+            continue
+        label = str(item.get("display_name") or header).strip() or header
+        rows.append((field_key, custom_review_column_key(source_type, field_key), label, 130))
+
+    order = get_source_column_order(store, source_type) or []
+    if order:
+        by_field = {field_key: row for field_key, *rest in rows for row in [(field_key, *rest)]}
+        ordered = [by_field[key] for key in order if key in by_field]
+        used = {row[0] for row in ordered}
+        ordered.extend(row for row in rows if row[0] not in used)
+        rows = ordered
+    return [(review_key, label, width) for _field_key, review_key, label, width in rows]
+
+
+def equipment_source_review_groups(store):
+    # v0.8.178: once a site has the configurable comparison source layer, the
+    # review grid is generated directly from that site's real files/rules.
+    if store is not None:
+        try:
+            from .configurable_comparison_service import get_config, review_groups
+            configurable = get_config(store, bootstrap=False)
+            if configurable.get("sources"):
+                return review_groups(store)
+        except Exception:
+            # Keep the historical five-source layout as a safety fallback so a
+            # malformed in-progress configuration never prevents the project from opening.
+            pass
+
+    """Return the universal Equipment Data Review layout.
+
+    v0.8.168 source groups are *physical-header driven*: for an active project,
+    SE / ZENON DB / ZENON SLD / ADMS DB / ADMS SLD show exactly the columns that
+    exist in each current file, minus optional rows hidden in Map Fields.  A
+    canonical SYSTEM field is forced visible only when its physical source row
+    actually exists; missing physical fields never create phantom review columns.
+
+    Index / Source Coverage / Analysis / Remarks / Resolution remain application
+    columns and are not physical source rows.
     """
     from ..config.column_schema import EQUIPMENT_SOURCE_GROUPS
 
@@ -614,94 +868,72 @@ def equipment_source_review_groups(store):
         "ADMS DB": "adms_db",
         "ADMS SLD": "adms_sld",
     }
-    hidden_by_source = {
-        source_type: get_hidden_source_fields(store, source_type)
-        for source_type in source_by_group.values()
-    }
-
-    # Build a complete built-in field catalog.  Fields already represented by
-    # the fixed universal grid retain their original review keys; the remaining
-    # mapped App fields become dynamic source-scoped columns.
-    builtin_by_group: dict[str, list[tuple[str, str, int]]] = {}
-    field_by_review_key: dict[str, str] = {}
-    for group_name, source_type in source_by_group.items():
-        schema = schema_for(source_type)
-        if schema is None:
-            continue
-        display_names = get_source_display_names(store, source_type)
-        hidden = hidden_by_source.get(source_type, set())
-        # Only treat fields as already present when their review key is actually
-        # part of this source group's fixed base layout.  The binding catalog is
-        # intentionally broader than the fixed grid (it also contains historical
-        # optional fields such as Resolved Full Name), so using the whole binding
-        # catalog here would incorrectly suppress those optional App fields.
-        base_group = next((columns for name, _color, columns in base if name == group_name), ())
-        base_review_keys = {column[0] for column in base_group}
-        fixed_fields = {
-            field_key
-            for review_key, (bound_source, field_key) in EQUIPMENT_SOURCE_DISPLAY_BINDINGS.items()
-            if bound_source == source_type and review_key in base_review_keys
+    # Preserve the historical schema-only fallback for an empty/new ProjectStore
+    # with no source files at all.  Once any physical source is active, the
+    # review becomes source-faithful and missing source files contribute 0 cols.
+    has_any_live_source = False
+    if hasattr(store, "source_path"):
+        for source_type in source_by_group.values():
+            try:
+                if store.source_path(source_type):
+                    has_any_live_source = True
+                    break
+            except Exception:
+                pass
+    if not has_any_live_source:
+        # Keep legacy schema catalog behavior for tooling/tests before a site has
+        # loaded physical sources.  Source-driven behavior starts with real data.
+        hidden_by_source = {
+            source_type: get_hidden_source_fields(store, source_type)
+            for source_type in source_by_group.values()
         }
-        for spec in schema.fields:
-            if spec.key in hidden or spec.key in fixed_fields:
+        resolved = []
+        for group, color, columns in base:
+            source_type = source_by_group.get(group)
+            if not source_type:
+                resolved.append((group, color, columns))
                 continue
-            review_key = equipment_review_column_key(source_type, spec.key)
-            label = display_names.get(spec.key) or default_display_name(source_type, spec.key, spec.label)
-            width = 180 if any(token in spec.key for token in ("name", "destination", "location", "reason")) else 130
-            builtin_by_group.setdefault(group_name, []).append((review_key, label, width))
-            field_by_review_key[review_key] = spec.key
-
-    # Remove mapping-level hidden optional built-ins from the fixed core groups.
-    filtered = []
-    for group, color, columns in base:
-        kept = []
-        for column in columns:
-            key = column[0]
-            binding = EQUIPMENT_SOURCE_DISPLAY_BINDINGS.get(key)
-            if binding and binding[1] in hidden_by_source.get(binding[0], set()):
-                continue
-            kept.append(column)
-        filtered.append((group, color, tuple(kept)))
-    base = filtered
-
-    custom_by_group: dict[str, list[tuple[str, str, int]]] = {}
-    custom_field_by_review_key: dict[str, str] = {}
-    for group_name, source_type in source_by_group.items():
-        try:
-            fields = store.custom_source_fields(source_type)
-        except Exception:
-            fields = []
-        for item in fields or []:
-            field_key = str((item or {}).get("field_key") or "").strip()
-            display_name = str((item or {}).get("display_name") or field_key).strip()
-            if not field_key or not display_name:
-                continue
-            review_key = custom_review_column_key(source_type, field_key)
-            custom_field_by_review_key[review_key] = field_key
-            custom_by_group.setdefault(group_name, []).append((review_key, display_name, 130))
+            hidden = hidden_by_source.get(source_type, set())
+            kept = []
+            for column in columns:
+                binding = EQUIPMENT_SOURCE_DISPLAY_BINDINGS.get(column[0])
+                if binding and binding[1] in hidden:
+                    continue
+                kept.append(column)
+            schema = schema_for(source_type)
+            fixed_fields = {
+                binding[1] for key, binding in EQUIPMENT_SOURCE_DISPLAY_BINDINGS.items()
+                if binding[0] == source_type and any(c[0] == key for c in columns)
+            }
+            display_names = get_source_display_names(store, source_type)
+            if schema is not None:
+                for spec in schema.fields:
+                    if spec.key in hidden or spec.key in fixed_fields:
+                        continue
+                    label = display_names.get(spec.key) or default_display_name(source_type, spec.key, spec.label)
+                    width = 180 if any(token in spec.key for token in ("name", "destination", "location", "reason")) else 130
+                    kept.append((equipment_review_column_key(source_type, spec.key), label, width))
+            try:
+                custom = store.custom_source_fields(source_type) or []
+            except Exception:
+                custom = []
+            for item in custom:
+                field_key = str((item or {}).get("field_key") or "").strip()
+                label = str((item or {}).get("display_name") or field_key).strip()
+                if field_key and label and field_key not in hidden:
+                    kept.append((custom_review_column_key(source_type, field_key), label, 130))
+            resolved.append((group, color, tuple(kept)))
+        return tuple(resolved)
 
     resolved = []
     for group, color, columns in base:
-        combined = list(columns) + list(builtin_by_group.get(group, ())) + list(custom_by_group.get(group, ()))
         source_type = source_by_group.get(group)
-        order = get_source_column_order(store, source_type) if source_type else None
-        if source_type:
-            # Record fixed source bindings for ordering lookup as well.
-            for review_key, binding in EQUIPMENT_SOURCE_DISPLAY_BINDINGS.items():
-                if binding[0] == source_type:
-                    field_by_review_key.setdefault(review_key, binding[1])
-        if source_type and order:
-            field_to_column: dict[str, tuple[str, str, int]] = {}
-            for column in combined:
-                review_key = column[0]
-                field_key = field_by_review_key.get(review_key) or custom_field_by_review_key.get(review_key, "")
-                if field_key and field_key not in field_to_column:
-                    field_to_column[field_key] = column
-            reordered = [field_to_column[key] for key in order if key in field_to_column]
-            used = {column[0] for column in reordered}
-            reordered.extend(column for column in combined if column[0] not in used)
-            combined = reordered
-        resolved.append((group, color, tuple(combined)))
+        if not source_type:
+            resolved.append((group, color, columns))
+            continue
+        validation = _live_review_source_validation(store, source_type)
+        live_columns = _live_review_columns_for_source(store, source_type, validation)
+        resolved.append((group, color, tuple(live_columns)))
     return tuple(resolved)
 
 def validation_summary(result) -> str:

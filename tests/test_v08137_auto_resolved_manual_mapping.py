@@ -20,11 +20,11 @@ class V08137AutoResolvedManualMappingTests(unittest.TestCase):
         cls.version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.143"', self.version)
+        self.assertIn('__version__ = "0.8.196"', self.version)
 
     def test_auto_label_shows_current_resolved_header_when_available(self):
         self.assertIn('auto_label = f"Auto → {auto_resolved}" if auto_resolved else "Auto · No match"', self.ui)
-        self.assertIn('auto_resolved = mapping.actual_column if mapping.kind in {MappingKind.EXACT, MappingKind.ALIAS} else ""', self.ui)
+        self.assertIn('auto_resolved = source_header', self.ui)
 
     def test_auto_label_stays_plain_when_unresolved(self):
         self.assertIn('auto_label = f"Auto → {auto_resolved}" if auto_resolved else "Auto · No match"', self.ui)

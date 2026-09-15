@@ -640,7 +640,7 @@ class ProjectStore:
 
         Field mappings are global by source type, while sheet selection belongs
         to this site's physical file and therefore lives in the ProjectStore.
-        Missing/blank means AUTO (first usable sheet in workbook order).
+        Missing/blank means AUTO (source-preferred business sheet when configured; otherwise first usable sheet).
         """
         raw = self.config.get("source_sheet_selections", {}) or {}
         return dict(raw.get(str(source_type), {}) or {})
@@ -688,20 +688,59 @@ class ProjectStore:
     _RMU_ANALYSIS_FIELDS = ("NAME", "FEEDER", "SMART", "TYPE", "IP")
 
     @classmethod
+    def _analysis_field_ids(cls, row: dict) -> list[str]:
+        """Return stable Analysis ids for legacy or configurable review rows."""
+        configured = [clean(value) for value in ((row or {}).get("analysis_field_order") or []) if clean(value)]
+        return [value.upper() for value in configured] if configured else list(cls._RMU_ANALYSIS_FIELDS)
+
+    @classmethod
+    def _analysis_field_original_id(cls, row: dict, field: str) -> str:
+        wanted = clean(field).upper()
+        for value in ((row or {}).get("analysis_field_order") or []):
+            if clean(value).upper() == wanted:
+                return clean(value)
+        return wanted
+
+    @classmethod
+    def _analysis_value_key(cls, row: dict, field: str) -> str:
+        original = cls._analysis_field_original_id(row, field)
+        mapping = dict((row or {}).get("analysis_field_keys") or {})
+        for key, value in mapping.items():
+            if clean(key).upper() == clean(field).upper():
+                return clean(value)
+        return f"analysis_{clean(original).lower()}"
+
+    @classmethod
+    def _analysis_field_label(cls, row: dict, field: str) -> str:
+        labels = dict((row or {}).get("analysis_field_labels") or {})
+        for key, value in labels.items():
+            if clean(key).upper() == clean(field).upper():
+                return clean(value) or clean(field)
+        return clean(field)
+
+    @classmethod
+    def _analysis_candidates(cls, row: dict, field: str) -> list[dict]:
+        candidates = dict((row or {}).get("resolution_candidates") or {})
+        for key, value in candidates.items():
+            if clean(key).upper() == clean(field).upper():
+                return list(value or [])
+        return []
+
+    @classmethod
     def _active_rmu_issue_fields(cls, row: dict) -> list[str]:
         return [
-            field for field in cls._RMU_ANALYSIS_FIELDS
-            if clean((row or {}).get(f"analysis_{field.lower()}" )).upper() == "FALSE"
+            field for field in cls._analysis_field_ids(row)
+            if clean((row or {}).get(cls._analysis_value_key(row, field))).upper() == "FALSE"
         ]
 
-    @staticmethod
-    def _rmu_field_fingerprint(row: dict, field: str) -> str:
+    @classmethod
+    def _rmu_field_fingerprint(cls, row: dict, field: str) -> str:
         field = clean(field).upper()
-        key = f"analysis_{field.lower()}"
-        candidates = ((row or {}).get("resolution_candidates") or {}).get(field, [])
+        key = cls._analysis_value_key(row, field)
+        candidates = cls._analysis_candidates(row, field)
         payload = {
             "result": clean((row or {}).get(key)),
-            "detail": clean((row or {}).get(f"{key}_detail")),
+            "detail": clean((row or {}).get(f"{key}__detail") or (row or {}).get(f"{key}_detail")),
             "candidates": candidates,
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -756,14 +795,16 @@ class ProjectStore:
         data = dict(record) if not isinstance(record, dict) else record
         return resolution_display_text(data)
 
-    @staticmethod
-    def _resolution_issue_snapshot(row: dict, field: str) -> dict:
+    @classmethod
+    def _resolution_issue_snapshot(cls, row: dict, field: str) -> dict:
         field = clean(field).upper()
-        candidates = list((((row or {}).get("resolution_candidates") or {}).get(field, []) or []))
+        key = cls._analysis_value_key(row, field)
+        candidates = cls._analysis_candidates(row, field)
         return {
             "analysis_field": field,
-            "analysis_result": clean((row or {}).get(f"analysis_{field.lower()}")),
-            "analysis_detail": clean((row or {}).get(f"analysis_{field.lower()}_detail")),
+            "analysis_label": cls._analysis_field_label(row, field),
+            "analysis_result": clean((row or {}).get(key)),
+            "analysis_detail": clean((row or {}).get(f"{key}__detail") or (row or {}).get(f"{key}_detail")),
             "source_values": [dict(item or {}) for item in candidates],
         }
 
@@ -778,28 +819,34 @@ class ProjectStore:
             result.setdefault(clean(row["rmu"]), {})[clean(row["analysis_field"]).upper()] = dict(row)
         return result
 
+    @classmethod
+    def _ordered_resolution_fields(cls, resolutions: dict) -> list[str]:
+        legacy = [field for field in cls._RMU_ANALYSIS_FIELDS if field in resolutions]
+        extra = sorted(field for field in resolutions if field not in cls._RMU_ANALYSIS_FIELDS)
+        return legacy + extra
+
     def rmu_resolution_summary(self, rmu: str) -> str:
         resolutions = self.rmu_resolution_map(rmu)
-        parts = []
-        for field in self._RMU_ANALYSIS_FIELDS:
-            record = resolutions.get(field)
-            if not record:
-                continue
-            parts.append(self._resolution_record_summary(record))
-        return "\n".join(parts)
+        return "\n".join(
+            self._resolution_record_summary(resolutions[field])
+            for field in self._ordered_resolution_fields(resolutions)
+        )
 
     def rmu_resolution_review_text(self, rmu: str) -> str:
         """Latest customer-facing Resolution plus independent per-issue comments."""
         resolutions = self.rmu_resolution_map(rmu)
         parts: list[str] = []
-        for field in self._RMU_ANALYSIS_FIELDS:
-            record = resolutions.get(field)
-            if not record:
-                continue
+        for field in self._ordered_resolution_fields(resolutions):
+            record = resolutions[field]
             parts.append(self._resolution_record_summary(record))
             comment = clean(record.get("customer_comment"))
             if comment:
-                parts.append(f"{field} comment: {comment}")
+                try:
+                    snapshot = json.loads(clean(record.get("issue_snapshot_json")) or "{}")
+                except Exception:
+                    snapshot = {}
+                label = clean(snapshot.get("analysis_label")) or field
+                parts.append(f"{label} comment: {comment}")
         return "\n".join(parts)
 
     def rmu_resolution_tooltip(self, rmu: str) -> str:
@@ -807,17 +854,16 @@ class ProjectStore:
         if not resolutions:
             return "No Resolution decisions recorded."
         lines = []
-        for field in self._RMU_ANALYSIS_FIELDS:
-            record = resolutions.get(field)
-            if not record:
-                continue
+        for field in self._ordered_resolution_fields(resolutions):
+            record = resolutions[field]
             try:
                 snapshot = json.loads(clean(record.get("issue_snapshot_json")) or "{}")
             except Exception:
                 snapshot = {}
+            label = clean(snapshot.get("analysis_label")) or field
             detail = clean(snapshot.get("analysis_detail"))
             if detail:
-                lines.append(f"{field} issue:\n{detail}")
+                lines.append(f"{label} issue:\n{detail}")
             lines.append(f"Agreed resolution:\n{self._resolution_record_summary(record)}")
             customer_comment = clean(record.get("customer_comment"))
             if customer_comment:
@@ -834,8 +880,8 @@ class ProjectStore:
         rmu = clean(rmu)
         field = clean(analysis_field).upper()
         decision = clean(decision_type).upper()
-        if not rmu or field not in self._RMU_ANALYSIS_FIELDS:
-            raise ValueError("RMU and a valid Analysis field are required")
+        if not rmu or not field:
+            raise ValueError("Equipment key and Analysis field are required")
         if decision not in {"USE_SOURCE", "NEEDS_ACTION", "ACCEPT_EXCEPTION", "OTHER"}:
             raise ValueError(f"Unsupported Resolution decision: {decision}")
         if decision == "OTHER" and not clean(selected_value):
@@ -992,91 +1038,22 @@ class ProjectStore:
         record = record or {}
         return clean(record.get("normalized_value") or record.get("selected_value")).upper()
 
-    @staticmethod
-    def _adms_db_candidate_for_field(row: dict, field: str) -> dict | None:
-        """Return the ADMS DB candidate for an Analysis field when available.
-
-        ADMS DB is the customer's reference for NAME / FEEDER / SMART / TYPE.
-        Some checks, notably IP, intentionally have no ADMS DB candidate; those
-        keep the pre-v0.8.54 Resolution behavior.
-        """
-        candidates = list((((row or {}).get("resolution_candidates") or {}).get(clean(field).upper(), []) or []))
-        for candidate in candidates:
-            if clean((candidate or {}).get("source")).upper() == "ADMS DB":
-                return dict(candidate or {})
-        return None
-
-    @classmethod
-    def _resolution_differs_from_adms_db(cls, row: dict, field: str, record: dict | None) -> bool:
-        """True when a USE_SOURCE choice disagrees with an available ADMS DB value.
-
-        Only fields that actually expose an ADMS DB validation candidate use
-        this rule. If ADMS DB is absent/blank for the field, existing Resolution
-        semantics are preserved.
-        """
-        record = record or {}
-        if clean(record.get("decision_type")).upper() != "USE_SOURCE":
-            return False
-        adms = cls._adms_db_candidate_for_field(row, field)
-        if not adms:
-            return False
-        adms_value = clean(adms.get("normalized") or adms.get("value")).upper()
-        if not adms_value:
-            return False
-
-        selected_source = clean(record.get("selected_source")).upper()
-        if selected_source == "ADMS DB":
-            # A persisted ADMS DB choice is authoritative even for an older
-            # record that predates normalized_value persistence. The decision
-            # fingerprint still protects against stale validation inputs.
-            return False
-
-        selected_value = cls._normalized_resolution_value(record)
-        if not clean(record.get("normalized_value")) and selected_source:
-            candidates = list((((row or {}).get("resolution_candidates") or {}).get(clean(field).upper(), []) or []))
-            source_candidate = next((
-                candidate for candidate in candidates
-                if clean((candidate or {}).get("source")).upper() == selected_source
-            ), None)
-            if source_candidate:
-                selected_value = clean(source_candidate.get("normalized") or source_candidate.get("value")).upper()
-        return selected_value != adms_value
-
     def sync_rmu_review_from_resolutions(self, rmu: str, row: dict, modified_by: str, *, _commit: bool = True) -> str:
-        """Derive Review from the customer's structured Resolution decisions.
+        """Return the current explicit Review status without deriving it from Resolution.
 
-        For an active FALSE field that has an ADMS DB candidate, selecting a
-        value equal to ADMS DB automatically closes that decision. Selecting a
-        different source/value automatically puts the RMU in NEEDS ACTION.
-        Explicit Needs Action still wins, unresolved issues still remain
-        Unreviewed, and fields without an ADMS DB candidate keep the previous
-        resolved/closed behavior.
+        Since v0.8.189, structured Resolution choices and Review Status are fully
+        independent workflow dimensions. Choosing ADMS DB, choosing another
+        source with the same normalized value, selecting a different source,
+        accepting an exception, or recording a corrective-action Resolution must
+        never auto-close, auto-open, or otherwise rewrite Review Status.
+
+        NEEDS ACTION therefore remains NEEDS ACTION until a reviewer explicitly
+        changes the status (for example to CLOSED or UNREVIEWED) through the
+        Review Status control. This compatibility hook is intentionally side-effect
+        free because older callers still invoke it after saving Resolution records.
         """
-        active = self._active_rmu_issue_fields(row)
-        if not active:
-            return clean(self.rmu_review_map().get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
-        resolutions = self.rmu_resolution_map(rmu)
-        current_status = clean(self.rmu_review_map().get(rmu, {}).get("review_status")).upper() or "UNREVIEWED"
-
-        if any(clean((resolutions.get(field) or {}).get("decision_type")).upper() == "NEEDS_ACTION" for field in active):
-            target = "NEEDS ACTION"
-        elif any(
-            self._resolution_differs_from_adms_db(row, field, resolutions.get(field))
-            for field in active if field in resolutions
-        ):
-            target = "NEEDS ACTION"
-        elif current_status == "CLOSED":
-            # Preserve an explicit human Closed state unless a newly saved
-            # Resolution explicitly disagrees with the ADMS DB reference.
-            target = "CLOSED"
-        elif any(field not in resolutions for field in active):
-            target = "UNREVIEWED"
-        else:
-            target = "CLOSED"
-        self.update_rmu_review_status(
-            rmu, target, modified_by, reason="Automatic Review state from structured Resolution decisions", _commit=_commit
-        )
-        return target
+        del row, modified_by, _commit
+        return clean(self.rmu_review_record(rmu).get("review_status")).upper() or "UNREVIEWED"
 
     @classmethod
     def _rmu_analysis_hash(cls, row: dict) -> str:
@@ -1087,10 +1064,10 @@ class ProjectStore:
         reviewed RMU merely because their raw source value changes.
         """
         payload = {}
-        for field in cls._RMU_ANALYSIS_FIELDS:
-            key = f"analysis_{field.lower()}"
+        for field in cls._analysis_field_ids(row):
+            key = cls._analysis_value_key(row, field)
             payload[key] = clean((row or {}).get(key))
-            payload[f"{key}_detail"] = clean((row or {}).get(f"{key}_detail"))
+            payload[f"{key}_detail"] = clean((row or {}).get(f"{key}__detail") or (row or {}).get(f"{key}_detail"))
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -1125,6 +1102,14 @@ class ProjectStore:
                 (rmu, "rmu_review_status", status, "UNREVIEWED",
                  "Automatic reset: RMU validation result changed after source refresh", "SYSTEM", now),
             )
+            # The latest-value projection is now UNREVIEWED.  Preserve that
+            # automatic state transition in the Needs Action lifecycle too, but
+            # only when this equipment already has formal Needs Action history.
+            self._sync_issue_case_status(
+                "RMU", rmu, old_status=status, new_status="UNREVIEWED", modified_by="SYSTEM",
+                reason="Automatic reset: RMU validation result changed after source refresh",
+                rmu=rmu, snapshot=self._rmu_issue_snapshot(rmu, row=row),
+            )
             if check_passed:
                 self.db.execute(
                     "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
@@ -1151,7 +1136,227 @@ class ProjectStore:
             else:
                 self.db.execute("UPDATE rmu_reviews SET analysis_hash=?,updated_at=? WHERE rmu=?", (analysis_hash, now, rmu))
 
+    _SOURCE_AUDIT_NAMES = {
+        "se_list": "SE",
+        "zenon_db": "ZENON DB",
+        "zenon_sld": "ZENON SLD",
+        "adms_db": "ADMS DB",
+        "adms_sld": "ADMS SLD",
+    }
+
+    @staticmethod
+    def _source_field_audit_label(field_key: str) -> str:
+        """Return a compact engineering label for a mapped source field."""
+        key = clean(field_key).lower()
+        special = {
+            "rmu": "Equipment Name",
+            "station": "SS",
+            "feeder": "FEEDER",
+            "gss_fid": "FEEDER",
+            "rmu_type": "TYPE",
+            "cabinet_type": "TYPE",
+            "device_type": "Device Type",
+            "smart": "SMART",
+            "oh_ug": "OH / UG",
+            "ip": "IP",
+            "channel_ip": "IP",
+            "port": "PORT",
+            "channel_port": "PORT",
+            "brand": "BRAND",
+            "function_location": "Function Location",
+            "screen_name": "SCREEN NAME",
+        }
+        return special.get(key, key.replace("_", " ").strip().upper() or "SOURCE FIELD")
+
+    @staticmethod
+    def _comparison_source_projection(row: dict | None) -> dict[tuple[str, str], str]:
+        """Project one calculated comparison row back to its source-owned values.
+
+        Only physical source/App fields are returned. Analysis, review status,
+        remarks and generated resolution values are deliberately excluded so a
+        recalculation cannot create false source-change history.
+        """
+        data = dict(row or {})
+        try:
+            from ...services.schema_service import RMU_REVIEW_DISPLAY_BINDINGS
+            bindings = dict(RMU_REVIEW_DISPLAY_BINDINGS)
+        except Exception:
+            bindings = {}
+        output: dict[tuple[str, str], str] = {}
+        for report_key, binding in bindings.items():
+            try:
+                source_type, field_key = binding
+            except Exception:
+                continue
+            output[(str(source_type), str(field_key))] = clean(data.get(report_key))
+
+        # Source-driven USER/App fields are stored as
+        # custom__<source_type>__<field_key>. They belong to the same audit
+        # contract and are tracked even when currently hidden from the UI.
+        for report_key, value in data.items():
+            key = str(report_key or "")
+            if key.startswith("custom__"):
+                parts = key.split("__", 2)
+                if len(parts) == 3:
+                    source_type, field_key = parts[1], parts[2]
+                    output.setdefault((source_type, field_key), clean(value))
+                continue
+
+            # v0.8.178 configurable Equipment Data Review source fields use
+            # generic__<source-id>__<physical-column-id>.  Treat them exactly
+            # like historical physical/App source values so the existing
+            # Needs Action lifecycle continues to capture later source changes.
+            if key.startswith("generic__"):
+                parts = key.split("__", 2)
+                if len(parts) == 3:
+                    source_type, field_key = parts[1], parts[2]
+                    output.setdefault((source_type, field_key), clean(value))
+        return output
+
+    @staticmethod
+    def _source_context_changed(old_context: dict, new_context: dict) -> bool:
+        """Whether one physical source changed between two calculated rows."""
+        old_context = dict(old_context or {})
+        new_context = dict(new_context or {})
+        if not old_context:
+            # Rows produced before v0.8.173 have no provenance context. Value
+            # differences against that last calculated row are still real and
+            # should be retained for an equipment that already had Needs Action.
+            return True
+        old_sha = clean(old_context.get("sha256"))
+        new_sha = clean(new_context.get("sha256"))
+        if old_sha and new_sha:
+            return old_sha != new_sha or clean(old_context.get("name")) != clean(new_context.get("name"))
+        old_name = clean(old_context.get("name"))
+        new_name = clean(new_context.get("name"))
+        if old_name != new_name:
+            return True
+        old_mtime = int(old_context.get("mtime_ns") or 0)
+        new_mtime = int(new_context.get("mtime_ns") or 0)
+        old_size = int(old_context.get("size") or 0)
+        new_size = int(new_context.get("size") or 0)
+        if old_mtime or new_mtime or old_size or new_size:
+            return old_mtime != new_mtime or old_size != new_size
+        return True
+
+    def _record_need_action_source_changes(self, previous_rows: dict[str, dict], rows: list[dict]) -> None:
+        """Append source-value diffs to the latest lifecycle of affected RMUs.
+
+        The contract is intentionally narrow:
+        * only equipment that has *ever* had an RMU Needs Action case is tracked;
+        * only physical/App source values that actually changed are written;
+        * unchanged fields never produce history noise;
+        * a closed case stays closed -- the source change is appended to the
+          latest historical case rather than silently reopening it.
+        """
+        if not previous_rows or not rows:
+            return
+        historical = {
+            clean(row[0])
+            for row in self.db.execute("SELECT DISTINCT entity_key FROM issue_cases WHERE entity_type='RMU'")
+            if clean(row[0])
+        }
+        if not historical:
+            return
+
+        now = datetime.now().isoformat(timespec="seconds")
+        for new_row in rows:
+            rmu = clean((new_row or {}).get("rmu"))
+            if not rmu or rmu not in historical:
+                continue
+            old_row = previous_rows.get(rmu)
+            if not old_row:
+                # First calculated appearance is a baseline, not a change.
+                continue
+
+            old_projection = self._comparison_source_projection(old_row)
+            new_projection = self._comparison_source_projection(new_row)
+            old_context_all = dict((old_row or {}).get("_source_context") or {})
+            new_context_all = dict((new_row or {}).get("_source_context") or {})
+            for source_field in sorted(set(old_projection) | set(new_projection)):
+                source_type, field_key = source_field
+                old_value = clean(old_projection.get(source_field))
+                new_value = clean(new_projection.get(source_field))
+                if old_value == new_value:
+                    continue
+                old_context = dict(old_context_all.get(source_type) or {})
+                new_context = dict(new_context_all.get(source_type) or {})
+                if not self._source_context_changed(old_context, new_context):
+                    # Same physical source identity: a mapping/presentation
+                    # recalculation alone must not masquerade as a source-file edit.
+                    continue
+
+                source_names = dict((new_row or {}).get("_source_audit_names") or {})
+                source_names.update({
+                    key: value for key, value in dict((old_row or {}).get("_source_audit_names") or {}).items()
+                    if key not in source_names
+                })
+                source_label = clean(source_names.get(source_type)) or self._SOURCE_AUDIT_NAMES.get(source_type, source_type.upper())
+                field_labels = dict((new_row or {}).get("_source_field_labels") or {})
+                old_field_labels = dict((old_row or {}).get("_source_field_labels") or {})
+                field_label = clean((field_labels.get(source_type) or {}).get(field_key))
+                if not field_label:
+                    field_label = clean((old_field_labels.get(source_type) or {}).get(field_key))
+                if not field_label:
+                    field_label = self._source_field_audit_label(field_key)
+                old_name = clean(old_context.get("name"))
+                new_name = clean(new_context.get("name"))
+                if old_name and new_name and old_name != new_name:
+                    file_text = f"{old_name} -> {new_name}"
+                elif new_name:
+                    file_text = f"{new_name} refreshed"
+                elif old_name:
+                    file_text = f"after {old_name}"
+                else:
+                    file_text = "after source refresh"
+                before_text = old_value if old_value else "<blank>"
+                after_text = new_value if new_value else "<blank>"
+                reason = (
+                    f"Source data changed · {source_label} · {file_text}; "
+                    f"{field_label}: {before_text} -> {after_text}"
+                )
+                snapshot = self._rmu_issue_snapshot(rmu, new_row)
+                snapshot["source_change"] = {
+                    "source_type": source_type,
+                    "source_label": source_label,
+                    "field_key": field_key,
+                    "field_label": field_label,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                    "old_file": old_name,
+                    "new_file": new_name,
+                }
+                self._record_issue_field_change(
+                    "RMU", rmu,
+                    field_name=f"{source_label} · {field_label}",
+                    old_value=old_value,
+                    new_value=new_value,
+                    modified_by="SYSTEM",
+                    reason=reason,
+                    snapshot=snapshot,
+                    event_type="SOURCE_VALUE_CHANGED",
+                    rmu=rmu,
+                )
+                self.db.execute(
+                    "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
+                    (rmu, f"source.{source_type}.{field_key}", old_value, new_value,
+                     reason, "SYSTEM", now),
+                )
+
     def save_comparison(self, rows: list[dict]):
+        previous_rows: dict[str, dict] = {}
+        for record in self.db.execute("SELECT rmu,data_json FROM comparison"):
+            try:
+                payload = json.loads(record["data_json"] or "{}")
+            except Exception:
+                payload = {}
+            previous_rows[clean(record["rmu"])] = payload or {"rmu": clean(record["rmu"])}
+
+        # Compare last-calculated source values with the newly calculated source
+        # values before replacing the projection table. This is the only point
+        # where both versions are available side-by-side.
+        self._record_need_action_source_changes(previous_rows, rows)
+
         overrides = {}
         legacy_fields = {"zsld_picture": "zsld_screen_name"}
         for item in self.db.execute("SELECT * FROM changes ORDER BY id"):
@@ -1425,7 +1630,7 @@ class ProjectStore:
 
     def _rmu_issue_snapshot(self, rmu: str, row: dict | None = None) -> dict:
         data = dict(row or self.row_by_rmu(rmu) or {})
-        review = self.rmu_review_map().get(clean(rmu), {})
+        review = self.rmu_review_record(rmu)
         resolutions = self.rmu_resolution_map(clean(rmu))
         return {
             "entity_type": "RMU",
@@ -1433,13 +1638,13 @@ class ProjectStore:
             "review_status": clean(review.get("review_status")),
             "manual_comment": clean(review.get("manual_comment")),
             "analysis": {
-                field: clean(data.get(f"analysis_{field.lower()}"))
-                for field in self._RMU_ANALYSIS_FIELDS
+                field: clean(data.get(self._analysis_value_key(data, field)))
+                for field in self._analysis_field_ids(data)
             },
             "analysis_detail": {
-                field: clean(data.get(f"analysis_{field.lower()}_detail"))
-                for field in self._RMU_ANALYSIS_FIELDS
-                if clean(data.get(f"analysis_{field.lower()}_detail"))
+                field: clean(data.get(f"{self._analysis_value_key(data, field)}__detail") or data.get(f"{self._analysis_value_key(data, field)}_detail"))
+                for field in self._analysis_field_ids(data)
+                if clean(data.get(f"{self._analysis_value_key(data, field)}__detail") or data.get(f"{self._analysis_value_key(data, field)}_detail"))
             },
             "resolutions": {
                 field: self._resolution_record_summary(record)
@@ -1491,7 +1696,7 @@ class ProjectStore:
             case_id = int(open_case["id"]) if open_case is not None else None
         status = clean(review_status).upper()
         if not status:
-            review = self.rmu_review_map().get(rmu, {})
+            review = self.rmu_review_record(rmu)
             status = clean(review.get("review_status")).upper() or "UNREVIEWED"
         stamp = modified_at or datetime.now().isoformat(timespec="seconds")
         cursor = self.db.execute(
@@ -1612,6 +1817,20 @@ class ProjectStore:
                 )
             return
         if open_case is None:
+            # Once an RMU has ever entered Needs Action, every later explicit
+            # review-state transition remains part of that equipment's lifecycle
+            # even after the formal case was closed.  Do not reopen a closed
+            # case for UNREVIEWED/CLOSED; append the state change to the latest
+            # historical RMU case so the audit trail remains complete.  A later
+            # NEEDS ACTION still opens the next formal case above.
+            if clean(entity_type).upper() == "RMU" and old_status != new_status:
+                latest_case = self._issue_case_row(entity_type, entity_key, open_only=False)
+                if latest_case is not None:
+                    self._append_issue_event(
+                        int(latest_case["id"]), "STATUS_CHANGED", field_name="review_status",
+                        old_value=old_status, new_value=new_status, reason=reason,
+                        modified_by=modified_by, snapshot=snapshot,
+                    )
             return
         case_id = int(open_case["id"])
         if new_status == "CLOSED":
@@ -1839,6 +2058,18 @@ class ProjectStore:
             "last_activity_at": max(combined_activity) if combined_activity else "",
         }
 
+    def equipment_full_lifecycle(self, equipment_key: str) -> dict:
+        """Generic Equipment Data Review lifecycle facade.
+
+        The physical schema keeps the historical ``RMU`` entity/table names for
+        backward compatibility, but every Equipment Data Review row uses the
+        same review key and lifecycle engine. This facade makes that generic
+        contract explicit without rewriting historical databases.
+        """
+        payload = dict(self.rmu_full_lifecycle(equipment_key) or {})
+        payload["equipment_key"] = clean(equipment_key)
+        return payload
+
     def issue_lifecycle_counts(self) -> dict[str, int]:
         counts = {"OPEN": 0, "CLOSED": 0, "TOTAL": 0, "RMU": 0, "SIGNAL": 0}
         for row in self.db.execute(
@@ -1857,9 +2088,19 @@ class ProjectStore:
             for row in self.db.execute("SELECT * FROM rmu_reviews")
         }
 
+    def rmu_review_record(self, rmu: str) -> dict:
+        """Return one equipment review row without scanning the full table.
+
+        Comment/Resolution/status edits are single-equipment hot paths.  Loading
+        every review row (often 2,000+ records) for each click made the UI feel
+        sticky even though the actual SQLite write was small.
+        """
+        row = self.db.execute("SELECT * FROM rmu_reviews WHERE rmu=?", (clean(rmu),)).fetchone()
+        return dict(row) if row else {}
+
     def update_rmu_check_passed(
         self, rmu: str, passed: bool, modified_by: str,
-        reason: str = "RMU manual verification changed",
+        reason: str = "RMU manual verification changed", *, _commit: bool = True,
     ) -> None:
         """Persist the Row Locator checkbox as a real manual pass/verification record.
 
@@ -1896,12 +2137,20 @@ class ProjectStore:
             "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
             (rmu, "rmu_check_passed", "PASS" if old_value else "", "PASS" if new_value else "", reason, by, now),
         )
-        self._record_issue_field_change(
-            "RMU", rmu, field_name="check_passed", old_value="PASS" if old_value else "",
-            new_value="PASS" if new_value else "", modified_by=by, reason=reason,
-            snapshot=self._rmu_issue_snapshot(rmu), event_type="CHECK_CHANGED", rmu=rmu,
-        )
-        self.db.commit()
+        # Lifecycle snapshots are only useful when this equipment already has
+        # a formal Needs Action case/history.  Building the snapshot for every
+        # ordinary PASS checkbox click performs several extra SQLite reads
+        # (comparison row, review row, resolutions) and was wasted for the
+        # common case where no lifecycle exists at all.
+        historical_case = self._issue_case_row("RMU", rmu, open_only=False)
+        if historical_case is not None:
+            self._record_issue_field_change(
+                "RMU", rmu, field_name="check_passed", old_value="PASS" if old_value else "",
+                new_value="PASS" if new_value else "", modified_by=by, reason=reason,
+                snapshot=self._rmu_issue_snapshot(rmu), event_type="CHECK_CHANGED", rmu=rmu,
+            )
+        if _commit:
+            self.db.commit()
 
     def rmu_manual_review_comment(self, rmu: str) -> str:
         row = self.db.execute("SELECT manual_comment FROM rmu_reviews WHERE rmu=?", (clean(rmu),)).fetchone()
@@ -2088,6 +2337,22 @@ class ProjectStore:
             rows = self.db.execute("SELECT * FROM rmu_action_tracking ORDER BY updated_at DESC,rmu")
         return [dict(row) for row in rows]
 
+    def equipment_action_tracking(self, *, status: str | None = None) -> list[dict]:
+        """Return Needs Action follow-up rows for every equipment review key.
+
+        ``rmu_action_tracking`` remains the persisted compatibility table name.
+        It already receives the review key for RMU and non-RMU equipment alike;
+        this generic facade prevents new UI/report code from treating it as
+        RMU-only.
+        """
+        rows = self.rmu_action_tracking(status=status)
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["equipment_key"] = clean(item.get("rmu"))
+            result.append(item)
+        return result
+
     def rmu_action_tracking_counts(self) -> dict[str, int]:
         counts = {"OPEN": 0, "CLOSED": 0, "TOTAL": 0}
         for row in self.db.execute(
@@ -2097,6 +2362,9 @@ class ProjectStore:
             counts[key] = int(row["n"] or 0)
             counts["TOTAL"] += int(row["n"] or 0)
         return counts
+
+    def equipment_action_tracking_counts(self) -> dict[str, int]:
+        return self.rmu_action_tracking_counts()
 
     def _sync_rmu_action_tracking(
         self, rmu: str, review_status: str, modified_by: str, reason: str

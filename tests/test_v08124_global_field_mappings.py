@@ -87,8 +87,9 @@ class GlobalFieldMappingsV08124Tests(unittest.TestCase):
 
     def test_map_fields_copy_explains_global_mapping_semantics(self):
         source = (Path(__file__).parents[1] / "src" / "migration_report_tool" / "ui" / "main_window.py").read_text(encoding="utf-8")
-        self.assertIn("explicit Source Field selections and saved column order are shared by every station", source)
-        self.assertIn("Name, deletion and Source Field mapping all apply to every station", source)
+        self.assertIn("Changing a protected Source Field changes how that App Column is interpreted for ALL sites", source)
+        self.assertIn("Hidden fields stay in the mapping model", source)
+        self.assertNotIn('QPushButton("Delete Column")', source)
 
 
 if __name__ == "__main__":

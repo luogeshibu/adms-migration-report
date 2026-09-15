@@ -11,6 +11,7 @@ from migration_report_tool.services.rmu_review_service import build_comparison
 from migration_report_tool.services.schema_service import (
     custom_review_column_key,
     rmu_review_groups,
+    set_hidden_source_fields,
 )
 
 
@@ -32,6 +33,8 @@ class DynamicRMUColumnTests(unittest.TestCase):
                     [{"field_key": "new_link", "display_name": "NEW LINK", "actual_column": "NEW LINK"}],
                     "tester",
                 )
+                # Explicitly show optional fields; v0.8.172 defaults them hidden.
+                set_hidden_source_fields(store, "adms_sld", set(), "tester")
                 rows, _summary = build_comparison(store)
                 self.assertEqual(len(rows), 1)
                 key = custom_review_column_key("adms_sld", "new_link")

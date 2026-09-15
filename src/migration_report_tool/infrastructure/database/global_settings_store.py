@@ -80,6 +80,20 @@ def _connect() -> sqlite3.Connection:
             modified_by TEXT NOT NULL DEFAULT '',
             modified_at TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS source_visibility_preferences (
+            source_type TEXT PRIMARY KEY,
+            hidden_keys_json TEXT NOT NULL DEFAULT '[]',
+            modified_by TEXT NOT NULL DEFAULT '',
+            modified_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS source_visibility_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            old_hidden_keys_json TEXT NOT NULL DEFAULT '[]',
+            new_hidden_keys_json TEXT NOT NULL DEFAULT '[]',
+            modified_by TEXT NOT NULL DEFAULT '',
+            modified_at TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS source_field_override_mappings (
             source_type TEXT NOT NULL,
             field_key TEXT NOT NULL,
@@ -111,6 +125,20 @@ def _connect() -> sqlite3.Connection:
             field_key TEXT NOT NULL,
             old_value TEXT NOT NULL DEFAULT '',
             new_value TEXT NOT NULL DEFAULT '',
+            modified_by TEXT NOT NULL DEFAULT '',
+            modified_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS equipment_comparison_profiles (
+            profile_name TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            modified_by TEXT NOT NULL DEFAULT '',
+            modified_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS equipment_comparison_profile_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_name TEXT NOT NULL,
+            old_payload_json TEXT NOT NULL DEFAULT '{}',
+            new_payload_json TEXT NOT NULL DEFAULT '{}',
             modified_by TEXT NOT NULL DEFAULT '',
             modified_at TEXT NOT NULL DEFAULT ''
         );
@@ -488,6 +516,69 @@ def replace_review_hidden_columns(
                 (view_key, json.dumps(cleaned, ensure_ascii=False), now),
             )
 
+def source_hidden_fields(source_type: str) -> set[str] | None:
+    """Return application-wide hidden App/source fields for one source table.
+
+    ``None`` means no visibility choice has ever been saved globally.  The
+    preference is keyed only by source type, not by station/project, so a Show
+    checkbox change made for ADMS SLD at one station is immediately reused by
+    every other station.
+    """
+    source_type = str(source_type or "").strip()
+    if not source_type:
+        return None
+    with closing(_connect()) as db:
+        row = db.execute(
+            "SELECT hidden_keys_json FROM source_visibility_preferences WHERE source_type=?",
+            (source_type,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        raw = json.loads(str(row["hidden_keys_json"] or "[]"))
+    except Exception:
+        raw = []
+    if not isinstance(raw, list):
+        raw = []
+    return {str(value).strip() for value in raw if str(value).strip()}
+
+
+def replace_source_hidden_fields(
+    source_type: str, hidden_keys, modified_by: str = ""
+) -> None:
+    """Persist source-field visibility application-wide for every station."""
+    source_type = str(source_type or "").strip()
+    if not source_type:
+        return
+    cleaned = sorted({str(value).strip() for value in (hidden_keys or []) if str(value).strip()})
+    before = source_hidden_fields(source_type)
+    before_sorted = sorted(before or set()) if before is not None else None
+    now = datetime.now().isoformat(timespec="seconds")
+    by = modified_by or "system"
+    with closing(_connect()) as db:
+        with db:
+            db.execute(
+                """INSERT INTO source_visibility_preferences(source_type,hidden_keys_json,modified_by,modified_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(source_type) DO UPDATE SET
+                    hidden_keys_json=excluded.hidden_keys_json,
+                    modified_by=excluded.modified_by,
+                    modified_at=excluded.modified_at""",
+                (source_type, json.dumps(cleaned, ensure_ascii=False), by, now),
+            )
+            if before_sorted is None or before_sorted != cleaned:
+                db.execute(
+                    "INSERT INTO source_visibility_audit(source_type,old_hidden_keys_json,new_hidden_keys_json,modified_by,modified_at) VALUES(?,?,?,?,?)",
+                    (
+                        source_type,
+                        json.dumps(before_sorted or [], ensure_ascii=False),
+                        json.dumps(cleaned, ensure_ascii=False),
+                        by,
+                        now,
+                    ),
+                )
+
+
 def source_column_order(source_type: str) -> list[str] | None:
     """Return the application-wide App-column order for one physical source.
 
@@ -554,3 +645,114 @@ def replace_source_column_order(
                 (source_type, json.dumps(cleaned, ensure_ascii=False), modified_by or "system", now),
             )
 
+
+
+def equipment_comparison_profiles() -> list[dict]:
+    """Return reusable Equipment Data Review comparison profiles.
+
+    Profiles live in ``global_settings.db`` and therefore are available to every
+    site/project opened by the same application user.  They intentionally store
+    logical configuration only; physical site file paths are removed by the
+    configurable comparison service before a profile is persisted.
+    """
+    with closing(_connect()) as db:
+        rows = db.execute(
+            "SELECT profile_name,payload_json,modified_by,modified_at "
+            "FROM equipment_comparison_profiles ORDER BY profile_name COLLATE NOCASE"
+        ).fetchall()
+    output: list[dict] = []
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        output.append({
+            "name": str(row["profile_name"] or "").strip(),
+            "payload": payload,
+            "modified_by": str(row["modified_by"] or "").strip(),
+            "modified_at": str(row["modified_at"] or "").strip(),
+        })
+    return output
+
+
+def equipment_comparison_profile(profile_name: str) -> dict | None:
+    name = str(profile_name or "").strip()
+    if not name:
+        return None
+    with closing(_connect()) as db:
+        row = db.execute(
+            "SELECT profile_name,payload_json,modified_by,modified_at "
+            "FROM equipment_comparison_profiles WHERE profile_name=?",
+            (name,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "name": str(row["profile_name"] or "").strip(),
+        "payload": payload,
+        "modified_by": str(row["modified_by"] or "").strip(),
+        "modified_at": str(row["modified_at"] or "").strip(),
+    }
+
+
+def replace_equipment_comparison_profile(
+    profile_name: str, payload: dict, modified_by: str = ""
+) -> dict:
+    """Create or replace one application-wide reusable comparison profile."""
+    name = str(profile_name or "").strip()
+    if not name:
+        raise ValueError("Profile name is required")
+    if not isinstance(payload, dict):
+        raise ValueError("Profile payload must be an object")
+    before = equipment_comparison_profile(name)
+    before_json = json.dumps((before or {}).get("payload") or {}, ensure_ascii=False, sort_keys=True)
+    cleaned_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+    new_json = json.dumps(cleaned_payload, ensure_ascii=False, sort_keys=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    by = str(modified_by or "system").strip() or "system"
+    with closing(_connect()) as db:
+        with db:
+            db.execute(
+                """INSERT INTO equipment_comparison_profiles(profile_name,payload_json,modified_by,modified_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(profile_name) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    modified_by=excluded.modified_by,
+                    modified_at=excluded.modified_at""",
+                (name, new_json, by, now),
+            )
+            if before_json != new_json:
+                db.execute(
+                    "INSERT INTO equipment_comparison_profile_audit(profile_name,old_payload_json,new_payload_json,modified_by,modified_at) VALUES(?,?,?,?,?)",
+                    (name, before_json, new_json, by, now),
+                )
+    return {"name": name, "payload": cleaned_payload, "modified_by": by, "modified_at": now}
+
+
+def delete_equipment_comparison_profile(profile_name: str, modified_by: str = "") -> bool:
+    """Delete a reusable profile without changing any site's saved configuration."""
+    name = str(profile_name or "").strip()
+    if not name:
+        return False
+    before = equipment_comparison_profile(name)
+    if before is None:
+        return False
+    before_json = json.dumps(before.get("payload") or {}, ensure_ascii=False, sort_keys=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    by = str(modified_by or "system").strip() or "system"
+    with closing(_connect()) as db:
+        with db:
+            db.execute("DELETE FROM equipment_comparison_profiles WHERE profile_name=?", (name,))
+            db.execute(
+                "INSERT INTO equipment_comparison_profile_audit(profile_name,old_payload_json,new_payload_json,modified_by,modified_at) VALUES(?,?,?,?,?)",
+                (name, before_json, "{}", by, now),
+            )
+    return True

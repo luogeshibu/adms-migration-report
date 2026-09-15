@@ -294,13 +294,22 @@ def _source_values_text(snapshot: dict) -> str:
 
 def _structured_resolution_snapshot(store, rows: list[dict]) -> list[dict]:
     """Freeze current structured RMU resolutions into report-ready records."""
-    rows_by_rmu = {clean(row.get("rmu")): row for row in rows if clean(row.get("rmu"))}
+    rows_by_rmu = {}
+    for row in rows:
+        key = clean(row.get("review_key") or row.get("rmu"))
+        if key:
+            rows_by_rmu[key] = row
     flattened = []
     all_resolutions = store.rmu_resolution_map()
     for rmu in sorted(all_resolutions, key=lambda value: (not str(value).isdigit(), int(value) if str(value).isdigit() else str(value))):
         by_field = all_resolutions.get(rmu) or {}
         current_row = rows_by_rmu.get(rmu, {})
-        for field in getattr(store, "_RMU_ANALYSIS_FIELDS", ("NAME", "FEEDER", "SMART", "TYPE", "IP")):
+        field_order = (
+            store._ordered_resolution_fields(by_field)
+            if hasattr(store, "_ordered_resolution_fields")
+            else list(getattr(store, "_RMU_ANALYSIS_FIELDS", ("NAME", "FEEDER", "SMART", "TYPE", "IP")))
+        )
+        for field in field_order:
             record = dict(by_field.get(field) or {})
             if not record:
                 continue
@@ -311,9 +320,10 @@ def _structured_resolution_snapshot(store, rows: list[dict]) -> list[dict]:
             if not issue_snapshot and current_row:
                 issue_snapshot = store._resolution_issue_snapshot(current_row, field)
             decision = clean(record.get("decision_type")).upper()
+            issue_label = clean(issue_snapshot.get("analysis_label")) or field
             flattened.append({
                 "rmu": rmu,
-                "issue": field,
+                "issue": issue_label,
                 "validation_values": _source_values_text(issue_snapshot),
                 "analysis_detail": clean(issue_snapshot.get("analysis_detail")),
                 "resolution": resolution_display_text(record),
@@ -651,7 +661,7 @@ def _resolution_original_target_source(field: str, record: dict) -> tuple[str, s
         ]
 
     if decision == "NEEDS_ACTION":
-        target = target or "TBD after corrective review"
+        target = target or "Not specified after corrective review"
         source_text = selected_source or "Corrective review"
     elif decision == "OTHER":
         target = target or "Per agreed comment"
@@ -863,24 +873,92 @@ def _signal_register_point_no(item: dict) -> str:
     return clean(item.get("zenon_dot")) or clean(item.get("adms_dot")) or clean(item.get("standard_dot")) or "-"
 
 
-def _rmu_open_action_snapshot(store, rows: list[dict], tracking_rows: list[dict]) -> list[dict]:
-    """Build the open RMU rectification register in the field-review format.
+def _infer_manual_issue_types(*texts: object) -> list[str]:
+    """Infer useful customer-facing issue categories from manual review text.
 
-    The formal report intentionally stays simple:
-    - ``ADMS DB Current Value`` is the currently validated ADMS-DB candidate.
-    - ``User Value`` is the value/source selected by the reviewer in Resolution.
-    - ``Source`` is the selected source for that user value.
-    - ``Remarks`` contains the same compact auto-generated Resolution text shown
-      in the App, followed by any reviewer-entered comment. Validation explanations
-      remain internal and are not copied into the formal action register.
+    Manual Needs Action can be created without a structured FALSE Analysis field.
+    The PDF should still identify *what kind of issue* the reviewer is flagging
+    instead of printing the review status itself as a fake "Modification Item".
+    Inference is intentionally conservative: it recognizes common engineering
+    field names/phrases and falls back to MANUAL REVIEW when no category is clear.
     """
-    rows_by_rmu = {clean(row.get("rmu")): row for row in rows if clean(row.get("rmu"))}
+    merged = " ".join(clean(value) for value in texts if clean(value))
+    upper = merged.upper()
+    if not upper:
+        return ["MANUAL REVIEW"]
+
+    result: list[str] = []
+
+    def add(label: str) -> None:
+        if label not in result:
+            result.append(label)
+
+    if re.search(r"\b(NAME|NAMING)\b", upper):
+        add("NAME")
+    if re.search(r"\bFEEDER\b", upper) or re.search(r"\b(MOVE|TRANSFER|REASSIGN)\b.{0,60}\bTO\b", upper):
+        add("FEEDER")
+    if re.search(r"\b(SMART|NONSMART|NOP)\b", upper):
+        add("SMART")
+    if re.search(r"\bTYPE\b", upper) or re.search(r"\b\d+\s*L\s*\d+\s*T?\b", upper):
+        add("TYPE")
+    if re.search(r"\bIP\b", upper) or re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", upper):
+        add("IP")
+    if re.search(r"\bBRAND\b", upper):
+        add("BRAND")
+    if re.search(r"\bDEVICE\b", upper) and "DEVICE TYPE" not in upper:
+        add("DEVICE DATA")
+
+    if not result and re.search(r"\b(MISSING DATA|NO DATA|SOURCE DATA|NO MATCH|ZENON DB|ADMS DB)\b", upper):
+        add("SOURCE DATA")
+
+    return result or ["MANUAL REVIEW"]
+
+
+def _rmu_open_action_snapshot(store, rows: list[dict], tracking_rows: list[dict]) -> list[dict]:
+    """Build the open equipment rectification register as one row per issue type.
+
+    Any equipment can have multiple configured comparison issues. Older exports compressed all
+    of them into one tall multi-line table row, which was hard to read and could
+    split across a PDF page boundary. The formal snapshot now emits one compact
+    row per issue/category. This also guarantees that every exported issue carries
+    an explicit Issue Type wherever the available review data supports one.
+    """
+    rows_by_rmu = {}
+    for row in rows:
+        key = clean(row.get("review_key") or row.get("rmu"))
+        if key:
+            rows_by_rmu[key] = row
     reviews = store.rmu_review_map() if hasattr(store, "rmu_review_map") else {}
     all_resolutions = store.rmu_resolution_map() if hasattr(store, "rmu_resolution_map") else {}
-    field_order = tuple(getattr(store, "_RMU_ANALYSIS_FIELDS", ("NAME", "FEEDER", "SMART", "TYPE", "IP")))
+    legacy_field_order = tuple(getattr(store, "_RMU_ANALYSIS_FIELDS", ("NAME", "FEEDER", "SMART", "TYPE", "IP")))
+
+    def _field_order(row: dict, resolutions: dict) -> list[str]:
+        configured = [clean(value).upper() for value in ((row or {}).get("analysis_field_order") or []) if clean(value)]
+        if configured:
+            return configured
+        extras = sorted(field for field in resolutions if field not in legacy_field_order)
+        return list(legacy_field_order) + extras
+
+    def _field_label(row: dict, field: str) -> str:
+        labels = dict((row or {}).get("analysis_field_labels") or {})
+        for key, value in labels.items():
+            if clean(key).upper() == clean(field).upper():
+                return clean(value) or field
+        return field
+
+    def _analysis_value(row: dict, field: str) -> str:
+        keys = dict((row or {}).get("analysis_field_keys") or {})
+        for key, value_key in keys.items():
+            if clean(key).upper() == clean(field).upper():
+                return clean((row or {}).get(value_key)).upper()
+        return clean((row or {}).get(f"analysis_{clean(field).lower()}")).upper()
 
     def _candidate_for_source(row: dict, field: str, source_name: str) -> dict:
-        candidates = list((((row or {}).get("resolution_candidates") or {}).get(clean(field).upper(), []) or []))
+        candidates = []
+        for key, values in dict((row or {}).get("resolution_candidates") or {}).items():
+            if clean(key).upper() == clean(field).upper():
+                candidates = list(values or [])
+                break
         wanted = clean(source_name).upper()
         for candidate in candidates:
             if clean((candidate or {}).get("source")).upper() == wanted:
@@ -896,112 +974,189 @@ def _rmu_open_action_snapshot(store, rows: list[dict], tracking_rows: list[dict]
         return {}
 
     def _display_candidate(candidate: dict) -> str:
-        return clean((candidate or {}).get("value")) or clean((candidate or {}).get("normalized")) or "<blank>"
+        return clean((candidate or {}).get("value")) or clean((candidate or {}).get("normalized")) or "Blank"
+
+    def _equipment_identity(review_key: str, row: dict) -> tuple[str, str]:
+        key = clean(review_key)
+        display_name = clean((row or {}).get("rmu"))
+        device_type = clean((row or {}).get("equipment_device_type")).upper()
+        if key.startswith("EQ::"):
+            parts = key.split("::", 2)
+            if not device_type and len(parts) >= 2:
+                device_type = clean(parts[1]).upper()
+            if not display_name and len(parts) == 3:
+                display_name = clean(parts[2])
+        return display_name or key, device_type or ("RMU" if not key.startswith("EQ::") else "EQUIPMENT")
+
+    def _action_row(
+        *,
+        rmu: str,
+        equipment_name: str,
+        equipment_type: str,
+        issue_type: str,
+        original_value: str,
+        target_value: str,
+        source: str,
+        remarks: str,
+        review: dict,
+        tracker: dict,
+    ) -> dict:
+        issue_type = clean(issue_type) or "MANUAL REVIEW"
+        original_value = clean(original_value) or "Not available in ADMS DB"
+        target_value = clean(target_value) or "Not specified"
+        source = clean(source) or "Manual review"
+        remarks = clean(remarks)
+        return {
+            "rmu": rmu,
+            "equipment_key": rmu,
+            "equipment_name": equipment_name,
+            "equipment_type": equipment_type,
+            "issue_type": issue_type,
+            "issues": issue_type,
+            "adms_db_value": original_value,
+            "user_value": target_value,
+            "source": source,
+            "comments": remarks,
+            "original_value": original_value,
+            "target_value": target_value,
+            "remarks": remarks,
+            "required_action": remarks,
+            "reviewed_by": clean(review.get("reviewed_by")) or clean(tracker.get("opened_by")),
+            "reviewed_at": clean(review.get("reviewed_at")) or clean(tracker.get("last_need_action_at")),
+        }
 
     result: list[dict] = []
     for tracker in tracking_rows:
         if clean(tracker.get("tracking_status")).upper() != "OPEN":
             continue
 
-        rmu = clean(tracker.get("rmu"))
+        rmu = clean(tracker.get("equipment_key") or tracker.get("rmu"))
         row = rows_by_rmu.get(rmu, {})
+        equipment_name, equipment_type = _equipment_identity(rmu, row)
         review = dict(reviews.get(rmu) or {})
         resolutions = dict(all_resolutions.get(rmu) or {})
+        manual_comment = clean(review.get("manual_comment"))
+        tracking_reason = clean(tracker.get("last_reason"))
+
+        field_order = _field_order(row, resolutions)
         active_fields = [
             field for field in field_order
-            if clean(row.get(f"analysis_{field.lower()}")).upper() == "FALSE"
+            if _analysis_value(row, field) == "FALSE"
         ]
 
-        # Prefer active FALSE fields.  If a previously reviewed issue remains open
-        # after source refresh, retain its still-persisted structured decision.
         issue_fields = list(active_fields)
         if not issue_fields:
             issue_fields = [
                 field for field in field_order
                 if clean((resolutions.get(field) or {}).get("decision_type")).upper()
-                in {"USE_SOURCE", "NEEDS_ACTION", "OTHER"}
+                in {"USE_SOURCE", "NEEDS_ACTION", "OTHER", "ACCEPT_EXCEPTION"}
             ]
 
-        adms_lines: list[str] = []
-        user_lines: list[str] = []
-        source_lines: list[str] = []
-        comment_lines: list[str] = []
+        if issue_fields:
+            for field_index, field in enumerate(issue_fields):
+                record = dict(resolutions.get(field) or {})
+                decision = clean(record.get("decision_type")).upper()
 
-        manual_comment = clean(review.get("manual_comment"))
+                remarks_parts: list[str] = []
+                if decision:
+                    generated_remark = clean(compact_resolution_text(record))
+                    if generated_remark:
+                        remarks_parts.append(generated_remark)
+                customer_comment = clean(record.get("customer_comment"))
+                if customer_comment:
+                    remarks_parts.append(f"Customer comment: {customer_comment}")
 
-        multi_issue = len(issue_fields) > 1
+                if manual_comment and field_index == 0:
+                    remarks_parts.append(f"User comment: {manual_comment}")
 
-        def _field_text(field: str, value: str) -> str:
-            return f"{field}: {value}" if multi_issue else value
+                adms_candidate = (
+                    _candidate_for_source(row, field, "ADMS DB")
+                    or _snapshot_candidate(record, "ADMS DB")
+                )
+                original_value = (
+                    _display_candidate(adms_candidate)
+                    if adms_candidate
+                    else "Not available in ADMS DB"
+                )
 
-        for field in issue_fields:
-            record = dict(resolutions.get(field) or {})
-            decision = clean(record.get("decision_type")).upper()
+                selected_source = clean(record.get("selected_source"))
+                selected_value = clean(record.get("selected_value")) or clean(record.get("normalized_value"))
 
-            # Keep the formal PDF Remarks aligned with what the reviewer sees in
-            # the App Resolution column.  This is intentionally the compact
-            # customer-facing text, not the lower-level validation detail.
-            if decision:
-                generated_remark = clean(compact_resolution_text(record))
-                if generated_remark:
-                    comment_lines.append(generated_remark)
-            customer_comment = clean(record.get("customer_comment"))
-            if customer_comment:
-                comment_lines.append(_field_text(field, f"Customer comment: {customer_comment}"))
+                if decision == "USE_SOURCE":
+                    source_candidate = (
+                        _candidate_for_source(row, field, selected_source)
+                        or _snapshot_candidate(record, selected_source)
+                    )
+                    if not selected_value and source_candidate:
+                        selected_value = _display_candidate(source_candidate)
+                    target_value = selected_value or "Not specified"
+                    source_text = selected_source or "Resolution"
+                elif decision == "OTHER":
+                    target_value = "See Remarks"
+                    source_text = selected_source or "Others"
+                elif decision == "NEEDS_ACTION":
+                    target_value = selected_value or "Not specified"
+                    source_text = selected_source or "Manual review"
+                elif decision == "ACCEPT_EXCEPTION":
+                    target_value = selected_value or (
+                        _display_candidate(adms_candidate) if adms_candidate else "Not specified"
+                    )
+                    source_text = selected_source or "Approved exception"
+                else:
+                    target_value = "Not specified"
+                    source_text = "Manual review"
 
-            adms_candidate = _candidate_for_source(row, field, "ADMS DB") or _snapshot_candidate(record, "ADMS DB")
-            adms_lines.append(_field_text(field, _display_candidate(adms_candidate) if adms_candidate else "<blank>"))
+                result.append(_action_row(
+                    rmu=rmu,
+                    equipment_name=equipment_name,
+                    equipment_type=equipment_type,
+                    issue_type=_field_label(row, field),
+                    original_value=original_value,
+                    target_value=target_value,
+                    source=source_text,
+                    remarks="\n".join(dict.fromkeys(part for part in remarks_parts if clean(part))),
+                    review=review,
+                    tracker=tracker,
+                ))
+            continue
 
-            selected_source = clean(record.get("selected_source"))
-            selected_value = clean(record.get("selected_value")) or clean(record.get("normalized_value"))
-            if decision == "USE_SOURCE":
-                source_candidate = _candidate_for_source(row, field, selected_source) or _snapshot_candidate(record, selected_source)
-                if not selected_value and source_candidate:
-                    selected_value = _display_candidate(source_candidate)
-                user_lines.append(_field_text(field, selected_value or "TBD"))
-                source_lines.append(_field_text(field, selected_source or "Resolution"))
-            elif decision == "OTHER":
-                # OTHER stores the user-entered text in selected_value.  The
-                # compact generated remark above already includes that text, so
-                # do not append it a second time.
-                user_lines.append(_field_text(field, "TBD"))
-                source_lines.append(_field_text(field, selected_source or "Others"))
-            elif decision == "NEEDS_ACTION":
-                user_lines.append(_field_text(field, selected_value or "TBD"))
-                source_lines.append(_field_text(field, selected_source or "Manual review"))
-            elif decision == "ACCEPT_EXCEPTION":
-                user_lines.append(_field_text(field, selected_value or (_display_candidate(adms_candidate) if adms_candidate else "TBD")))
-                source_lines.append(_field_text(field, selected_source or "Approved exception"))
-            else:
-                user_lines.append(_field_text(field, "TBD"))
-                source_lines.append(_field_text(field, "Manual review"))
+        manual_types = _infer_manual_issue_types(manual_comment, tracking_reason)
+        fallback_remarks = manual_comment
+        if not fallback_remarks:
+            generic_reason = tracking_reason.casefold()
+            if generic_reason not in {
+                "rmu needs action",
+                "equipment data review marked needs action",
+                "needs action",
+            }:
+                fallback_remarks = tracking_reason
+        fallback_remarks = (
+            f"User comment: {fallback_remarks}"
+            if fallback_remarks
+            else "Manual follow-up required; reviewer target value has not been specified."
+        )
 
-        if not issue_fields:
-            issue_fields = ["Needs Action"]
-            adms_lines.append("Current ADMS DB value unavailable")
-            user_lines.append("TBD")
-            source_lines.append("Manual review")
+        for issue_type in manual_types:
+            field = issue_type if issue_type in field_order else ""
+            adms_candidate = _candidate_for_source(row, field, "ADMS DB") if field else {}
+            original_value = (
+                _display_candidate(adms_candidate)
+                if adms_candidate
+                else "Not available in ADMS DB"
+            )
+            result.append(_action_row(
+                rmu=rmu,
+                equipment_name=equipment_name,
+                equipment_type=equipment_type,
+                issue_type=issue_type,
+                original_value=original_value,
+                target_value="Not specified",
+                source="Manual review",
+                remarks=fallback_remarks,
+                review=review,
+                tracker=tracker,
+            ))
 
-        # User-entered review comments follow the automatic Resolution text so
-        # the Remarks cell carries both sources of review information.
-        if manual_comment:
-            comment_lines.append(f"User comment: {manual_comment}")
-
-        result.append({
-            "rmu": rmu,
-            "issues": ", ".join(dict.fromkeys(issue_fields)),
-            "adms_db_value": "\n".join(dict.fromkeys(line for line in adms_lines if clean(line))),
-            "user_value": "\n".join(dict.fromkeys(line for line in user_lines if clean(line))),
-            "source": "\n".join(dict.fromkeys(line for line in source_lines if clean(line))),
-            "comments": "\n".join(dict.fromkeys(line for line in comment_lines if clean(line))),
-            # Compatibility aliases retained in the frozen snapshot for older readers.
-            "original_value": "\n".join(dict.fromkeys(line for line in adms_lines if clean(line))),
-            "target_value": "\n".join(dict.fromkeys(line for line in user_lines if clean(line))),
-            "remarks": "\n".join(dict.fromkeys(line for line in comment_lines if clean(line))),
-            "required_action": "\n".join(dict.fromkeys(line for line in comment_lines if clean(line))),
-            "reviewed_by": clean(review.get("reviewed_by")) or clean(tracker.get("opened_by")),
-            "reviewed_at": clean(review.get("reviewed_at")) or clean(tracker.get("last_need_action_at")),
-        })
     return result
 
 def build_site_signoff_snapshot(store, *, revision: dict | None = None) -> dict:
@@ -1038,8 +1193,16 @@ def build_site_signoff_snapshot(store, *, revision: dict | None = None) -> dict:
     )
 
     structured_resolutions = _structured_resolution_snapshot(store, rows)
-    rmu_action_tracking = store.rmu_action_tracking() if hasattr(store, "rmu_action_tracking") else []
-    rmu_action_tracking_counts = store.rmu_action_tracking_counts() if hasattr(store, "rmu_action_tracking_counts") else {"OPEN": 0, "CLOSED": 0, "TOTAL": 0}
+    rmu_action_tracking = (
+        store.equipment_action_tracking()
+        if hasattr(store, "equipment_action_tracking")
+        else (store.rmu_action_tracking() if hasattr(store, "rmu_action_tracking") else [])
+    )
+    rmu_action_tracking_counts = (
+        store.equipment_action_tracking_counts()
+        if hasattr(store, "equipment_action_tracking_counts")
+        else (store.rmu_action_tracking_counts() if hasattr(store, "rmu_action_tracking_counts") else {"OPEN": 0, "CLOSED": 0, "TOTAL": 0})
+    )
     rmu_open_actions = _rmu_open_action_snapshot(store, rows, rmu_action_tracking)
     site_name = (
         store.config.get("site_name")
@@ -1130,6 +1293,18 @@ def build_site_signoff_snapshot(store, *, revision: dict | None = None) -> dict:
             "rmu_followup_open": int(rmu_action_tracking_counts.get("OPEN", 0)),
             "rmu_followup_closed": int(rmu_action_tracking_counts.get("CLOSED", 0)),
             "rmu_followup_total": int(rmu_action_tracking_counts.get("TOTAL", 0)),
+            "rmu_open_issue_items": len(rmu_open_actions),
+            # Generic aliases used by the current Equipment Data Review UI/PDF.
+            # Legacy RMU keys remain for backward-compatible snapshots/tests.
+            "equipment_records": len(rows),
+            "equipment_validation_pass": rmu_validation_pass,
+            "equipment_with_issues": rmu_with_issues,
+            "equipment_review_closed": rmu_review_closed,
+            "equipment_review_pending": rmu_review_pending,
+            "equipment_followup_open": int(rmu_action_tracking_counts.get("OPEN", 0)),
+            "equipment_followup_closed": int(rmu_action_tracking_counts.get("CLOSED", 0)),
+            "equipment_followup_total": int(rmu_action_tracking_counts.get("TOTAL", 0)),
+            "equipment_open_issue_items": len(rmu_open_actions),
         },
         "rmu_review_counts": rmu_counts,
         "signal_review_counts": signal_counts,
@@ -1157,14 +1332,15 @@ def _check_td() -> str:
 
 
 def _rmu_action_tracking_rows(snapshot: dict) -> str:
-    """Render the simplified RMU rectification register."""
+    """Render the equipment rectification register (legacy function name retained)."""
     rows = []
     for idx, item in enumerate(snapshot.get("rmu_open_actions", []), 1):
         rows.append(
             "<tr>"
             + _td(idx, cls="num")
-            + _td(item.get("rmu"))
-            + _td(item.get("issues"))
+            + _td(item.get("equipment_type") or "EQUIPMENT")
+            + _td(item.get("equipment_name") or item.get("rmu"))
+            + _td(item.get("issue_type") or item.get("issues"), cls="issue-type")
             + _td(item.get("adms_db_value") or item.get("original_value"), cls="compact-text")
             + _td(item.get("user_value") or item.get("target_value"), cls="compact-text")
             + _td(item.get("source"), cls="compact-text")
@@ -1174,7 +1350,7 @@ def _rmu_action_tracking_rows(snapshot: dict) -> str:
             + "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="9" class="empty">No RMU is currently open for rectification.</td></tr>')
+        rows.append('<tr><td colspan="10" class="empty">No equipment is currently open for rectification.</td></tr>')
     return "".join(rows)
 
 def _signal_need_action_rows(snapshot: dict, category: str) -> str:
@@ -1234,6 +1410,12 @@ def _html(snapshot: dict, *, prepared_by: str = "", company: str = "NARI") -> st
     report_date = generated[:10]
     revision_name = _display_revision_name(revision)
     revision_desc = revision.get("description") or ""
+    document_status = clean(snapshot.get("document_status"))
+    draft_banner = (
+        '<div class="draft-banner">REVIEW DRAFT · VALIDATION REQUIRED · NOT FOR FINAL HANDOVER / SIGNATURE</div>'
+        if document_status == "REVIEW DRAFT"
+        else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -1244,13 +1426,19 @@ body {{ font-family: 'Segoe UI', Arial, sans-serif; font-size: 9pt; color: #1821
 h1 {{ text-align:center; font-size:18pt; margin:0; color:#0f2742; }}
 h2 {{ font-size:12.5pt; color:#0f2742; margin:18px 0 8px 0; border-bottom:1px solid #cfd8e3; padding-bottom:4px; page-break-after:avoid; }}
 .subtitle {{ text-align:center; color:#52667a; font-size:10pt; margin:4px 0 16px 0; }}
+.draft-banner {{ text-align:center; border:2px solid #b54708; background:#fff4e5; color:#8a3208; font-weight:800; font-size:10pt; padding:8px 10px; margin:0 0 12px 0; }}
 .meta, .summary, .grid {{ width:100%; min-width:100%; border-collapse:collapse; margin:6px 0 12px 0; table-layout:fixed; }}
 .meta td, .summary td {{ border:1px solid #d7e0e8; padding:6px 7px; }}
 .meta .label, .summary .label {{ background:#f2f6f9; font-weight:600; }}
 .summary .group {{ background:#dfeaf4; color:#0f2742; font-weight:700; font-size:9.5pt; letter-spacing:.1px; }}
+.grid thead {{ display:table-header-group; }}
+.grid tbody {{ display:table-row-group; }}
+.grid tr {{ page-break-inside:avoid; break-inside:avoid; }}
+.grid thead tr {{ page-break-after:avoid; break-after:avoid; }}
 .grid th {{ background:#0f2742; color:white; border:1px solid #0f2742; padding:5px 3px; font-size:7.6pt; vertical-align:middle; }}
-.grid td {{ border:1px solid #cfd8e3; padding:4px 3px; vertical-align:top; font-size:7.3pt; }}
+.grid td {{ border:1px solid #cfd8e3; padding:4px 3px; vertical-align:top; font-size:7.3pt; overflow-wrap:break-word; word-wrap:break-word; }}
 .grid .num {{ text-align:center; }}
+.grid .issue-type {{ font-weight:700; }}
 .grid .compact-text {{ font-size:7.0pt; line-height:1.25; }}
 .grid .remarks-text {{ font-size:7.0pt; line-height:1.30; }}
 .grid .action-cell {{ text-align:center; font-weight:700; }}
@@ -1274,6 +1462,7 @@ h2 {{ font-size:12.5pt; color:#0f2742; margin:18px 0 8px 0; border-bottom:1px so
 <body>
 <h1>STATION MODIFICATION &amp; ISSUE CLOSURE REPORT</h1>
 <div class="subtitle">Saudi ADMS Project - Distribution Network Data Migration Review</div>
+{draft_banner}
 
 <table class="meta" width="100%" cellspacing="0" cellpadding="0">
 <colgroup><col width="18%"><col width="22%"><col width="18%"><col width="42%"></colgroup>
@@ -1282,11 +1471,11 @@ h2 {{ font-size:12.5pt; color:#0f2742; margin:18px 0 8px 0; border-bottom:1px so
 <tr><td class="label">Application</td><td>Migration Report Tool v{escape(__version__)}</td><td class="label">Revision Notes</td><td>{escape(str(revision_desc or '-'))}</td></tr>
 </table>
 
-<h2>RMU Data Summary</h2>
+<h2>Equipment Data Summary</h2>
 <table class="summary" width="100%" cellspacing="0" cellpadding="0">
 <colgroup><col width="23%"><col width="10%"><col width="23%"><col width="10%"><col width="24%"><col width="10%"></colgroup>
-<tr><td class="label">Total RMUs</td><td>{summary.get('rmu_records', 0)}</td><td class="label">Validation Pass</td><td>{summary.get('rmu_validation_pass', 0)}</td><td class="label">RMUs With Issues</td><td>{summary.get('rmu_with_issues', 0)}</td></tr>
-<tr><td class="label">Review Passed / Closed</td><td>{summary.get('rmu_review_closed', 0)}</td><td class="label">Need Action / Open</td><td>{summary.get('rmu_followup_open', 0)}</td><td class="label">Pending Review</td><td>{summary.get('rmu_review_pending', 0)}</td></tr>
+<tr><td class="label">Total Equipment</td><td>{summary.get('equipment_records', summary.get('rmu_records', 0))}</td><td class="label">Validation Pass</td><td>{summary.get('equipment_validation_pass', summary.get('rmu_validation_pass', 0))}</td><td class="label">Equipment With Issues</td><td>{summary.get('equipment_with_issues', summary.get('rmu_with_issues', 0))}</td></tr>
+<tr><td class="label">Review Passed / Closed</td><td>{summary.get('equipment_review_closed', summary.get('rmu_review_closed', 0))}</td><td class="label">Need Action / Open</td><td>{summary.get('equipment_followup_open', summary.get('rmu_followup_open', 0))}</td><td class="label">Pending Review</td><td>{summary.get('equipment_review_pending', summary.get('rmu_review_pending', 0))}</td></tr>
 </table>
 
 <h2>Signal Data Summary</h2>
@@ -1297,14 +1486,14 @@ h2 {{ font-size:12.5pt; color:#0f2742; margin:18px 0 8px 0; border-bottom:1px so
 <tr><td class="label">Need Action Total</td><td>{summary.get('signal_need_action_total', 0)}</td><td class="label">Closed</td><td>{summary.get('signal_review_closed', 0)}</td><td class="label">Pending / Open</td><td>{summary.get('signal_review_pending', 0)}</td></tr>
 </tbody></table>
 
-<h2>RMU Need Action Register ({summary.get('rmu_followup_open', 0)})</h2>
-<p class="small">Only open RMU rectification items are listed. Original Value shows the current ADMS-DB value; Target Value shows the reviewer-provided value; Remarks contains the App-generated Resolution text plus any reviewer-entered comment.</p>
+<h2>Equipment Need Action Register ({summary.get('equipment_followup_open', summary.get('rmu_followup_open', 0))} equipment / {summary.get('equipment_open_issue_items', summary.get('rmu_open_issue_items', 0))} issues)</h2>
+<p class="small">One row represents one issue type / field. Issue Type identifies the affected category (for example FEEDER, SMART, TYPE, IP or SOURCE DATA). Original Value shows the current ADMS-DB value when available. Target Value shows the agreed reviewer value; <b>Not specified</b> means no target value has been provided yet. Remarks contains the App-generated Resolution text plus any reviewer-entered comment.</p>
 <p class="verification-note">Verification marking: mark &#10003; in the box to confirm/accept, or &#10007; to reject/not confirm.</p>
 <table class="grid" width="100%" cellspacing="0" cellpadding="0">
 <colgroup>
-<col width="4%"><col width="7%"><col width="10%"><col width="17%"><col width="15%"><col width="12%"><col width="21%"><col width="7%"><col width="7%">
+<col width="4%"><col width="8%"><col width="10%"><col width="10%"><col width="13%"><col width="13%"><col width="10%"><col width="18%"><col width="7%"><col width="7%">
 </colgroup>
-<thead><tr><th>No.</th><th>RMU</th><th>Modification Item</th><th>Original Value</th><th>Target Value</th><th>Source</th><th>Remarks</th><th>NARI Confirm</th><th>SE/DNV Verify</th></tr></thead>
+<thead><tr><th>No.</th><th>Type</th><th>Equipment</th><th>Issue Type</th><th>Original Value</th><th>Target Value</th><th>Source</th><th>Remarks</th><th>NARI Confirm</th><th>SE/DNV Verify</th></tr></thead>
 <tbody>{_rmu_action_tracking_rows(snapshot)}</tbody>
 </table>
 
@@ -1371,6 +1560,8 @@ def export_site_signoff_pdf(
     revision: dict | None,
     prepared_by: str,
     company: str = "NARI",
+    review_draft: bool = False,
+    target_path: Path | None = None,
 ) -> tuple[Path, dict]:
     """Generate the PDF in the persistent site report directory.
 
@@ -1378,10 +1569,21 @@ def export_site_signoff_pdf(
     outside this function so callers can handle errors before committing metadata.
     """
     snapshot = build_site_signoff_snapshot(store, revision=revision)
+    snapshot["document_status"] = "REVIEW DRAFT" if review_draft else "FORMAL"
+    snapshot["validation_required_at_export"] = bool(
+        store.config.get("validation_required_after_source_import", False)
+    )
     site = _safe_name(snapshot.get("site") or store.folder.name)
     rev = _safe_name(_display_revision_name(revision))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = store.reports_dir / f"{site}_{rev}_Issue_Closure_{stamp}.pdf"
+    draft_token = "_DRAFT" if review_draft else ""
+    if target_path is None:
+        target = store.reports_dir / f"{site}_{rev}_Issue_Closure{draft_token}_{stamp}.pdf"
+    else:
+        target = Path(target_path).expanduser()
+        if target.suffix.lower() != ".pdf":
+            target = target.with_suffix(".pdf")
+        target.parent.mkdir(parents=True, exist_ok=True)
 
     writer = QPdfWriter(str(target))
     writer.setTitle(f"{site} Distribution Network Data Migration Report")

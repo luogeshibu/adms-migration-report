@@ -87,6 +87,10 @@ def test_resolution_choice_and_customer_comment_are_independent_and_comment_hist
         store = ProjectStore(Path(td) / "site")
         row = _issue_row()
         try:
+            store.save_comparison([row])
+            store.update_rmu_review_status(
+                "6537", "NEEDS ACTION", "alice", "Reviewer explicitly opened Needs Action"
+            )
             status1, _ = store.save_rmu_resolution_decisions(
                 "6537", row, _decision("Confirmed by customer drawing Rev.01"), "alice"
             )
@@ -95,7 +99,7 @@ def test_resolution_choice_and_customer_comment_are_independent_and_comment_hist
             assert first["selected_source"] == "ZENON DB"
             assert first["selected_value"] == "RHB-23"
             assert first["customer_comment"] == "Confirmed by customer drawing Rev.01"
-            assert status1 == "NEEDS ACTION"  # chosen feeder differs from ADMS DB reference
+            assert status1 == "NEEDS ACTION"  # explicit Review Status is preserved
 
             status2, _ = store.save_rmu_resolution_decisions(
                 "6537", row, _decision("Rechecked after modification; customer still confirms RHB-23"), "bob"

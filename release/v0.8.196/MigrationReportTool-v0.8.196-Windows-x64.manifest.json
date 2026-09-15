@@ -1,0 +1,985 @@
+{
+  "product": "NARI Saudi ADMS Migration Report",
+  "version": "0.8.196",
+  "platform": "Windows x64",
+  "created_at_utc": "2026-09-15T08:09:44+00:00",
+  "package": "MigrationReportTool-v0.8.196-Windows-x64.zip",
+  "package_sha256": "9e608987b7c13646605fbc8a1b4789752d7aa336f97a1e69a89908ee89fabd4b",
+  "files": [
+    {
+      "path": "_internal/_bz2.pyd",
+      "sha256": "d28c3dd1c22bfb8a6e8a6a9c2359842b797d08e878ecb7805f60e86a45589d11",
+      "size": 87776
+    },
+    {
+      "path": "_internal/_ctypes.pyd",
+      "sha256": "25d9b0be550d428fecc697ca20450343a7c3ce77c9f5283e9aecfd188d609250",
+      "size": 142560
+    },
+    {
+      "path": "_internal/_decimal.pyd",
+      "sha256": "8d41a84db20a9b985e98c802ad6833cf9625c744ad35478dd346f54f81488706",
+      "size": 290528
+    },
+    {
+      "path": "_internal/_elementtree.pyd",
+      "sha256": "16f4d30a50fc25950762a8bbef9dd6c5750729345539c224d489be33e6d6f340",
+      "size": 138464
+    },
+    {
+      "path": "_internal/_hashlib.pyd",
+      "sha256": "36ce760b9fac53fe51755f30a68d86f5fde89bf1b66c65c19e04aa3afa404ac2",
+      "size": 69344
+    },
+    {
+      "path": "_internal/_lzma.pyd",
+      "sha256": "5f7003f9f0256e36351ca2810b3485db28579b08e4d1d65f6f211fcd1136f395",
+      "size": 160992
+    },
+    {
+      "path": "_internal/_multiprocessing.pyd",
+      "sha256": "9e87ce081fbcf0b6596fcba98e121379ad72a33d68e6b2af7a8bcc5b900229ba",
+      "size": 38624
+    },
+    {
+      "path": "_internal/_queue.pyd",
+      "sha256": "bb53357b4e91ac23ed4061f15ff3e5e91a5b3be1cbb0c6cf294521ae5b4efa1c",
+      "size": 36576
+    },
+    {
+      "path": "_internal/_socket.pyd",
+      "sha256": "25ac83cac32ed0d67b2cc9672ce64cb53f0a29a75b14c276e901023ff43da5f9",
+      "size": 87776
+    },
+    {
+      "path": "_internal/_sqlite3.pyd",
+      "sha256": "b0c4edff6d60f300373ec929ab915f95ee601bf167e04d28e4e9e28a8e536fe0",
+      "size": 132832
+    },
+    {
+      "path": "_internal/_ssl.pyd",
+      "sha256": "5c07572df2913618cfb851b608cb5f74d740fcce5c3f2e63dc0a2ba39ab35dad",
+      "size": 190688
+    },
+    {
+      "path": "_internal/_uuid.pyd",
+      "sha256": "a09308efd309732e3745e70b4456235579c450cac32bed616dfb3913b56f6637",
+      "size": 28384
+    },
+    {
+      "path": "_internal/_wmi.pyd",
+      "sha256": "0ab1fbcf18c95d70343012feb1aad61e1ba95aaed5b4a08e57fc5990e8a9a452",
+      "size": 40160
+    },
+    {
+      "path": "_internal/_zstd.pyd",
+      "sha256": "262aea62a994920daf152a10bdc0ca83a8b1c0874e71db23734862431de182c6",
+      "size": 503520
+    },
+    {
+      "path": "_internal/assets/data_migration_cover.png",
+      "sha256": "13f20ecf5d8ec135ea5d8e6015e99674e59772b35a62dee7838e3db9e55257f4",
+      "size": 437632
+    },
+    {
+      "path": "_internal/assets/logo.ico",
+      "sha256": "a78805b407eb7235fad162209a7873da7c5ab1bbe329a0c0d424d91f46738cf9",
+      "size": 29365
+    },
+    {
+      "path": "_internal/assets/logo.png",
+      "sha256": "0492c3366bb31d992f2dfb73b38fb62fdb663f7ce460523b237135b76dc1ab04",
+      "size": 7495
+    },
+    {
+      "path": "_internal/assets/logo.svg",
+      "sha256": "6d0c4547a0a3347a790fbfa701f2e18c4b00431ddd2af6c19d89a8d2a7766806",
+      "size": 625
+    },
+    {
+      "path": "_internal/assets/report_header.png",
+      "sha256": "4e580868d9909910aa71bf25115c1287902d8ef66e9d338b7ef358d7bb5eb0c5",
+      "size": 141478
+    },
+    {
+      "path": "_internal/assets/splash.png",
+      "sha256": "a4a75ab882fd2e1b43c56293aa6d8851b0990f208a37d6dc11b66652509ce4e7",
+      "size": 29494
+    },
+    {
+      "path": "_internal/base_library.zip",
+      "sha256": "79102ead432e16e55613bc4cc00fb91064a1e9a02c2f49684380e63a7f7ec293",
+      "size": 1392372
+    },
+    {
+      "path": "_internal/icons/audit.svg",
+      "sha256": "8a97ca8f04267f6df6e4b06be4434b5e289aa0c4dcdbc9932cd22e6f07cc74e6",
+      "size": 245
+    },
+    {
+      "path": "_internal/icons/database.svg",
+      "sha256": "f12d1cd5f2cbe6731e800b4b68954e518ffa35ce686477e2dc58856b2803c9a9",
+      "size": 295
+    },
+    {
+      "path": "_internal/icons/overview.svg",
+      "sha256": "5721d8b09c6eb2ed1fc5b9cf6d4a94fb9dabd2c080e09cd2f9558a030f1ed3b3",
+      "size": 355
+    },
+    {
+      "path": "_internal/icons/report.svg",
+      "sha256": "9563cec352be17da0db2be412785025164dea3fbf9546b384c5425c23f93a2b1",
+      "size": 226
+    },
+    {
+      "path": "_internal/icons/rmu.svg",
+      "sha256": "1c6c6241a0ea5eb8c4fee456fab6bfab7d0b15df0d167335981bc11558e4fdda",
+      "size": 368
+    },
+    {
+      "path": "_internal/icons/settings.svg",
+      "sha256": "77ff61aae4a8e91270222e6b575e8cf8d6a360d37b24852ce93c5deb545c6fbc",
+      "size": 646
+    },
+    {
+      "path": "_internal/icons/signal.svg",
+      "sha256": "1cbb2007d86baf21d3c1b9806cd79ccc3b0aab71b0811cce727bc77beb33dd78",
+      "size": 290
+    },
+    {
+      "path": "_internal/icons/versions.svg",
+      "sha256": "b517f51da136419f91f1bcb76caa5452009d61ad7745791f7c841b3cb40aa585",
+      "size": 249
+    },
+    {
+      "path": "_internal/libcrypto-3.dll",
+      "sha256": "53c529145339fb042a3dcd3a09c2d7753204f8b4fc79d99e0d31e69a33985958",
+      "size": 6242552
+    },
+    {
+      "path": "_internal/libffi-8.dll",
+      "sha256": "eff52743773eb550fcc6ce3efc37c85724502233b6b002a35496d828bd7b280a",
+      "size": 39696
+    },
+    {
+      "path": "_internal/libssl-3.dll",
+      "sha256": "b17a87979862d19241edc4318f967e24c3ec356ed6c2368f561179fab2311001",
+      "size": 1329912
+    },
+    {
+      "path": "_internal/pyexpat.pyd",
+      "sha256": "133942bde91fe43289076a0b50a01b265df4ead078617cca6f6604a4166e1260",
+      "size": 222944
+    },
+    {
+      "path": "_internal/PySide6/MSVCP140.dll",
+      "sha256": "4c667b706893593812cd111b369ba6a77f54d1f1b1ae87cf3bf37692663cfba2",
+      "size": 549176
+    },
+    {
+      "path": "_internal/PySide6/MSVCP140_1.dll",
+      "sha256": "d419d24b0a76366f5c9d908b0e45fe70e9e9154bb8ad5f3de42070f2337f857b",
+      "size": 27448
+    },
+    {
+      "path": "_internal/PySide6/MSVCP140_2.dll",
+      "sha256": "89917964abb6ca16a260cab258e180c3abc239b5af00eed659d0edf0efdd339c",
+      "size": 271672
+    },
+    {
+      "path": "_internal/PySide6/opengl32sw.dll",
+      "sha256": "34b444c016289b560662ff896deceb7f4b2c0723aed3d319ae167c9186ce42b3",
+      "size": 20639544
+    },
+    {
+      "path": "_internal/PySide6/plugins/generic/qtuiotouchplugin.dll",
+      "sha256": "aa9080fa8b1c3cf4d3790c1eecf4a1f5c796ce58f31f80910357578f20fd80ac",
+      "size": 101176
+    },
+    {
+      "path": "_internal/PySide6/plugins/iconengines/qsvgicon.dll",
+      "sha256": "5bb97b6f114682ae0b5f42b23b6818aece6499bad88dac80a138efa8a88c12bc",
+      "size": 72504
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qgif.dll",
+      "sha256": "d301d7e9a68327692e4c76faa6b125517730b22c68f4de7f09fda9d4ac0ddee1",
+      "size": 47928
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qicns.dll",
+      "sha256": "49db148fea9f01e9953fd0a771d16cfaf364599f07aab3634d4f5c7c25abd78a",
+      "size": 57144
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qico.dll",
+      "sha256": "1684fd56f1758167f7b3ac011264ae5859b3cf6113e381626ec3dc1d3122fe52",
+      "size": 46904
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qjpeg.dll",
+      "sha256": "6517345ac19f5c489daeadc029d0018bbdc09d8e1031c60d714557972f22c6d4",
+      "size": 591672
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qpdf.dll",
+      "sha256": "541350d584d990b8dcccb6726a4cb2169b901b90b6221273f813a13256570705",
+      "size": 42296
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qsvg.dll",
+      "sha256": "4b7d65ba39be58cb469b54b5fdee2987871d67e5050cd70724016e09966e54f6",
+      "size": 39736
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qtga.dll",
+      "sha256": "6b0381150070fcd4224597fe73c68b47055b30b418aa14794c94c5007d14ca5d",
+      "size": 38200
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qtiff.dll",
+      "sha256": "3d6ea04da215ee2a9459399fb9f6d73cad8787944b9d450399025bcd39d020b5",
+      "size": 445752
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qwbmp.dll",
+      "sha256": "1a4596509987e9557edda69ed13cdd0d33f4ebda72e464ddc00a566bec05f151",
+      "size": 36664
+    },
+    {
+      "path": "_internal/PySide6/plugins/imageformats/qwebp.dll",
+      "sha256": "6b2c53cc4423140c29a6a1eb6dd908016e09d794b5739a05a3a39c8c49a0df8a",
+      "size": 564536
+    },
+    {
+      "path": "_internal/PySide6/plugins/networkinformation/qnetworklistmanager.dll",
+      "sha256": "e571a4b4e582738cd1bc4889cb2896635c2543baff408442701b6706a1b4a86e",
+      "size": 79160
+    },
+    {
+      "path": "_internal/PySide6/plugins/platforminputcontexts/qtvirtualkeyboardplugin.dll",
+      "sha256": "e10c64dd2ae4f9b756ec1ebe3950a05e345ba40834b7be2900af426623d85475",
+      "size": 34104
+    },
+    {
+      "path": "_internal/PySide6/plugins/platforms/qdirect2d.dll",
+      "sha256": "56f41ad523d016fe2cf2c90fae158e21766d1fcd021bced1a3704c6da0f00c98",
+      "size": 1071416
+    },
+    {
+      "path": "_internal/PySide6/plugins/platforms/qminimal.dll",
+      "sha256": "768a9c6dbb1c86abbefa2ff9d7e98cdfb4fdc9292eb8d64195bb6d23939a5344",
+      "size": 61752
+    },
+    {
+      "path": "_internal/PySide6/plugins/platforms/qoffscreen.dll",
+      "sha256": "e776251668440169ed18a2fe1b236762d514ef5244639cbb559b5a77ddd38954",
+      "size": 110904
+    },
+    {
+      "path": "_internal/PySide6/plugins/platforms/qwindows.dll",
+      "sha256": "bf6dbc3009f386fa22f0ced560bea6bbf3e0e0b4442d2fb855db67cffce49dbf",
+      "size": 991032
+    },
+    {
+      "path": "_internal/PySide6/plugins/styles/qmodernwindowsstyle.dll",
+      "sha256": "a7a6424c23bf371bd28a404a196b210971726f6f2a87b63aac185a5e6e40da71",
+      "size": 240440
+    },
+    {
+      "path": "_internal/PySide6/plugins/tls/qcertonlybackend.dll",
+      "sha256": "67be4d333a0f489d02714169a6ec54eaa80efa649d733fcbeb81881ecb02b4f3",
+      "size": 104760
+    },
+    {
+      "path": "_internal/PySide6/plugins/tls/qopensslbackend.dll",
+      "sha256": "7a0727417b8e21e64d9a7cf0f390bc85b3e337b4eef5ac977f49659d97e6b552",
+      "size": 314168
+    },
+    {
+      "path": "_internal/PySide6/plugins/tls/qschannelbackend.dll",
+      "sha256": "14abc5b245c0f2e03f7bc0b474a8db2ecb441c7300a8a8b16fb865eaf2674619",
+      "size": 247608
+    },
+    {
+      "path": "_internal/PySide6/pyside6.abi3.dll",
+      "sha256": "d0b5c701fb3a8ea839e72b602058f3960935156ebeca084893c54c99e54dd707",
+      "size": 255288
+    },
+    {
+      "path": "_internal/PySide6/Qt6Core.dll",
+      "sha256": "d6a3c37c5263c5d418fc0e80b722bc9fca7c0859e6f635f9624a2fde00bdc653",
+      "size": 10363704
+    },
+    {
+      "path": "_internal/PySide6/Qt6Gui.dll",
+      "sha256": "ae29b005f51b6850bf57fa06fced0dc8c7039fd6fafc3bfbcfe76e38adc7abf1",
+      "size": 9546552
+    },
+    {
+      "path": "_internal/PySide6/Qt6Network.dll",
+      "sha256": "dd3512d1c5ed062d30c98426cd0a850f13e0cf31437afb5b0b474132b9c52922",
+      "size": 1751352
+    },
+    {
+      "path": "_internal/PySide6/Qt6OpenGL.dll",
+      "sha256": "d51088f16db8c96dba7ef3c1474e611adb3ebdb211fea35b8e755d2a7407f7ad",
+      "size": 1988408
+    },
+    {
+      "path": "_internal/PySide6/Qt6Pdf.dll",
+      "sha256": "6fc87c84a723b05a0a3d7dce87083d25d23b1558e8806ff1cc7952bb9c5c9779",
+      "size": 4620600
+    },
+    {
+      "path": "_internal/PySide6/Qt6Qml.dll",
+      "sha256": "514fc8d9ff0754d2bcb446bbe0f6cc421213d92c8c1870e4cf787e4e176d51f6",
+      "size": 5337912
+    },
+    {
+      "path": "_internal/PySide6/Qt6QmlMeta.dll",
+      "sha256": "c6e8b02ad52e01e0e865a085b629b08629fbe5c68146425d4cefdcaaef7a8462",
+      "size": 159032
+    },
+    {
+      "path": "_internal/PySide6/Qt6QmlModels.dll",
+      "sha256": "066e72ad668ff02dcf530805d071313f9e89d9f1fb49a522aa4ed52712741bf2",
+      "size": 990008
+    },
+    {
+      "path": "_internal/PySide6/Qt6QmlWorkerScript.dll",
+      "sha256": "c037ab72fb9c1c1ebbe47f70b8a35d440537765ef6207424aae0c16fea26eda1",
+      "size": 79672
+    },
+    {
+      "path": "_internal/PySide6/Qt6Quick.dll",
+      "sha256": "900a493625af1f7d9fe6071b9aaee15e560cc7afc122702656723539ed81975f",
+      "size": 6569272
+    },
+    {
+      "path": "_internal/PySide6/Qt6Svg.dll",
+      "sha256": "1eac8f7415b311a88cb3cb4e25c3098d0e059c24c831fbbb13f43a80f0df06b7",
+      "size": 609080
+    },
+    {
+      "path": "_internal/PySide6/Qt6VirtualKeyboard.dll",
+      "sha256": "a14fac89759569965dbeb45b2a13e592c0bce0cc559adaa32145fcb92de016f9",
+      "size": 427832
+    },
+    {
+      "path": "_internal/PySide6/Qt6Widgets.dll",
+      "sha256": "ff0df9e2e6827e035f0731a4cedfc6333f4602bca00775e56346f27032406b74",
+      "size": 6497080
+    },
+    {
+      "path": "_internal/PySide6/QtCore.pyd",
+      "sha256": "74f96322c5e9cea73aefd2ed5870e5275336b31f552fcd32f12fc81d23f1bc6f",
+      "size": 3345720
+    },
+    {
+      "path": "_internal/PySide6/QtGui.pyd",
+      "sha256": "7bef20046045199c037b7cbfedaa1c5464730fa948b2c9ec8afbf718e63774d4",
+      "size": 3901240
+    },
+    {
+      "path": "_internal/PySide6/QtNetwork.pyd",
+      "sha256": "c5038bb71fc9d57330fa2d8eeec65aab69fcf02687cc8f54dbfb5995cfec6a71",
+      "size": 1009464
+    },
+    {
+      "path": "_internal/PySide6/QtSvg.pyd",
+      "sha256": "2d128bbd2839aaad93f96d4d0705912065d2dcc20c92cb028f0441979bdb7280",
+      "size": 116024
+    },
+    {
+      "path": "_internal/PySide6/QtWidgets.pyd",
+      "sha256": "f12f4ca641998e5706d5f7b0023147d573f0f2d2361e26dadf31bdbf05fbfd1d",
+      "size": 4857656
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ar.qm",
+      "sha256": "b11333c520ccd8e375cde20985df402d586a1a95e0796313bbeb9f717d4db22e",
+      "size": 104
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_bg.qm",
+      "sha256": "1e22ee126ec9f76031d880285a907b3a0c4510392319ff700dcdee964abbb1ad",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ca.qm",
+      "sha256": "17ab2623c7f6e8def44b3dbcb517544185817d65f1298ddb10ef71136f232bdc",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_cs.qm",
+      "sha256": "c585918fb1d4821a054ea40bdcf279f275ca76c88a5793f433dac6a611ac7e8f",
+      "size": 95
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_da.qm",
+      "sha256": "f6773c672acb73fdef6e092060d69d1e5dfee840012bac912d1e92de28714386",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_de.qm",
+      "sha256": "0401c316aa3b50a172eb44a4ff1ec384924073beec7c928ef888ec48e4612688",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_en.qm",
+      "sha256": "494ac9a2b2cb2fdeced353f4a9f898ed8dcf616e9bc667438c62681e3f7f79cf",
+      "size": 33
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_es.qm",
+      "sha256": "648ed4519bc45d7a4779479a7626ea16cf9aa23e93a0b178546cc47bea0591ab",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_fa.qm",
+      "sha256": "3f4c989c6b2990d80cc6299408214b31698923b52f154483b3371875de91f88e",
+      "size": 84
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_fi.qm",
+      "sha256": "342d01c7eeb234e431d0506821c4cd03c0433115d8d63fee3357be2331858879",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_fr.qm",
+      "sha256": "c896a38892a92346b033793d56440993236b23e47e06f3974afdb0552f628387",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_gd.qm",
+      "sha256": "49df855a004a17950338af3146466f6df4d5852410bd0b58ea80e0d0203a9d24",
+      "size": 70
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_gl.qm",
+      "sha256": "204a01ac7deb6b5bae193afecbd1e50d18c73bf7d94badeb2bbfdf6123c4ed93",
+      "size": 323590
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_he.qm",
+      "sha256": "36f01fff2f25e116d4b7af78097b7e49520fd5b7fb6fb120e40be228c05c045f",
+      "size": 57
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ar.qm",
+      "sha256": "222088c9752d1cc3bab985ef2dc77e5ae78578dce18a61ec15b39f02e588163d",
+      "size": 8743
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_bg.qm",
+      "sha256": "cbcdd1e0bbae332d80ddb0a286056f17c824fa28d353d7fdf12fc97d9f6fe054",
+      "size": 10599
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ca.qm",
+      "sha256": "fe40962c814a9f489e18d033e4aaabe435232c9bcf760830c6165af507cca80e",
+      "size": 7435
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_cs.qm",
+      "sha256": "4ac56fc63e400943bab13f1d4c418502138908e1d488c24aee6131d3d17552aa",
+      "size": 15297
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_da.qm",
+      "sha256": "6bb092552a398687119f6d52145f04bf8373977446d8f00c0dcbd56b96829f0f",
+      "size": 4795
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_de.qm",
+      "sha256": "037bc99abf98571ae9375c2513536c15b571d66406c36c1de447b547ff539c07",
+      "size": 7569
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_en.qm",
+      "sha256": "494ac9a2b2cb2fdeced353f4a9f898ed8dcf616e9bc667438c62681e3f7f79cf",
+      "size": 33
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_es.qm",
+      "sha256": "fd16b279f8cf69077f75e94d90c9c07a2afff3948a579e3789f5ffb5e5f4202d",
+      "size": 10704
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_fr.qm",
+      "sha256": "875ee2dcdc64e3dea888d84048e382d3921a175f12847de2e6b1cb12ad9add50",
+      "size": 3573
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_gl.qm",
+      "sha256": "7399a248609974773f60866c87b78ea7dfbc4f750313d692f7886cd763883c9f",
+      "size": 10891
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_hr.qm",
+      "sha256": "8c8cc3c5b1ab2b074f82937001b896603420ef75592b3b78172177360dd7ea61",
+      "size": 5170
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_hu.qm",
+      "sha256": "7be32e015119c969453abb6e8f3fb377963a69fafb10c27b796737b5eb283eaf",
+      "size": 7255
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_it.qm",
+      "sha256": "316fe8d0815e2b4b396895beb38ef1a40431915b5e054df80f4c0cd556f26e4b",
+      "size": 10612
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ja.qm",
+      "sha256": "ae603b2c0d434d40cde433ffcba65f9ee27978a9e19316007be7fe782a5b8b47",
+      "size": 7917
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ka.qm",
+      "sha256": "159c74f94b384b5ee6afdf38b6cfc4806bc99ecf73be02d4a7021d4ceba7ec7e",
+      "size": 7091
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ko.qm",
+      "sha256": "f11c64694e8e34e1d2c46c1a1d15d6ba9f2db7b61de4fdf54eca5ab977c3e052",
+      "size": 5708
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_nl.qm",
+      "sha256": "44a8a0daf775d14352180052d13f623814d7bdf98e2c5c80144b7bf74214e3b0",
+      "size": 5087
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_nn.qm",
+      "sha256": "4c8a7213942078e4f72f5babd26c41b77ace70189714a58b5504a7d5ad0193dc",
+      "size": 6934
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_pl.qm",
+      "sha256": "cc6cb4d8c54086224672f2e49e623c8cb7c0c1cd65b8d5ecd42fc9ba3a6065bd",
+      "size": 9673
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_pt_BR.qm",
+      "sha256": "b4015c5d519b4fe93c00bf734d1742e4f0094d89862664d548eb64a46a2feae7",
+      "size": 16030
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_ru.qm",
+      "sha256": "557b644e6da5f1ec720ef93965617087e4d1f40b2494cc5aa524cf3796108de7",
+      "size": 7288
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_sk.qm",
+      "sha256": "f41e33e1d790bd0d3eb180f1f875bc191fe74773628f25c2cad95e1402e66867",
+      "size": 10388
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_sl.qm",
+      "sha256": "2ec955e662407ebcd8dcdae5aaa21e4108e0b5b0aee0e9db712c27072943535f",
+      "size": 10363
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_sv.qm",
+      "sha256": "95bdb03dbaa6dbdfda46c249e9ccce9a353f71ddb8b112961e8b005b2c60b13c",
+      "size": 6934
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_tr.qm",
+      "sha256": "81da2f88cd624097581f2d29b10311796bcd9ab289e65883346d276110542d28",
+      "size": 6723
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_uk.qm",
+      "sha256": "497cfc473684692ee44d7a3795e8fb2270c57069fd9eb98a615dd29ab9be8a7c",
+      "size": 9750
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_zh_CN.qm",
+      "sha256": "e256d1f6034a5a5521c62f129f91731216e474f71e1d9caea3d3dcb11b670deb",
+      "size": 5115
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_help_zh_TW.qm",
+      "sha256": "40112812abb43853d678cc6d97729f21f21b3a7321c827fc9d18f6c936447d1e",
+      "size": 5160
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_hr.qm",
+      "sha256": "fc9e4146f33be3d09b234be01e56235d3037d8d82d64f0700b4d4a6e253a61a7",
+      "size": 102
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_hu.qm",
+      "sha256": "c2fa649f167cdb801d1cc0cb69c1d93594fd5bf8c0b7e79b969935da5c3e19aa",
+      "size": 84
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_it.qm",
+      "sha256": "9e7a18bc20ebeec54baaaf41c918a74534511271f796dffffd0f9b9ec31c68d3",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ja.qm",
+      "sha256": "0f5fe50452947d1ee9755249d860354bff6977279b4c496a5bc77e5b89dd745e",
+      "size": 84
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ka.qm",
+      "sha256": "00b67c6dfc255079b5b98a5640f82519c96b2520a028682fba4078b39d743eaa",
+      "size": 94
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ko.qm",
+      "sha256": "1d254b535e1cb35cbcad8210b15b89f4488159826bf35b4504696263dd102fa3",
+      "size": 84
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_lg.qm",
+      "sha256": "6ba668501f4c040c66da1bdc022362da3c8cf663da6aa484cbdb599028da98ed",
+      "size": 57
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_lt.qm",
+      "sha256": "47eb5f97467df769261421d54a5bea1131c9fb9b6388791d38bb6574335b64bf",
+      "size": 165383
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_lv.qm",
+      "sha256": "addeca285282338294f24ca50d37d08a5f68d3785d0a94af86dd4ec8f2a3b449",
+      "size": 63
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_nl.qm",
+      "sha256": "39e870cbd25c0f97fa9b1828d5ea1ed9849857a2e26c5321b3f13c76be8f0548",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_nn.qm",
+      "sha256": "4e544e23f75eafe1553dc896973db23b5795cd243786d5c653cc0f36a46ca74f",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_pl.qm",
+      "sha256": "e6890afa0caf0f6db0248e4c94f6016b8ec8bc266f1e0e9b8f01e8ea912cf968",
+      "size": 99
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_pt_BR.qm",
+      "sha256": "0e24c58e35271853f8cdfb3f0f7b0741b5a9a588e43cdec62ae85a3842771e0a",
+      "size": 106
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_pt_PT.qm",
+      "sha256": "2c1e7bbf5168a64b43752dd4c547601c0bde6d610f8671fa3e3af38597e84783",
+      "size": 70334
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_ru.qm",
+      "sha256": "1b388e2d6d1bd405603e794e498c6d7ec5f5a5ad819243546f6399181da36758",
+      "size": 102
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_sk.qm",
+      "sha256": "840c3b01c89df976fc1d2e5bfc6fc84b65666b8a3ceb4cbf5aa0c22af3d2a383",
+      "size": 95
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_sl.qm",
+      "sha256": "c44e0313a9414cc0e490b65b0c036fa11bca959353b228886547bc2c8492034f",
+      "size": 228428
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_sv.qm",
+      "sha256": "daaae448e0814b469ac3d7a91096fde15491600a6b8bc6c01508425fb5e8b3ec",
+      "size": 91
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_tr.qm",
+      "sha256": "59e8a0c411be3b0802a68561b090f182099d6b75c4fe46f398e55f11528e11b9",
+      "size": 84
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_uk.qm",
+      "sha256": "053ec1f677c4dba48c6a97eb28f4fc78c1511324d1843d7f4cec2c7c00a66145",
+      "size": 102
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_zh_CN.qm",
+      "sha256": "c0e29d32c9540a7e78643b74214e633c56f6ab11f018e516629f2c11b1fb09fc",
+      "size": 99
+    },
+    {
+      "path": "_internal/PySide6/translations/qt_zh_TW.qm",
+      "sha256": "24e226954491689549a1a1990db3b8cb78888008d8163b2fd2442b772b6d1b5f",
+      "size": 99
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ar.qm",
+      "sha256": "e03fe68d83201543698fd7fe267dd5dfc5bfd195147e74ff2f19ac3491401263",
+      "size": 160017
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_bg.qm",
+      "sha256": "e448ac9e3f16c29eb27af3012efe21052daa78fabfb34cd6dff2f69ee3bd3cdb",
+      "size": 165337
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ca.qm",
+      "sha256": "5298532fc52ffbc4e2c549f277151a61e741921c834286f7c04d3753677b6b04",
+      "size": 269007
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_cs.qm",
+      "sha256": "03028b42df5479270371e4c3bdc7df2f56cbbe6dda956a2864ac6f6415861fe8",
+      "size": 174701
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_da.qm",
+      "sha256": "7d1e5ca3310b54d104c19bf2abd402b38e584e87039a70e153c4a9af74b25c22",
+      "size": 181387
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_de.qm",
+      "sha256": "ed828a83dfaa51944f166c842155b48ab3bd7cb2c46dcd96269eb5d48af4f63f",
+      "size": 223282
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_en.qm",
+      "sha256": "494ac9a2b2cb2fdeced353f4a9f898ed8dcf616e9bc667438c62681e3f7f79cf",
+      "size": 33
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_es.qm",
+      "sha256": "4ffda56ba3bb5414ab0482d1dde64a6f226e3488f6b7f3f11a150e01f53fa4c8",
+      "size": 165170
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_fa.qm",
+      "sha256": "f78e59b5bdd586181a999034ba418868ed17fe9c05707fb65e523f70e92253d2",
+      "size": 148156
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_fi.qm",
+      "sha256": "e47fe13713e184d07fa4495dde0c589b0e8f562e91574a3558a9363443a4fa72",
+      "size": 179941
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_fr.qm",
+      "sha256": "314243a55c32679ad473fdfe48dc7d66e973ad0fc8bf2164480c58dddb50c1a7",
+      "size": 159463
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_gd.qm",
+      "sha256": "63b439dd44139aa3aed54c2ebe03fa9bc77f22c14ed8fba8eff2608445bb233d",
+      "size": 189580
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_he.qm",
+      "sha256": "e1ebca16afe8994356f81ca007fbdb9ddf865842010fe908923d873b687cad3f",
+      "size": 138690
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_hr.qm",
+      "sha256": "bb9eec9a9a652c1340dc75eb2e749be50df00f885b3d6900dfc76799c45b244d",
+      "size": 149711
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_hu.qm",
+      "sha256": "98463295539d769c8645a0b7fb95ad38454cfd0b14f36af485513f036ddbbbc6",
+      "size": 205885
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_it.qm",
+      "sha256": "7808ed542a7833c4bd94ec8bdfbbca00bb4f2fe15979b9121ce3249323687300",
+      "size": 161166
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ja.qm",
+      "sha256": "2b9581c69b975f59be505b127cd3c19d403ef3d12e0e8386fb97238223e9c1df",
+      "size": 129913
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ka.qm",
+      "sha256": "e55e4b72fa620bebee5297ca59dfe2f49894a1e544f2b7485b1cfd8829289d6f",
+      "size": 201105
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ko.qm",
+      "sha256": "0179ed1b136e1cb3f583351eaa2c545ba3d83a6ee3f82c32505926a1a5f5f183",
+      "size": 156799
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_lg.qm",
+      "sha256": "31c0cc4ce13b1d74fe0c19ed0b47638fb31e20c93ee08092533e884007aebfb5",
+      "size": 315764
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_lv.qm",
+      "sha256": "846e047573ae40c83671c3ba7f73e27efc24b98c82701da0df9973e574178bb2",
+      "size": 153608
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_nl.qm",
+      "sha256": "f61513bcdbb6ad800585f9437a95d018aab17fa12ee414aa31462ff279d8240e",
+      "size": 202861
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_nn.qm",
+      "sha256": "f9f2fb7c60e7fcb38bbd3c1314ef122145594265e20b0659ff00004baab13ac7",
+      "size": 196411
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_pl.qm",
+      "sha256": "3cf6b5c14d5eb0cf81e9af2066e66b3aa579a6b9b3c323ed670761f6254a8c54",
+      "size": 162962
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_pt_BR.qm",
+      "sha256": "3475d61604b938d459949801a906dbd34a8ca824ade94120015d676e208da859",
+      "size": 290955
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_ru.qm",
+      "sha256": "3da6605668f9178d11a838c4515478084dcfb4f9cf22f99d7a92b492db9c224b",
+      "size": 203767
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_sk.qm",
+      "sha256": "d586ae2c314074cf398417fdecb40709d5478dfeb0a67c2fe60d509ee9b59ed7",
+      "size": 125763
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_sv.qm",
+      "sha256": "5a2178dd2c03cc4516697f1fb0049649c9ed53f5cde6b937786733dae06aeda8",
+      "size": 249963
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_tr.qm",
+      "sha256": "353fdfd7165659a49212e7a25bf91c0a71588e52c836f7496640f26782414634",
+      "size": 248720
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_uk.qm",
+      "sha256": "51b8ff55b37dc5907d637a8ddda12fbe816852b0244c74eb4f0fb84867a786e0",
+      "size": 158274
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_zh_CN.qm",
+      "sha256": "0481a9b92a6f0578400e960a7d5ee70217a6a450eaf7f98b7d32b8dbd0d58616",
+      "size": 147222
+    },
+    {
+      "path": "_internal/PySide6/translations/qtbase_zh_TW.qm",
+      "sha256": "21012b2b427f8d09d31ce9cae582ca27955b478ca3dc2ec18a3068d808638c6a",
+      "size": 126185
+    },
+    {
+      "path": "_internal/PySide6/VCRUNTIME140.dll",
+      "sha256": "f893ae75a1a24eea174d982f94bc80ce2448201eaa919a73c0653a5657685de4",
+      "size": 116024
+    },
+    {
+      "path": "_internal/PySide6/VCRUNTIME140_1.dll",
+      "sha256": "48aa2783793ea18ab3c2c71d420d4fff9814e662a1ff810053c6e5250061a716",
+      "size": 41272
+    },
+    {
+      "path": "_internal/python3.dll",
+      "sha256": "22c6e46d8bd563cdb072650901461ef68be2ea6cb1e80af859559d9395a27e39",
+      "size": 73952
+    },
+    {
+      "path": "_internal/python314.dll",
+      "sha256": "fde89cdb5c2d08ae65de7ef4abca1876c93ba3796002f5ac0bf7e4d4f5a94da0",
+      "size": 6778592
+    },
+    {
+      "path": "_internal/select.pyd",
+      "sha256": "fab1b4cee101359d82d72061b83cff1855337b3677b9fe01cd69f7548f4c496e",
+      "size": 33504
+    },
+    {
+      "path": "_internal/shiboken6/MSVCP140.dll",
+      "sha256": "fd4a8c046fa3fea9ca6132f50cf8a56cf1e783b2d3093ba5c85fa063bc6b3845",
+      "size": 549176
+    },
+    {
+      "path": "_internal/shiboken6/Shiboken.pyd",
+      "sha256": "2f6f3a694f675b1dafdae26903191613c02866ab48e02591ae34ca1a3b1284f1",
+      "size": 33592
+    },
+    {
+      "path": "_internal/shiboken6/shiboken6.abi3.dll",
+      "sha256": "de3c6b2ed5f75c9ac0de4a6844b653b3b9d09263ce68c2b5fc25a96c5c3e8469",
+      "size": 394040
+    },
+    {
+      "path": "_internal/shiboken6/VCRUNTIME140.dll",
+      "sha256": "de617641d82eac15595d2e39394163ac33e49bb032cf2c2ea0044ed39d3675e9",
+      "size": 116024
+    },
+    {
+      "path": "_internal/shiboken6/VCRUNTIME140_1.dll",
+      "sha256": "fa577d54bd10a91e52472da784a619da6cf241af45f0a0c48b27e91fa0fe6104",
+      "size": 41272
+    },
+    {
+      "path": "_internal/sqlite3.dll",
+      "sha256": "2940bee51c4a00c7e8f2a8a1be857d4c4ad23b2657fbf7fdf18e3a3fd20066c6",
+      "size": 1584864
+    },
+    {
+      "path": "_internal/templates/IOA STANDARD.xlsx",
+      "sha256": "db6e39146408dba7d634367aee694b364e7f9ddeaf75dfbfe418caa699c7698b",
+      "size": 46504
+    },
+    {
+      "path": "_internal/unicodedata.pyd",
+      "sha256": "0d4f124b2d6622d276d777f7106972219f9b310edb5df8149c253da7c013d6d8",
+      "size": 759008
+    },
+    {
+      "path": "_internal/VCRUNTIME140.dll",
+      "sha256": "052ad6a20d375957e82aa6a3c441ea548d89be0981516ca7eb306e063d5027f4",
+      "size": 120400
+    },
+    {
+      "path": "_internal/VCRUNTIME140_1.dll",
+      "sha256": "6a99bc0128e0c7d6cbbf615fcc26909565e17d4ca3451b97f8987f9c6acbc6c8",
+      "size": 49776
+    },
+    {
+      "path": "BUILD_INFO.json",
+      "sha256": "df2411eb0e69627244dc42b83c4cd0f1173fce7173a9e53b378484ed469e309a",
+      "size": 341
+    },
+    {
+      "path": "MigrationReportTool.exe",
+      "sha256": "4427a3953185f58c8bc93c13253113caec74fccd2a0c2681830d5c57c6923e76",
+      "size": 3954734
+    },
+    {
+      "path": "README.md",
+      "sha256": "67ec3539d7a69ffc2fe4c1d00e45efb33a63a96ffe5f1274960eaf6f9ac259f8",
+      "size": 25619
+    },
+    {
+      "path": "USER_GUIDE.md",
+      "sha256": "116677d9600f1a4a7f9b7dbd886d0ecea0b54ae07603e52d11613a6eaca171d1",
+      "size": 887
+    },
+    {
+      "path": "VERSION.txt",
+      "sha256": "59c48060fa2fcef05bcc1c487acc08ea4641ef10f9cf0134dec98d3a0ac36b59",
+      "size": 9
+    },
+    {
+      "path": "workspace/README.txt",
+      "sha256": "af4cd7809f923f59509b8aae6d77ce954c60e16c5a56846ca668ec1deff9592a",
+      "size": 63
+    }
+  ]
+}

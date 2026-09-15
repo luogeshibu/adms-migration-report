@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "migration-report-tool"
 dynamic = ["version"]
-description = "Professional SE / Zenon / ADMS migration review application"
+description = "Professional configurable Excel/CSV equipment migration review application"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [

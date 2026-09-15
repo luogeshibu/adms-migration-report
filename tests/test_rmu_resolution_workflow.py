@@ -63,7 +63,7 @@ def test_each_false_field_requires_its_own_resolution():
                 normalized_value=rtype["normalized"],
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "TYPE"),
             )
-            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "UNREVIEWED"
             assert len(store.rmu_resolution_map("1001")) == 2
         finally:
             store.db.close()
@@ -82,6 +82,7 @@ def test_needs_action_drives_review_status():
                 normalized_value=feeder["normalized"],
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "FEEDER"),
             )
+            store.update_rmu_review_status("1001", "NEEDS ACTION", "tester", "Reviewer requires corrective action")
             store.set_rmu_resolution(
                 "1001", "TYPE", "NEEDS_ACTION", "tester",
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "TYPE"),
@@ -93,16 +94,18 @@ def test_needs_action_drives_review_status():
 
 
 
-def test_adms_db_choice_auto_closes_but_different_choice_needs_action():
+def test_resolution_source_choice_never_changes_explicit_review_status():
     with tempfile.TemporaryDirectory() as td:
         store = ProjectStore(Path(td) / "site")
         try:
             row = _row()
-            # Isolate the FEEDER issue so the resulting Review status is direct.
             row["analysis_type"] = "TRUE"
             row["analysis_type_detail"] = "TYPE ok"
             store.save_comparison([row])
 
+            # A reviewer-owned NEEDS ACTION state must survive even when the
+            # selected Resolution value is exactly the ADMS DB value.
+            store.update_rmu_review_status("1001", "NEEDS ACTION", "tester", "Manual Needs Action")
             adms = row["resolution_candidates"]["FEEDER"][1]
             store.set_rmu_resolution(
                 "1001", "FEEDER", "USE_SOURCE", "tester",
@@ -110,8 +113,9 @@ def test_adms_db_choice_auto_closes_but_different_choice_needs_action():
                 normalized_value=adms["normalized"],
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "FEEDER"),
             )
-            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "NEEDS ACTION"
 
+            # Choosing a different source also must not rewrite Review Status.
             se = row["resolution_candidates"]["FEEDER"][0]
             store.set_rmu_resolution(
                 "1001", "FEEDER", "USE_SOURCE", "tester",
@@ -120,11 +124,16 @@ def test_adms_db_choice_auto_closes_but_different_choice_needs_action():
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "FEEDER"),
             )
             assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "NEEDS ACTION"
+
+            # Closure is an explicit reviewer action and remains independent of
+            # later Resolution edits too.
+            store.update_rmu_review_status("1001", "CLOSED", "tester", "Reviewer explicitly closed item")
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
         finally:
             store.db.close()
 
 
-def test_same_normalized_value_as_adms_db_closes_even_when_source_name_differs():
+def test_same_normalized_value_as_adms_db_does_not_auto_close():
     with tempfile.TemporaryDirectory() as td:
         store = ProjectStore(Path(td) / "site")
         try:
@@ -143,12 +152,12 @@ def test_same_normalized_value_as_adms_db_closes_even_when_source_name_differs()
                 normalized_value=choice["normalized"],
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "FEEDER"),
             )
-            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "UNREVIEWED"
         finally:
             store.db.close()
 
 
-def test_field_without_adms_db_candidate_keeps_existing_resolution_behavior():
+def test_field_without_adms_db_candidate_also_keeps_review_status_independent():
     with tempfile.TemporaryDirectory() as td:
         store = ProjectStore(Path(td) / "site")
         try:
@@ -169,7 +178,7 @@ def test_field_without_adms_db_candidate_keeps_existing_resolution_behavior():
                 normalized_value=choice["normalized"],
                 analysis_fingerprint=store._rmu_field_fingerprint(row, "IP"),
             )
-            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "UNREVIEWED"
         finally:
             store.db.close()
 
@@ -222,7 +231,7 @@ def test_other_manual_comment_is_a_resolved_customer_decision():
             assert record["decision_type"] == "OTHER"
             assert record["selected_value"] == "Keep the current feeder pending the agreed field note."
             assert "Other agreed resolution / comment" in record["decision_description"]
-            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "CLOSED"
+            assert store.sync_rmu_review_from_resolutions("1001", row, "tester") == "UNREVIEWED"
         finally:
             store.db.close()
 

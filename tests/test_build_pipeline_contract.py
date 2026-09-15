@@ -89,7 +89,7 @@ class BuildPipelineContractTests(unittest.TestCase):
         self.assertIn('self.store.rmu_review_map()', text)
         self.assertIn('self.store.set_rmu_resolution(', text)
         self.assertIn('def sync_rmu_review_from_resolutions(', store)
-        self.assertIn('self.update_rmu_review_status(', store)
+        self.assertNotIn('self.update_rmu_review_status(', store[store.index('def sync_rmu_review_from_resolutions('):store.index('def _rmu_analysis_hash')])
         self.assertNotIn('change_rmus = {x["rmu"] for x in self.store.changes()', text)
         self.assertIn('self.rmu_review_filter_combo.addItems(["ALL REVIEWS", "UNREVIEWED", "CLOSED", "NEEDS ACTION"])', text)
         self.assertNotIn('self.status_combo.addItems(["ALL", "MATCHED", "WARNING", "FAILED"', text)

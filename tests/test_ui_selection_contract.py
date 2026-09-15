@@ -51,7 +51,7 @@ class UISelectionContractTests(unittest.TestCase):
     def test_rmu_review_has_frozen_row_locator(self):
         self.assertIn("self.comparison_locator = SpreadsheetTableWidget(0, 5)", self.ui)
         self.assertIn('("locator_no", "No.", 55)', self.ui)
-        self.assertIn('("locator_rmu", "RMU", 90)', self.ui)
+        self.assertIn('("locator_rmu", "Index / Key", 150)', self.ui)
         self.assertIn('("locator_checked", "Checked", 74)', self.ui)
         self.assertIn('("locator_analysis", "Analysis", 115)', self.ui)
         self.assertIn('("locator_review", "Review", 115)', self.ui)
@@ -59,7 +59,7 @@ class UISelectionContractTests(unittest.TestCase):
 
     def test_dashboard_separates_rmu_and_signal_kpis(self):
         for text in (
-            'MetricCard("Total RMUs"', 'MetricCard("Pass"', 'MetricCard("With Issues"',
+            'MetricCard("Total Equipment"', 'MetricCard("Pass"', 'MetricCard("With Issues"',
             'MetricCard("ADMS Points"', 'MetricCard("Matched"', 'MetricCard("Mismatched"',
         ):
             self.assertIn(text, self.ui)
@@ -125,7 +125,7 @@ class UISelectionContractTests(unittest.TestCase):
 
     def test_dashboard_exception_actions_apply_real_filters(self):
         self.assertIn("self.dashboard_rmu_issues_button.clicked.connect(self.open_dashboard_rmu_issues)", self.ui)
-        self.assertIn('self.analysis_combo.setCurrentText("ANY MISMATCH")', self.ui)
+        self.assertIn('self.analysis_combo.setCurrentIndex(max(0, self.analysis_combo.findData("ANY MISMATCH")))', self.ui)
         self.assertIn("self.dashboard_signal_mismatch_button.clicked.connect(self.open_dashboard_signal_mismatches)", self.ui)
         self.assertIn('self.db_smart_result_combo.setCurrentText("MISMATCHED")', self.ui)
         self.assertNotIn('b2.clicked.connect(lambda: self.set_page(2))', self.ui)
@@ -156,23 +156,23 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertNotIn('VALIDATION INCOMPLETE · {validation_unchecked} UNCHECKED', self.ui)
         self.assertNotIn('state = "VALIDATION COMPLETE"', self.ui)
         self.assertIn('Resolution {resolved_issue_decisions} / {total_issue_decisions} issue decision(s)', self.ui)
-        self.assertIn('review_total = rmu_review_total + signal_review_total', self.ui)
+        self.assertIn('review_total = equipment_review_total_all + signal_review_total', self.ui)
         self.assertNotIn('validation_unchecked', self.ui)
 
     def test_human_review_counts_exceptions_only(self):
         self.assertIn('MetricCard("Closed / Issues"', self.ui)
-        self.assertIn('one affected RMU + one mismatched signal', self.ui)
+        self.assertIn('one affected equipment item + one mismatched signal', self.ui)
         self.assertIn('mismatch_keys = {', self.ui)
         self.assertIn('signal_review_total = len(mismatch_keys)', self.ui)
-        self.assertIn('per-field decisions remain an implementation/detail view inside the RMU', self.ui)
+        self.assertIn('Per-field decisions remain an implementation/detail view inside Equipment Data Review', self.ui)
         self.assertIn('STANDARD-driven signal rows are TRUE/FALSE', self.ui)
 
     def test_dashboard_review_progress_uses_business_objects(self):
         self.assertIn('MetricCard("Closed / Issues"', self.ui)
         self.assertIn('rmu_review_total = rmu_issues', self.ui)
         self.assertIn('visible_status = rmu_review_display_status(row, review_record)', self.ui)
-        self.assertIn('f"RMU Review: {rmu_reviewed} / {rmu_review_total}', self.ui)
-        self.assertIn('f"Human Review · RMU {rmu_reviewed}/{rmu_review_total} · "', self.ui)
+        self.assertIn('f"Equipment Review: {rmu_reviewed} / {rmu_review_total}', self.ui)
+        self.assertIn('f"Human Review · Equipment {rmu_reviewed}/{rmu_review_total} · "', self.ui)
         self.assertIn('f"Signal {signal_reviewed}/{signal_review_total}"', self.ui)
         self.assertIn('signal_processed_total = signal_reviewed + signal_required_needs', self.ui)
         self.assertIn('signal_closed = signal_review_counts["CLOSED"]', self.ui)
@@ -281,7 +281,7 @@ class UISelectionContractTests(unittest.TestCase):
         self.assertIn('AUTO · Latest published version', self.ui)
         self.assertIn('if no published V exists, use the configured Source Detection Rules/base filename', self.ui)
         self.assertIn('PIN: use the exact V version you select', self.ui)
-        self.assertIn('MANUAL: browse any physical file; explicit user selection has the highest priority', self.ui)
+        self.assertIn('MANUAL: browse any CSV/XLSX/XLSM filename; field mapping, not filename, defines the source role.', self.ui)
 
 if __name__ == "__main__":
     unittest.main()

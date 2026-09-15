@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from ...domain.schema import SchemaValidationError
-from ..parsers import read_mapped_rows, read_csv_raw, read_excel_raw
+from ..parsers import read_mapped_rows, read_csv_raw, read_excel_raw, resolve_source_excel_sheet_name
 from ...storage import ProjectStore
 
 
@@ -27,7 +27,8 @@ class WorkspaceFileAdapter(SourceAdapter):
             return []
         overrides = self.store.source_column_overrides(source_type)
         sheet_name = self.store.source_sheet_name(source_type) if path.suffix.lower() in {".xlsx", ".xlsm"} and hasattr(self.store, "source_sheet_name") else ""
-        mapped = read_mapped_rows(source_type, path, overrides, strict=True, sheet_name=sheet_name or None)
+        effective_sheet = resolve_source_excel_sheet_name(source_type, path, sheet_name or None) if path.suffix.lower() in {".xlsx", ".xlsm"} else ""
+        mapped = read_mapped_rows(source_type, path, overrides, strict=True, sheet_name=effective_sheet or None)
         rows = [dict(row) for row in mapped.rows]
 
         # USER App columns use application-global Source Field selections and
@@ -39,7 +40,7 @@ class WorkspaceFileAdapter(SourceAdapter):
             if path.suffix.lower() == ".csv":
                 _headers, raw_rows = read_csv_raw(path)
             else:
-                _headers, raw_rows = read_excel_raw(path, sheet_name=sheet_name or None)
+                _headers, raw_rows = read_excel_raw(path, sheet_name=effective_sheet or None)
             for index, row in enumerate(rows):
                 raw = raw_rows[index] if index < len(raw_rows) else {}
                 for item in custom_fields:

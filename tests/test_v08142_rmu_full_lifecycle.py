@@ -8,11 +8,11 @@ from migration_report_tool.version import __version__
 
 class RMUFullLifecycleTests(unittest.TestCase):
     def test_release_and_schema_remain_compatible(self):
-        self.assertEqual(__version__, "0.8.143")
+        self.assertEqual(__version__, "0.8.196")
         with tempfile.TemporaryDirectory() as td:
             store = ProjectStore(Path(td) / "site")
             try:
-                self.assertEqual(store.project_schema_version(), 11)
+                self.assertEqual(store.project_schema_version(), 12)
             finally:
                 store.close()
 
@@ -100,12 +100,12 @@ class RMUFullLifecycleTests(unittest.TestCase):
 
     def test_rmu_review_ui_contains_in_page_lifecycle_panel(self):
         source = Path("src/migration_report_tool/ui/main_window.py").read_text(encoding="utf-8")
-        self.assertIn('self.comparison_lifecycle_title = QLabel("RMU Lifecycle · Select one RMU row")', source)
+        self.assertIn('self.comparison_lifecycle_title = QLabel("Equipment Action Tracking")', source)
         self.assertIn("self.comparison_page_splitter = QSplitter(Qt.Vertical)", source)
         self.assertIn("self.store.rmu_full_lifecycle(rmu)", source)
         self.assertIn('QPushButton("Open Full Lifecycle")', source)
-        self.assertIn('menu.addAction("View Full RMU Lifecycle...", self._open_selected_rmu_lifecycle)', source)
-        self.assertIn("RMUFullLifecycleDialog(self.store, rmu, self).exec()", source)
+        self.assertIn('menu.addAction(ui_tr("View Full Equipment Lifecycle...", self.ui_language), self._open_selected_rmu_lifecycle)', source)
+        self.assertIn("RMUFullLifecycleDialog(", source)
 
 
 if __name__ == "__main__":

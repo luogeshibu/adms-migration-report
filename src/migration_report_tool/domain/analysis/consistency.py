@@ -262,6 +262,36 @@ def compare_consistency(
     return ConsistencyResult(len(set(normalized.values())) == 1, normalized, raw_values)
 
 
+def compare_strict_consistency(
+    values_by_source: Mapping[str, object] | Iterable[tuple[str, object]],
+    normalizer: Normalizer,
+) -> ConsistencyResult:
+    """Compare every participating source, treating blank as a real value.
+
+    This is the configurable Equipment Data Review rule introduced in v0.8.191:
+
+    * all participating sources equal and non-blank => TRUE;
+    * all participating sources blank => TRUE;
+    * any blank/non-blank mix => FALSE;
+    * any two different non-blank normalized values => FALSE.
+
+    Callers decide which sources participate by deciding which source/value pairs
+    they pass in.  A missing source row should therefore be passed as ``""`` when
+    that source has a binding for the configured comparison field.
+    """
+    items = values_by_source.items() if isinstance(values_by_source, Mapping) else values_by_source
+    normalized: dict[str, str] = {}
+    raw_values: dict[str, str] = {}
+    for source, raw in items:
+        key = str(source)
+        normalized[key] = normalizer(raw)
+        raw_values[key] = clean(raw)
+
+    if not normalized:
+        return ConsistencyResult(None, normalized, raw_values)
+    return ConsistencyResult(len(set(normalized.values())) == 1, normalized, raw_values)
+
+
 def first_value(row: Mapping[str, object], *keys: str) -> object:
     """Return the first non-blank value from a row using source-specific aliases."""
     for key in keys:

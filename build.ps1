@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$SkipTests,
     [switch]$KeepStage
@@ -54,6 +54,46 @@ function Invoke-Python {
     if ($LASTEXITCODE -ne 0) { throw "$Label failed with exit code $LASTEXITCODE." }
 }
 
+function Invoke-IsolatedRegressionTests {
+    # Regression tests must never read or mutate the operator's real application
+    # settings. Global Map Fields/visibility are intentionally persisted under
+    # LOCALAPPDATA in production, so running tests against that database makes a
+    # formal build depend on whichever station mappings happen to be active on
+    # the build PC. It can also let tests overwrite real user preferences.
+    # Use a clean build-local sandbox for both application-global and project data.
+    $TestSandbox = Join-Path $BuildDir 'test-sandbox'
+    $TestUserData = Join-Path $TestSandbox 'user-data'
+    $TestProjectData = Join-Path $TestSandbox 'project-data'
+    Remove-DirectorySafe $TestSandbox
+    New-Item -ItemType Directory -Force -Path $TestUserData,$TestProjectData | Out-Null
+
+    $PreviousUserDataRoot = $env:MIGRATION_REPORT_TOOL_USER_DATA_ROOT
+    $PreviousProjectDataRoot = $env:MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT
+    try {
+        $env:MIGRATION_REPORT_TOOL_USER_DATA_ROOT = $TestUserData
+        $env:MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT = $TestProjectData
+        Write-Host "  Test user data: $TestUserData" -ForegroundColor DarkGray
+        Write-Host "  Test project data: $TestProjectData" -ForegroundColor DarkGray
+        Invoke-Python -Label '[3/10] Regression tests (isolated)...' -PythonArgs @('-m','unittest','discover','-s','tests','-p','test_*.py','-v')
+    }
+    finally {
+        if ($null -eq $PreviousUserDataRoot) {
+            Remove-Item Env:MIGRATION_REPORT_TOOL_USER_DATA_ROOT -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:MIGRATION_REPORT_TOOL_USER_DATA_ROOT = $PreviousUserDataRoot
+        }
+        if ($null -eq $PreviousProjectDataRoot) {
+            Remove-Item Env:MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT = $PreviousProjectDataRoot
+        }
+        try { Remove-DirectorySafe $TestSandbox }
+        catch { Write-Host "Warning: unable to remove test sandbox: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+}
+
 function Assert-BuildEnvironment {
     Assert-File $LockFile 'Dependency lock file'
     Assert-File $PyProject 'pyproject.toml'
@@ -89,7 +129,7 @@ try {
     Invoke-Python -Label '[2/10] Preflight validation...' -PythonArgs @('packaging\tools\preflight.py','--root',$Root)
 
     if (-not $SkipTests) {
-        Invoke-Python -Label '[3/10] Regression tests...' -PythonArgs @('-m','unittest','discover','-s','tests','-p','test_*.py','-v')
+        Invoke-IsolatedRegressionTests
     }
     else {
         Write-Host '[3/10] Regression tests SKIPPED by explicit developer option.' -ForegroundColor Yellow

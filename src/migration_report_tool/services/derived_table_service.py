@@ -18,7 +18,7 @@ from typing import Callable, Mapping
 from openpyxl import Workbook
 
 from ..config.sources import schema_for
-from ..infrastructure.parsers import read_csv_raw, read_excel_raw, read_mapped_rows, read_standard_raw
+from ..infrastructure.parsers import read_csv_raw, read_excel_raw, read_mapped_rows, read_standard_raw, resolve_source_excel_sheet_name
 from ..parsers import clean
 from .schema_service import get_source_overrides
 
@@ -87,8 +87,9 @@ def load_source_rows(store, source_type: str, path: Path) -> list[dict]:
     """Return canonical built-in fields plus persistent custom source fields."""
     overrides = get_source_overrides(store, source_type)
     sheet_name = store.source_sheet_name(source_type) if store and Path(path).suffix.lower() in {".xlsx", ".xlsm"} and hasattr(store, "source_sheet_name") else ""
-    mapped = read_mapped_rows(source_type, Path(path), overrides, strict=False, sheet_name=sheet_name or None)
-    _headers, raw = _raw_rows(source_type, Path(path), overrides, sheet_name=sheet_name or None)
+    effective_sheet = resolve_source_excel_sheet_name(source_type, Path(path), sheet_name or None) if Path(path).suffix.lower() in {".xlsx", ".xlsm"} else ""
+    mapped = read_mapped_rows(source_type, Path(path), overrides, strict=False, sheet_name=effective_sheet or None)
+    _headers, raw = _raw_rows(source_type, Path(path), overrides, sheet_name=effective_sheet or None)
     custom = list(store.custom_source_fields(source_type) if store else [])
     rows: list[dict] = []
     count = max(len(mapped.rows), len(raw))

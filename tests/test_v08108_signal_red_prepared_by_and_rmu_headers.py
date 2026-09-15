@@ -34,7 +34,7 @@ def test_pdf_export_requires_typed_prepared_by():
 
 
 def test_rmu_register_formal_headers_are_restored_while_contents_remain_simple():
-    expected = '<th>No.</th><th>RMU</th><th>Modification Item</th><th>Original Value</th><th>Target Value</th><th>Source</th><th>Remarks</th><th>NARI Confirm</th><th>SE/DNV Verify</th>'
+    expected = '<th>No.</th><th>RMU</th><th>Issue Type</th><th>Original Value</th><th>Target Value</th><th>Source</th><th>Remarks</th><th>NARI Confirm</th><th>SE/DNV Verify</th>'
     assert expected in PDF
     block = PDF[PDF.index("def _rmu_open_action_snapshot"):PDF.index("def build_site_signoff_snapshot")]
     assert '"adms_db_value"' in block
