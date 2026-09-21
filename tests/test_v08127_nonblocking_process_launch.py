@@ -10,7 +10,7 @@ class V08127NonBlockingProcessLaunchTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', self.version)
+        self.assertIn('__version__ = "0.8.215"', self.version)
 
     def test_process_spawn_is_launched_by_threadpool(self):
         block = self.ui[self.ui.index("def _start_process_background_task"):self.ui.index("def _reopen_active_store_after_worker")]

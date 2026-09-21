@@ -29,6 +29,7 @@ from ...domain.schema import MappingKind, resolve_schema
 
 from ...storage import ProjectStore
 from ...importing import ImportResult, import_source
+from ...services.portable_site_service import is_unified_site_folder
 
 
 @dataclass(frozen=True)
@@ -99,8 +100,16 @@ def _save_repository_config(payload: dict) -> None:
     _config_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+DEFAULT_SHARED_REPOSITORY_ROOT = Path(r"\\172.16.21.101\Share Folder\Downstream Report")
+
+
 def load_repository_root() -> Path | None:
-    value = str(_load_repository_config().get("root", "")).strip()
+    config = _load_repository_config()
+    value = str(config.get("root", "")).strip()
+    # Do not probe the default UNC path while constructing the main window.
+    # Windows can block for a long time when a remembered server is offline.
+    # The setup guide can still offer/select this path after the UI is visible.
+    # A saved explicit path remains authoritative for upgrade compatibility.
     return Path(value) if value else None
 
 
@@ -112,6 +121,7 @@ def save_repository_root(root: Path) -> None:
     root = Path(root).resolve()
     payload = _load_repository_config()
     payload["root"] = str(root)
+    payload["repository_root_user_selected_v1"] = True
     _save_repository_config(payload)
 
 
@@ -327,7 +337,12 @@ def metadata_fingerprint(path: Path) -> dict:
 
 
 def _files_casefold(site_dir: Path) -> dict[str, Path]:
-    return {p.name.casefold(): p for p in site_dir.iterdir() if p.is_file()}
+    result = {p.name.casefold(): p for p in site_dir.iterdir() if p.is_file()}
+    # Unified sites keep source tables in source_files. Keep the legacy root
+    # lookup first so duplicate names remain deterministic during migration.
+    for path in site_tabular_files(site_dir):
+        result.setdefault(path.name.casefold(), path)
+    return result
 
 
 def _first_existing(files: dict[str, Path], names: Iterable[str]) -> Path | None:
@@ -364,7 +379,7 @@ def site_tabular_files(site_dir: Path) -> tuple[Path, ...]:
             parent_parts = rel.parts[:-1]
             if any(
                 part.startswith(".")
-                or part.casefold() in {"archive", "backup", "backups", "__pycache__"}
+                or part.casefold() in {"archive", "backup", "backups", "generated", "reports", "snapshots", "__pycache__"}
                 for part in parent_parts
             ):
                 continue
@@ -486,8 +501,8 @@ def source_version_candidates(site_dir: Path, source_type: str) -> list[Path]:
     if source_type not in SOURCE_BY_KEY or not site_dir.exists():
         return []
     result: list[Path] = []
-    for candidate in site_dir.iterdir():
-        if not candidate.is_file() or candidate.suffix.lower() not in _source_extensions(source_type):
+    for candidate in site_tabular_files(site_dir):
+        if candidate.suffix.lower() not in _source_extensions(source_type):
             continue
         if _family_name_matches_source(candidate, source_type, site_dir.name) and has_explicit_source_version(candidate):
             result.append(candidate)
@@ -521,8 +536,8 @@ def _rule_fallback_candidates(site_dir: Path, source_type: str, used: set[Path] 
         return []
     keywords = load_source_detection_keywords().get(source_type, [])
     candidates: list[Path] = []
-    for candidate in site_dir.iterdir():
-        if not candidate.is_file() or candidate.suffix.lower() not in _source_extensions(source_type):
+    for candidate in site_tabular_files(site_dir):
+        if candidate.suffix.lower() not in _source_extensions(source_type):
             continue
         try:
             if candidate.resolve() in used:
@@ -731,8 +746,9 @@ def discover_site_sources(site_dir: Path, *, deep: bool = True) -> tuple[dict[st
     site_dir = Path(site_dir)
     site = site_dir.name
     files = _files_casefold(site_dir)
-    all_files = [p for p in site_dir.iterdir() if p.is_file()]
-    supported = [p for p in all_files if p.suffix.lower() in {".csv", ".xlsx", ".xlsm"}]
+    # Read both legacy root-level sources and organized source_files. Output
+    # folders are excluded by site_tabular_files.
+    supported = list(site_tabular_files(site_dir))
     result: dict[str, Path] = {}
     detections: dict[str, SourceDetection] = {}
     used: set[Path] = set()
@@ -932,6 +948,9 @@ def scan_repository(root: Path, *, deep: bool = True) -> list[SiteInfo]:
     root = Path(root)
     if not root.exists() or not root.is_dir():
         return []
+    if is_unified_site_folder(root):
+        sources, detections, unmapped = discover_site_sources(root, deep=deep)
+        return [SiteInfo(root.name, root, sources, detections, unmapped)]
     sites = []
     for folder in sorted((p for p in root.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))), key=lambda p: p.name.casefold()):
         sources, detections, unmapped = discover_site_sources(folder, deep=deep)
@@ -953,9 +972,18 @@ def selected_repository_source_path(site: SiteInfo, store: ProjectStore | None, 
     filename = str((selection or {}).get("file_name") or "").strip()
     if not filename:
         return None
-    candidate = Path(site.path) / Path(filename).name
-    if not candidate.exists() or not candidate.is_file():
+    candidates = [
+        path for path in site_tabular_files(site.path)
+        if path.name.casefold() == Path(filename).name.casefold()
+    ]
+    if not candidates:
         return None
+    # Prefer a root-level legacy file when both layouts temporarily coexist;
+    # otherwise use the organized source_files copy.
+    candidate = min(
+        candidates,
+        key=lambda path: (len(path.relative_to(site.path).parts), str(path).casefold()),
+    )
     if candidate.suffix.lower() not in _source_extensions(source_type):
         return None
     # Explicit user selection is authoritative. The physical filename is not a
@@ -1249,4 +1277,3 @@ def sync_site_to_project(
     store.config["repository_last_snapshot"] = str(snapshot_dir)
     store.save_config()
     return SiteSyncResult(snapshot_dir=snapshot_dir, imported=tuple(imported), changed_keys=tuple(sorted(set(changed))))
-

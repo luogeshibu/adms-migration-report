@@ -9,7 +9,7 @@ VERSION = (ROOT / "src/migration_report_tool/version.py").read_text(encoding="ut
 
 class TestV08169PdfIssueRegisterClarity(unittest.TestCase):
     def test_release_version(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION)
+        self.assertIn('__version__ = "0.8.215"', VERSION)
 
     def test_rmu_register_uses_issue_type_not_review_status_as_column(self):
         self.assertIn("<th>Issue Type</th>", PDF)

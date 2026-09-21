@@ -14,7 +14,7 @@ MODULES = (ROOT / "src" / "migration_report_tool" / "config" / "source_modules.p
 
 class TestV08184ZhI18nUnlimitedSources(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_new_configurable_source_and_profile_ui_has_chinese_contracts(self):
         cases = {

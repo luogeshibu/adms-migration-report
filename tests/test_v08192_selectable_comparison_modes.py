@@ -57,7 +57,7 @@ class TestV08192SelectableComparisonModes(unittest.TestCase):
         }
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_old_configs_migrate_to_strict_site_default(self):
         config = normalize_config({"sources": [], "comparisons": [{"id": "x", "title": "X", "bindings": {}}]})

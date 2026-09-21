@@ -15,7 +15,7 @@ from migration_report_tool.version import __version__
 
 class TestV08186RecursiveSiteSourceDiscovery(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_station_availability_finds_nested_equipment_workbook(self):
         with tempfile.TemporaryDirectory() as td:
@@ -55,7 +55,10 @@ class TestV08186RecursiveSiteSourceDiscovery(unittest.TestCase):
     def test_station_list_uses_recursive_availability_helper(self):
         main_window = Path(__file__).parents[1] / "src" / "migration_report_tool" / "ui" / "main_window.py"
         text = main_window.read_text(encoding="utf-8")
-        self.assertIn("has_tabular_files = site_has_tabular_files(site.path)", text)
+        # The recursive scan runs in the background repository indexer.  The
+        # station list reuses its result instead of rescanning a UNC tree on
+        # every GUI refresh.
+        self.assertIn("has_tabular_files = bool(site.sources or site.unmapped_files)", text)
 
 
 if __name__ == "__main__":

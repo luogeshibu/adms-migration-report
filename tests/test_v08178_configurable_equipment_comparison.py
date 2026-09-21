@@ -60,7 +60,7 @@ class TestV08178ConfigurableEquipmentComparison(unittest.TestCase):
         return next(column.id for column in structure.columns if column.header == header)
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_any_number_of_files_and_per_file_keys_build_dynamic_review(self):
         a = self._csv(

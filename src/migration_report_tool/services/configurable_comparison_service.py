@@ -31,8 +31,14 @@ import uuid
 
 from openpyxl import load_workbook
 
-from ..analysis import compare_consistency, compare_strict_consistency
-from ..parsers import clean
+from ..analysis import (
+    compare_consistency,
+    compare_strict_consistency,
+    normalize_feeder_for_compare,
+    normalize_nop,
+    normalize_smart,
+)
+from ..parsers import clean, normalize_key
 from ..infrastructure.database.global_settings_store import (
     equipment_comparison_profiles as _global_equipment_profiles,
     equipment_comparison_profile as _global_equipment_profile,
@@ -45,12 +51,32 @@ CONFIG_VERSION = 4
 PROFILE_LINK_KEY = "equipment_comparison_profile_link_v1"
 PROFILE_PAYLOAD_VERSION = 2
 LIVE_METADATA_KEY = "configurable_live_source_metadata_v1"
+# Reserved shared profile written by the configuration administrator.  It is
+# intentionally hidden from the normal reusable-template list: other
+# workstations consume it automatically instead of selecting it manually.
+ADMIN_ACTIVE_PROFILE_NAME = "__GLOBAL_ADMIN_ACTIVE__"
 
 COMPARISON_MODE_DEFAULT = "default"
 COMPARISON_MODE_STRICT = "strict"
 COMPARISON_MODE_IGNORE_BLANK = "ignore_blank"
 VALID_SITE_COMPARISON_MODES = {COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK}
 VALID_RULE_COMPARISON_MODES = {COMPARISON_MODE_DEFAULT, *VALID_SITE_COMPARISON_MODES}
+
+# Comparison value normalization is deliberately separate from the comparison
+# mode.  A rule may still be strict about blanks while using the proven ADMS
+# feeder decoder (for example JED-CTL-AJWD-AH331 -> AJWD-31).
+NORMALIZATION_AUTO = "auto"
+NORMALIZATION_TEXT = "text"
+NORMALIZATION_FEEDER = "feeder"
+NORMALIZATION_SMART = "smart"
+NORMALIZATION_NOP = "nop"
+VALID_RULE_NORMALIZATIONS = {
+    NORMALIZATION_AUTO,
+    NORMALIZATION_TEXT,
+    NORMALIZATION_FEEDER,
+    NORMALIZATION_SMART,
+    NORMALIZATION_NOP,
+}
 
 
 def _site_comparison_mode(value: object) -> str:
@@ -63,6 +89,15 @@ def _rule_comparison_mode(rule: dict, site_default: str) -> str:
     if mode in VALID_SITE_COMPARISON_MODES:
         return mode
     return _site_comparison_mode(site_default)
+
+
+def _rule_normalization(rule: dict) -> str:
+    mode = clean((rule or {}).get("normalization"))
+    return mode if mode in VALID_RULE_NORMALIZATIONS else NORMALIZATION_AUTO
+
+
+def _rule_title_token(title: object) -> str:
+    return normalize_key(title).replace("_", " ").strip().upper()
 
 
 @dataclass(frozen=True)
@@ -242,6 +277,11 @@ def normalize_config(config: dict | None) -> dict:
             "header_row": max(1, int(source.get("header_row") or 1)),
             "key_column": clean(source.get("key_column")),
             "hidden_columns": sorted({clean(x) for x in (source.get("hidden_columns") or []) if clean(x)}),
+            "hidden_column_headers": {
+                clean(field_id): clean(header)
+                for field_id, header in dict(source.get("hidden_column_headers") or {}).items()
+                if clean(field_id) and clean(header)
+            },
             "enabled": bool(source.get("enabled", True)),
             "selection_mode": clean(source.get("selection_mode")) if clean(source.get("selection_mode")) in {"pinned", "latest_family"} else "pinned",
             "family_key": clean(source.get("family_key")),
@@ -267,7 +307,23 @@ def normalize_config(config: dict | None) -> dict:
         mode = clean(rule.get("comparison_mode"))
         if mode not in VALID_RULE_COMPARISON_MODES:
             mode = COMPARISON_MODE_DEFAULT
-        comparisons.append({"id": rule_id, "title": title, "comparison_mode": mode, "bindings": bindings})
+        normalization = clean(rule.get("normalization"))
+        if normalization not in VALID_RULE_NORMALIZATIONS:
+            # Existing and new sites stay conservative.  Smart business
+            # normalization is enabled only by an explicit site-local choice.
+            normalization = NORMALIZATION_TEXT
+        comparisons.append({
+            "id": rule_id,
+            "title": title,
+            "comparison_mode": mode,
+            "normalization": normalization,
+            "binding_headers": {
+                clean(source_id): clean(header)
+                for source_id, header in dict(rule.get("binding_headers") or {}).items()
+                if clean(source_id) in source_ids and clean(header)
+            },
+            "bindings": bindings,
+        })
     output["comparisons"] = comparisons
     output["updated_at"] = clean(raw.get("updated_at"))
     return output
@@ -344,7 +400,7 @@ def list_comparison_profiles() -> list[dict]:
             "modified_at": clean(item.get("modified_at")),
         }
         for item in _global_equipment_profiles()
-        if clean(item.get("name"))
+        if clean(item.get("name")) and clean(item.get("name")) != ADMIN_ACTIVE_PROFILE_NAME
     ]
 
 
@@ -360,13 +416,54 @@ def get_comparison_profile(profile_name: str) -> dict | None:
     }
 
 
-def save_comparison_profile(profile_name: str, config: dict, modified_by: str = "") -> dict:
+def save_comparison_profile(profile_name: str, config: dict, modified_by: str = "", *, store=None) -> dict:
     name = clean(profile_name)
     if not name:
         raise ValueError("Profile name is required")
+    profile_config = normalize_config(config)
+    if store is not None:
+        # Keep the human-readable physical header alongside hidden ids.  This
+        # lets another station remap visibility when its workbook generated a
+        # different physical-column id.
+        for source in profile_config.get("sources", []):
+            hidden = set(source.get("hidden_columns") or [])
+            if not hidden:
+                source["hidden_column_headers"] = {}
+                continue
+            try:
+                columns = source_column_catalog(store, source)
+            except Exception:
+                columns = ()
+            source["hidden_column_headers"] = {
+                column.id: column.header
+                for column in columns
+                if column.id in hidden
+            }
+        source_by_id = {
+            clean(source.get("id")): source
+            for source in profile_config.get("sources", [])
+            if clean(source.get("id"))
+        }
+        for rule in profile_config.get("comparisons", []):
+            binding_headers = {}
+            for source_id, field_id in dict(rule.get("bindings") or {}).items():
+                source = source_by_id.get(clean(source_id))
+                if not source:
+                    continue
+                try:
+                    columns = source_column_catalog(store, source)
+                except Exception:
+                    columns = ()
+                header = next(
+                    (column.header for column in columns if column.id == clean(field_id)),
+                    "",
+                )
+                if header:
+                    binding_headers[clean(source_id)] = header
+            rule["binding_headers"] = binding_headers
     payload = {
         "version": PROFILE_PAYLOAD_VERSION,
-        "equipment_config": _profile_safe_config(config),
+        "equipment_config": _profile_safe_config(profile_config),
     }
     saved = _replace_global_equipment_profile(name, payload, modified_by or "system")
     return {
@@ -517,6 +614,8 @@ def _stored_source_path(store, source: dict) -> Path | None:
     if not text:
         return None
     mode = clean((source or {}).get("path_mode")).lower()
+    if mode == "project_relative":
+        return Path(store.folder) / text
     if mode == "site_relative":
         base = site_root(store)
         if base:
@@ -572,7 +671,7 @@ def source_path(store, source: dict) -> Path | None:
 
     # Existing v0.8.178-v0.8.181 configs can contain a timestamped legacy copy.
     # Prefer the true live/original file without mutating/deleting history.
-    if stored is not None and _path_is_inside_project_data(store, stored):
+    if stored is not None and clean((source or {}).get("path_mode")).lower() != "project_relative" and _path_is_inside_project_data(store, stored):
         role = _legacy_role_for_source(source, stored)
         live = _legacy_path(store, role) if role else None
         if live is not None and live.exists() and not _path_is_inside_project_data(store, live):
@@ -763,6 +862,11 @@ def _same_path(left: Path, right: Path) -> bool:
 
 def encode_source_path(store, path: Path) -> tuple[str, str]:
     path = Path(path).resolve()
+    try:
+        rel = path.relative_to(Path(store.folder).resolve())
+        return str(rel), "project_relative"
+    except ValueError:
+        pass
     base_text = str((store.config or {}).get("repository_path") or "").strip()
     if base_text:
         base = Path(base_text).resolve()
@@ -774,16 +878,77 @@ def encode_source_path(store, path: Path) -> tuple[str, str]:
     return str(path), "absolute"
 
 
+def _profile_hidden_columns_for_target(store, template_source: dict, target_source: dict) -> list[str]:
+    """Translate template hidden fields to the target file's physical ids.
+
+    Physical ids are stable for an unchanged header, but different station
+    workbooks often add a version suffix, change spacing/case, or reorder
+    columns.  The profile therefore tries the id first and then the saved
+    physical header text before giving up and retaining the original id.
+    """
+    hidden = [clean(value) for value in (template_source.get("hidden_columns") or []) if clean(value)]
+    if not hidden:
+        return []
+    try:
+        target_columns = source_column_catalog(store, target_source)
+    except Exception:
+        target_columns = ()
+    if not target_columns:
+        return hidden
+    saved_headers = {
+        clean(field_id): clean(header)
+        for field_id, header in dict(template_source.get("hidden_column_headers") or {}).items()
+        if clean(field_id) and clean(header)
+    }
+    result = []
+    for field_id in hidden:
+        result.append(
+            _profile_column_id_for_target(
+                target_columns,
+                field_id,
+                saved_headers.get(field_id),
+            )
+        )
+    return sorted(set(result))
+
+
+def _profile_column_id_for_target(
+    target_columns: tuple[PhysicalColumn, ...],
+    field_id: str,
+    saved_header: str = "",
+) -> str:
+    """Resolve one template field against the target workbook columns."""
+    field_id = clean(field_id)
+    if not target_columns:
+        return field_id
+    by_id = {column.id: column.id for column in target_columns}
+    exact = by_id.get(field_id)
+    if exact:
+        return exact
+
+    def token(value: object) -> str:
+        return re.sub(r"[\W_]+", "", normalize_key(value), flags=re.UNICODE).casefold()
+
+    wanted = token(saved_header)
+    if not wanted:
+        return field_id
+    for column in target_columns:
+        if wanted == token(column.header) or wanted == token(column.label):
+            return column.id
+    return field_id
+
+
 def apply_comparison_profile(
     store, profile_name: str, *, current_config: dict | None = None
 ) -> tuple[dict, dict]:
     """Merge one reusable profile into the current site's physical sources.
 
     The profile owns the reusable *logical* contract (source roles/order/titles,
-    Key/Index defaults, visibility defaults and comparison rules).  Physical file
-    paths remain site-local.  Existing local sources are matched by stable id,
-    file-family key, then module title; matching local paths are preserved.  For
-    a new role the site's file pool is searched by the profile's family key.
+    enabled state, Key/Index defaults, hidden fields and comparison rules).
+    Physical file paths remain site-local.  Existing local sources are matched
+    by stable id, file-family key, then module title; matching local paths are
+    preserved.  For a new role the site's file pool is searched by the profile's
+    family key.
 
     Site-only extra sources are deliberately retained and appended.  This makes
     profile reuse safe for stations that have an extra vendor/system table.
@@ -832,9 +997,10 @@ def apply_comparison_profile(
         if local is not None:
             merged["path"] = str(local.get("path") or "").strip()
             merged["path_mode"] = clean(local.get("path_mode")) or "absolute"
-            # Participation is operational/site-specific.  A station that has
-            # intentionally disabled one role stays disabled after template sync.
-            merged["enabled"] = bool(local.get("enabled", merged.get("enabled", True)))
+            # Enabled/disabled participation is part of the reusable station
+            # configuration.  The physical path remains local, but the target
+            # station must receive the template's participation state.
+            merged["enabled"] = bool(template_source.get("enabled", True))
             used_current_ids.add(clean(local.get("id")))
         else:
             merged["path"] = ""
@@ -847,6 +1013,11 @@ def apply_comparison_profile(
                 merged["path"] = encoded
                 merged["path_mode"] = path_mode
 
+        # Hidden-field ids belong to the physical workbook.  Remap them using
+        # the template's saved header text so visibility survives stations
+        # whose files use a different column-id hash.
+        merged["hidden_columns"] = _profile_hidden_columns_for_target(store, template_source, merged)
+
         merged_sources.append(merged)
 
     # Preserve site-only extra sources.  They remain available and keep their
@@ -857,17 +1028,53 @@ def apply_comparison_profile(
         if local_id and local_id not in used_current_ids:
             merged_sources.append(dict(local))
 
+    target_sources_by_id = {
+        clean(source.get("id")): source
+        for source in merged_sources
+        if clean(source.get("id"))
+    }
+    current_rules_by_title = {
+        clean(rule.get("title")).casefold(): rule
+        for rule in current.get("comparisons", [])
+        if clean(rule.get("title"))
+    }
     merged_rules: list[dict] = []
     for rule in template.get("comparisons", []):
         bindings = {}
+        current_rule = current_rules_by_title.get(clean(rule.get("title")).casefold())
         for template_source_id, column_id in dict(rule.get("bindings") or {}).items():
             target_id = id_map.get(clean(template_source_id))
             if target_id and clean(column_id):
-                bindings[target_id] = clean(column_id)
+                target_source = target_sources_by_id.get(target_id, {})
+                binding_headers = dict(rule.get("binding_headers") or {})
+                try:
+                    target_columns = source_column_catalog(store, target_source)
+                except Exception:
+                    target_columns = ()
+                resolved_column_id = _profile_column_id_for_target(
+                    target_columns,
+                    clean(column_id),
+                    clean(binding_headers.get(clean(template_source_id))),
+                )
+                # Profiles created before binding_headers existed can still be
+                # applied safely. If the current station already has a valid
+                # mapping for the same logical rule/source, keep that mapping
+                # instead of turning the rule into an empty comparison.
+                if target_columns and not any(column.id == resolved_column_id for column in target_columns):
+                    legacy_binding = clean((current_rule or {}).get("bindings", {}).get(target_id))
+                    if legacy_binding and any(column.id == legacy_binding for column in target_columns):
+                        resolved_column_id = legacy_binding
+                bindings[target_id] = resolved_column_id
         merged_rules.append({
             "id": clean(rule.get("id")) or _rule_id(),
             "title": clean(rule.get("title")) or "Comparison",
             "comparison_mode": clean(rule.get("comparison_mode")) or COMPARISON_MODE_DEFAULT,
+            "normalization": clean(rule.get("normalization")) or NORMALIZATION_AUTO,
+            "binding_headers": {
+                clean(source_id): clean(header)
+                for source_id, header in dict(rule.get("binding_headers") or {}).items()
+                if clean(source_id) and clean(header)
+            },
             "bindings": bindings,
         })
 
@@ -895,6 +1102,63 @@ def source_column_catalog(store, source: dict) -> tuple[PhysicalColumn, ...]:
         sheet_name=clean(source.get("sheet_name")),
         header_row=max(1, int(source.get("header_row") or 1)),
     ).columns
+
+
+def comparison_field_warnings(store, config: dict | None = None) -> tuple[dict, ...]:
+    """Return non-blocking warnings for configured fields absent from a site.
+
+    Reusable profiles intentionally preserve logical column ids, while each
+    station supplies its own physical workbooks.  A target workbook can
+    therefore be valid but lack a field used by the shared profile.  Keep the
+    profile and let the reviewer decide how to map it; the UI presents these
+    records as warnings instead of making profile application fail.
+    """
+    normalized = normalize_config(config if config is not None else get_config(store, bootstrap=False))
+    active_sources = [
+        source for source in normalized.get("sources", [])
+        if bool(source.get("enabled", True))
+    ]
+    catalogs: dict[str, tuple[PhysicalColumn, ...]] = {}
+    source_titles: dict[str, str] = {}
+    for source in active_sources:
+        source_id = clean(source.get("id"))
+        if not source_id:
+            continue
+        path = source_path(store, source)
+        source_titles[source_id] = clean(source.get("title")) or (path.stem if path else "Source")
+        if not path or not path.exists():
+            continue
+        try:
+            catalogs[source_id] = source_column_catalog(store, source)
+        except Exception:
+            # The normal validation path reports unreadable/missing files.  Do
+            # not turn an I/O error here into a duplicate or misleading field
+            # warning.
+            continue
+
+    warnings: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rule in normalized.get("comparisons", []):
+        rule_title = clean(rule.get("title")) or "Comparison"
+        for source_id, column_id in dict(rule.get("bindings") or {}).items():
+            source_id = clean(source_id)
+            column_id = clean(column_id)
+            if not source_id or not column_id or source_id not in catalogs:
+                continue
+            if any(column.id == column_id for column in catalogs[source_id]):
+                continue
+            key = (source_id, column_id, rule_title.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            warnings.append({
+                "kind": "comparison_field",
+                "source_id": source_id,
+                "source_title": source_titles.get(source_id, "Source"),
+                "rule_title": rule_title,
+                "field_id": column_id,
+            })
+    return tuple(warnings)
 
 
 def _path_is_inside_project_data(store, path: Path | None) -> bool:
@@ -1110,6 +1374,44 @@ def _generic_normalize(value: object) -> str:
     return clean(value)
 
 
+def _comparison_normalizer(rule: dict, site_name: str = ""):
+    """Return the value normalizer selected by one configurable rule.
+
+    ``auto`` is intentionally opt-in.  It is useful for a reviewer who wants
+    the field title to select a known semantic normalizer, while the default
+    site configuration remains text-only and never guesses across stations.
+    """
+    mode = _rule_normalization(rule)
+    title = _rule_title_token((rule or {}).get("title"))
+    if mode == NORMALIZATION_FEEDER or (mode == NORMALIZATION_AUTO and title in {"FEEDER", "FDR"}):
+        return lambda value: normalize_feeder_for_compare(value, site_name)
+    if mode == NORMALIZATION_SMART or (mode == NORMALIZATION_AUTO and title == "SMART"):
+        return normalize_smart
+    if mode == NORMALIZATION_NOP or (mode == NORMALIZATION_AUTO and title == "NOP"):
+        return normalize_nop
+    return _generic_normalize
+
+
+def _normalization_label(rule: dict) -> str:
+    mode = _rule_normalization(rule)
+    if mode == NORMALIZATION_FEEDER:
+        return "FEEDER smart normalization"
+    if mode == NORMALIZATION_SMART:
+        return "SMART alias normalization"
+    if mode == NORMALIZATION_NOP:
+        return "NOP contains normalization"
+    if mode == NORMALIZATION_TEXT:
+        return "Text / exact"
+    title = _rule_title_token((rule or {}).get("title"))
+    if title in {"FEEDER", "FDR"}:
+        return "Automatic FEEDER normalization"
+    if title == "SMART":
+        return "Automatic SMART alias normalization"
+    if title == "NOP":
+        return "Automatic NOP contains normalization"
+    return "Text / exact"
+
+
 def _index_rows(table: LoadedTable, key_column: str) -> tuple[dict[str, dict], dict[str, int], dict[str, str]]:
     grouped: dict[str, list[dict]] = {}
     display: dict[str, str] = {}
@@ -1142,7 +1444,14 @@ def analysis_detail_key(rule_id: str) -> str:
     return analysis_column_key(rule_id) + "__detail"
 
 
-def _analysis_tooltip(title: str, result, mode: str, values_by_source: dict[str, object]) -> str:
+def _analysis_tooltip(
+    title: str,
+    result,
+    mode: str,
+    values_by_source: dict[str, object],
+    normalizer,
+    normalization_label: str,
+) -> str:
     effective = _site_comparison_mode(mode)
     if effective == COMPARISON_MODE_IGNORE_BLANK:
         rule_text = (
@@ -1154,14 +1463,16 @@ def _analysis_tooltip(title: str, result, mode: str, values_by_source: dict[str,
             "Mode: Strict equality. Every bound source participates and blank is a real comparison value. "
             "All values equal = TRUE (including all blank); any blank/non-blank mix or other difference = FALSE."
         )
-    lines = [f"{title} consistency check", rule_text, ""]
+    lines = [f"{title} consistency check", f"Normalization: {normalization_label}", rule_text, ""]
     if not values_by_source:
         lines += ["No bound sources", "Result: N/A"]
         return "\n".join(lines)
     for source, raw_value in values_by_source.items():
         raw = clean(raw_value)
-        normalized = _generic_normalize(raw_value)
+        normalized = normalizer(raw_value)
         lines.append(f"{source}: {raw or normalized or '<blank>'}")
+        if raw and normalized and raw != normalized:
+            lines.append(f"  normalized: {normalized}")
     lines += ["", f"Result: {result.display or 'N/A'}"]
     return "\n".join(lines)
 
@@ -1171,6 +1482,11 @@ def build_configurable_review(store) -> tuple[list[dict], dict]:
     if not config["sources"]:
         return [], {"coverage": {}, "source_count": 0, "config": config}
 
+    site_name = clean(
+        (store.config or {}).get("repository_site")
+        or (store.config or {}).get("site_name")
+        or getattr(getattr(store, "folder", None), "name", "")
+    )
     loaded: dict[str, LoadedTable] = {}
     indexes: dict[str, dict[str, dict]] = {}
     duplicate_counts: dict[str, dict[str, int]] = {}
@@ -1280,6 +1596,7 @@ def build_configurable_review(store) -> tuple[list[dict], dict]:
         for rule in ordered_rules:
             rule_id = rule["id"]
             title = clean(rule.get("title")) or "Comparison"
+            normalizer = _comparison_normalizer(rule, site_name)
             values = {}
             for source in ordered_sources:
                 source_id = source["id"]
@@ -1294,13 +1611,20 @@ def build_configurable_review(store) -> tuple[list[dict], dict]:
                 values[source_meta[source_id]["title"]] = source_row.get(column_id, "") if source_row else ""
             effective_mode = _rule_comparison_mode(rule, config.get("default_comparison_mode"))
             if effective_mode == COMPARISON_MODE_IGNORE_BLANK:
-                result = compare_consistency(values, _generic_normalize)
+                result = compare_consistency(values, normalizer)
             else:
-                result = compare_strict_consistency(values, _generic_normalize)
+                result = compare_strict_consistency(values, normalizer)
             analysis_key = analysis_column_key(rule_id)
             detail_key = analysis_detail_key(rule_id)
             row[analysis_key] = result.display
-            row[detail_key] = _analysis_tooltip(title, result, effective_mode, values)
+            row[detail_key] = _analysis_tooltip(
+                title,
+                result,
+                effective_mode,
+                values,
+                normalizer,
+                _normalization_label(rule),
+            )
             row["analysis_field_order"].append(rule_id)
             row["analysis_field_labels"][rule_id] = title
             row["analysis_field_keys"][rule_id] = analysis_key

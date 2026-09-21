@@ -10,7 +10,7 @@ class V08131MapFieldsSaveProgressContractTests(unittest.TestCase):
         cls.version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
 
     def test_release_version(self):
-        self.assertIn('__version__ = "0.8.196"', self.version)
+        self.assertIn('__version__ = "0.8.215"', self.version)
 
     def test_dialog_save_uses_cached_header_instead_of_full_file_reread(self):
         start = self.ui.index("    def _save(self):", self.ui.index("class SourceMappingDialog"))

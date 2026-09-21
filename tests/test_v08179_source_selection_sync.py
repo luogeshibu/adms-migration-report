@@ -8,7 +8,7 @@ from migration_report_tool.version import __version__
 
 class TestV08179SourceSelectionSync(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_source_switch_does_not_refresh_list_while_qt_delivers_selection_signal(self):
         source = Path(__file__).parents[1] / "src" / "migration_report_tool" / "ui" / "main_window.py"

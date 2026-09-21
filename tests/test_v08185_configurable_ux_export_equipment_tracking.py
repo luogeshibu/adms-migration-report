@@ -17,7 +17,7 @@ PDF_SOURCE = (ROOT / "src/migration_report_tool/infrastructure/export/signoff_pd
 
 class TestV08185ConfigurableUxExportEquipmentTracking(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_source_recognition_categories_are_extensible_optional_hints(self):
         with tempfile.TemporaryDirectory() as td:

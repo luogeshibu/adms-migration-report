@@ -233,6 +233,24 @@ def normalize_smart(value: object) -> str:
     return compact
 
 
+def normalize_nop(value: object) -> str:
+    """Normalize NOP classifications by detecting NOP anywhere in the value.
+
+    Source files use values such as ``NOP``, ``SMART NOP`` and ``NORMAL NOP``
+    for the same equipment classification.  Punctuation and spacing are
+    ignored for detection, while non-NOP values retain the generic text
+    normalization so they still compare normally and cannot be silently
+    treated as NOP.
+    """
+    text = clean(value).upper()
+    if not text:
+        return ""
+    compact = re.sub(r"[^A-Z0-9]+", "", text)
+    if "NOP" in compact:
+        return "NOP"
+    return clean(value)
+
+
 def normalize_type(value: object) -> str:
     """Normalize RMU cabinet type, e.g. 2L1T / 3L1T."""
     text = clean(value).upper()

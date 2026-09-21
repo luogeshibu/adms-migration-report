@@ -19,7 +19,7 @@ def function_block(source: str, name: str, next_name: str) -> str:
 
 class ReviewSaveResponsivenessTests(unittest.TestCase):
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION)
+        self.assertIn('__version__ = "0.8.215"', VERSION)
 
     def test_item_picker_uses_save_cancel_labels(self):
         block = MAIN[MAIN.index("class QInputDialog"):MAIN.index("class I18nStatusBar")]

@@ -18,7 +18,7 @@ class V08129ExplicitBlankSystemMappingTests(unittest.TestCase):
 
     def test_version(self):
         version = (self.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "0.8.196"', version)
+        self.assertIn('__version__ = "0.8.215"', version)
 
     def test_explicit_blank_wins_over_existing_auto_header(self):
         result = resolve_schema(

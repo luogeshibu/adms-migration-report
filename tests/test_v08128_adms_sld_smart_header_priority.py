@@ -12,7 +12,7 @@ class V08128AdmsSldSmartHeaderPriorityTests(unittest.TestCase):
 
     def test_version(self):
         version = (self.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "0.8.196"', version)
+        self.assertIn('__version__ = "0.8.215"', version)
 
     def test_adms_sld_smart_prefers_is_smart_header(self):
         result = resolve_schema(

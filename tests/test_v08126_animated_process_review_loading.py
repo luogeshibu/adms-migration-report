@@ -11,7 +11,7 @@ class V08126AnimatedProcessReviewLoadingTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', self.version)
+        self.assertIn('__version__ = "0.8.215"', self.version)
 
     def test_busy_popup_has_explicit_ping_pong_timer(self):
         marquee = self.ui[self.ui.index("class BusyMarqueeProgressBar"):self.ui.index("class BusyOperationPopup")]

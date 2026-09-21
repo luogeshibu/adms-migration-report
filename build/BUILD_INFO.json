@@ -1,12 +1,12 @@
 {
   "product": "NARI Saudi ADMS Migration Report",
-  "version": "0.8.196",
+  "version": "0.8.215",
   "platform": "Windows x64",
-  "built_at_utc": "2026-09-15T08:08:31+00:00",
+  "built_at_utc": "2026-09-21T14:48:10+00:00",
   "python": "3.14.6",
   "pyside6": "6.11.2",
   "pyinstaller": "6.22.2",
-  "git_commit": "69680ea94aff984ad3afcfb2e3d303596d0f0af3",
+  "git_commit": "cce015a80019fd5b5ed5bfd664d541a97c75d11c",
   "git_branch": "master",
   "git_dirty": true
 }

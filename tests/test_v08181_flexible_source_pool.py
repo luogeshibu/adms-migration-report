@@ -43,7 +43,7 @@ class TestV08181FlexibleSourcePool(unittest.TestCase):
         return path
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_refresh_inventory_discovers_flat_and_optional_subfolders_without_auto_membership(self):
         flat = self._csv("NEW-SYSTEM.csv", [["ID", "TYPE"], ["A", "T"]])
@@ -106,6 +106,10 @@ class TestV08181FlexibleSourcePool(unittest.TestCase):
             "Participate in Equipment Data Review", "Latest file in family (AUTO)", "Pin this exact file",
         ):
             self.assertIn(token, text)
+        self.assertIn("setDragDropMode(QAbstractItemView.InternalMove)", text)
+        self.assertIn("_source_rows_moved", text)
+        self.assertIn('"Move Up"', text)
+        self.assertIn('"Move Down"', text)
         self.assertIn('resolve_configurable_signal_assignment(store, source_type)', text)
 
 

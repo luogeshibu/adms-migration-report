@@ -2,14 +2,16 @@
 
 Unlike ``ProjectStore`` (one database per site), this store holds presentation
 metadata that must be identical for every site, such as review-table Display
-Names.  It lives under the writable application user-data root so settings
-survive release-folder replacement.
+Names.  When the shared site repository is available it lives inside that
+repository, so every workstation reads the same configuration.  A local
+application-data fallback is retained for offline/legacy use.
 """
 from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+import os
 import sqlite3
 import json
 
@@ -17,14 +19,62 @@ from ...utils.paths import user_data_root
 
 
 def global_settings_db_path() -> Path:
-    path = user_data_root() / "settings" / "global_settings.db"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    """Return the shared configuration database used by all workstations.
+
+    The repository is resolved lazily to avoid importing the site repository
+    during module initialization (the site repository itself imports the
+    project database layer).  The first workstation that sees a shared
+    repository safely copies the legacy local database into ``_shared``; later
+    workstations use that shared database directly.
+    """
+    local_path = user_data_root() / "settings" / "global_settings.db"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Test suites deliberately point MIGRATION_REPORT_TOOL_USER_DATA_ROOT at a
+    # temporary directory.  Keep those runs isolated from the live shared
+    # repository; production workstations that do not set this variable still
+    # use the shared _shared/global_settings.db as intended.
+    if os.environ.get("MIGRATION_REPORT_TOOL_USER_DATA_ROOT", "").strip():
+        return local_path
+
+    shared_path: Path | None = None
+    try:
+        from ..filesystem.site_repository import load_repository_root
+
+        repository = load_repository_root()
+        if repository and Path(repository).is_dir():
+            shared_path = Path(repository) / "_shared" / "global_settings.db"
+            shared_path.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, ImportError, RuntimeError):
+        shared_path = None
+
+    if shared_path is None:
+        return local_path
+    if shared_path.resolve() == local_path.resolve():
+        return shared_path
+
+    # Preserve existing per-workstation settings on the first migration.  A
+    # SQLite backup is used instead of copying a possibly inconsistent file.
+    if not shared_path.exists() and local_path.is_file():
+        try:
+            source = sqlite3.connect(str(local_path), timeout=15)
+            target = sqlite3.connect(str(shared_path), timeout=15)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        except (OSError, sqlite3.Error):
+            # The shared repository remains usable even if a legacy local DB
+            # is locked or damaged; schema creation below will initialize it.
+            pass
+    return shared_path
 
 
 def _connect() -> sqlite3.Connection:
-    db = sqlite3.connect(global_settings_db_path())
+    db = sqlite3.connect(global_settings_db_path(), timeout=15)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=15000")
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS source_display_names (
@@ -142,9 +192,263 @@ def _connect() -> sqlite3.Connection:
             modified_by TEXT NOT NULL DEFAULT '',
             modified_at TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS global_configuration_admin (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            user_name TEXT NOT NULL DEFAULT '',
+            machine_name TEXT NOT NULL DEFAULT '',
+            ip_address TEXT NOT NULL DEFAULT '',
+            client_id TEXT NOT NULL DEFAULT '',
+            claimed_at TEXT NOT NULL DEFAULT '',
+            modified_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS workstation_presence (
+            client_id TEXT PRIMARY KEY,
+            user_name TEXT NOT NULL DEFAULT '',
+            machine_name TEXT NOT NULL DEFAULT '',
+            ip_address TEXT NOT NULL DEFAULT '',
+            app_version TEXT NOT NULL DEFAULT '',
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            last_seen_at TEXT NOT NULL DEFAULT ''
+        );
         """
     )
+    # Existing shared databases were created before the workstation IP was
+    # recorded.  Upgrade that one table in place without touching templates or
+    # any site's project.db.
+    admin_columns = {
+        str(row[1]) for row in db.execute("PRAGMA table_info(global_configuration_admin)").fetchall()
+    }
+    if "ip_address" not in admin_columns:
+        db.execute("ALTER TABLE global_configuration_admin ADD COLUMN ip_address TEXT NOT NULL DEFAULT ''")
+        db.commit()
     return db
+
+
+def global_configuration_admin() -> dict | None:
+    """Return the single shared configuration administrator, if claimed.
+
+    This state deliberately lives beside the global templates and mappings.  A
+    workstation can therefore be copied or replaced without changing who owns
+    the shared configuration.  Review records remain in each site's project.db.
+    """
+    with closing(_connect()) as db:
+        row = db.execute(
+            "SELECT user_name,machine_name,ip_address,client_id,claimed_at,modified_at "
+            "FROM global_configuration_admin WHERE singleton=1"
+        ).fetchone()
+    if row is None:
+        return None
+    return {key: str(row[key] or "").strip() for key in row.keys()}
+
+
+def claim_global_configuration_admin(
+    user_name: str, machine_name: str = "", client_id: str = "", ip_address: str = ""
+) -> dict | None:
+    """Claim the shared configuration role using first-claim-wins semantics.
+
+    Repeated claims from the same client are harmless.  A different client is
+    rejected until the current administrator explicitly releases the role.
+    SQLite's immediate transaction prevents two workstations claiming it at
+    the same time over the Windows share.
+    """
+    user = str(user_name or "").strip() or "User"
+    machine = str(machine_name or "").strip()
+    client = str(client_id or "").strip()
+    ip = str(ip_address or "").strip()
+    if not client:
+        return None
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT user_name,machine_name,ip_address,client_id,claimed_at,modified_at "
+                "FROM global_configuration_admin WHERE singleton=1"
+            ).fetchone()
+            if row is not None and str(row["client_id"] or "").strip() != client:
+                db.rollback()
+                return None
+            if row is None:
+                db.execute(
+                    "INSERT INTO global_configuration_admin(singleton,user_name,machine_name,ip_address,client_id,claimed_at,modified_at) "
+                    "VALUES(1,?,?,?,?,?,?)",
+                    (user, machine, ip, client, now, now),
+                )
+                claimed_at = now
+            else:
+                claimed_at = str(row["claimed_at"] or now)
+                db.execute(
+                    "UPDATE global_configuration_admin SET user_name=?,machine_name=?,ip_address=?,modified_at=? WHERE singleton=1",
+                    (user, machine, ip, now),
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    return {
+        "user_name": user,
+        "machine_name": machine,
+        "ip_address": ip,
+        "client_id": client,
+        "claimed_at": claimed_at,
+        "modified_at": now,
+    }
+
+
+def force_claim_global_configuration_admin(
+    user_name: str, machine_name: str = "", client_id: str = "", ip_address: str = ""
+) -> dict | None:
+    """Explicitly replace the current shared Admin after user confirmation.
+
+    Normal claims remain first-claim-wins.  This separate operation is used only
+    by the visible Force Takeover action for the recovery case where the old
+    workstation is unavailable and cannot release the persistent lock.
+    """
+    user = str(user_name or "").strip() or "User"
+    machine = str(machine_name or "").strip()
+    client = str(client_id or "").strip()
+    ip = str(ip_address or "").strip()
+    if not client:
+        return None
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT claimed_at FROM global_configuration_admin WHERE singleton=1"
+            ).fetchone()
+            claimed_at = str(row["claimed_at"] or now) if row is not None else now
+            db.execute(
+                "INSERT INTO global_configuration_admin(singleton,user_name,machine_name,ip_address,client_id,claimed_at,modified_at) "
+                "VALUES(1,?,?,?,?,?,?) "
+                "ON CONFLICT(singleton) DO UPDATE SET user_name=excluded.user_name, "
+                "machine_name=excluded.machine_name, ip_address=excluded.ip_address, "
+                "client_id=excluded.client_id, modified_at=excluded.modified_at",
+                (user, machine, ip, client, claimed_at, now),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    return {
+        "user_name": user,
+        "machine_name": machine,
+        "ip_address": ip,
+        "client_id": client,
+        "claimed_at": claimed_at,
+        "modified_at": now,
+    }
+
+
+def release_global_configuration_admin(user_name: str, client_id: str) -> bool:
+    """Release the shared role only when called by its current workstation."""
+    client = str(client_id or "").strip()
+    if not client:
+        return False
+    with closing(_connect()) as db:
+        with db:
+            result = db.execute(
+                "DELETE FROM global_configuration_admin WHERE singleton=1 AND client_id=?",
+                (client,),
+            )
+    return result.rowcount > 0
+
+
+def is_global_configuration_admin(user_name: str, client_id: str) -> bool:
+    """Return whether this stable workstation identity owns the Admin role.
+
+    Usernames are deliberately ignored here.  They are display/audit labels;
+    the persistent client ID is the identity boundary that separates two
+    workstations using the same Windows account.
+    """
+    state = global_configuration_admin()
+    return bool(
+        state
+        and str(state.get("client_id") or "").strip() == str(client_id or "").strip()
+    )
+
+
+def touch_workstation_presence(
+    user_name: str,
+    machine_name: str,
+    ip_address: str,
+    client_id: str,
+    app_version: str = "",
+    is_admin: bool = False,
+) -> bool:
+    """Publish one workstation's lightweight shared-folder heartbeat.
+
+    This is intentionally based on the shared SQLite file rather than LAN
+    broadcast or IP scanning.  SMB access to the repository is already the
+    application's common dependency, so this works across subnets/firewalls
+    as long as the shared folder is available.  ``client_id`` is the stable
+    per-workstation identity and prevents identical Windows usernames from
+    overwriting one another.
+    """
+    client = str(client_id or "").strip()
+    if not client:
+        return False
+    now = datetime.now().isoformat(timespec="seconds")
+    values = (
+        client,
+        str(user_name or "").strip() or "User",
+        str(machine_name or "").strip(),
+        str(ip_address or "").strip(),
+        str(app_version or "").strip(),
+        1 if is_admin else 0,
+        now,
+    )
+    with closing(_connect()) as db:
+        with db:
+            db.execute(
+                """
+                INSERT INTO workstation_presence(
+                    client_id,user_name,machine_name,ip_address,app_version,is_admin,last_seen_at
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    user_name=excluded.user_name,
+                    machine_name=excluded.machine_name,
+                    ip_address=excluded.ip_address,
+                    app_version=excluded.app_version,
+                    is_admin=excluded.is_admin,
+                    last_seen_at=excluded.last_seen_at
+                """,
+                values,
+            )
+    return True
+
+
+def list_workstation_presence(max_age_seconds: int = 90) -> list[dict]:
+    """Return known workstations, newest first, with an online flag.
+
+    A stale row is retained as history and marked offline instead of being
+    deleted, so an administrator can still identify a workstation that used
+    to own the shared configuration.
+    """
+    now = datetime.now()
+    try:
+        age_limit = max(1, int(max_age_seconds))
+    except (TypeError, ValueError):
+        age_limit = 90
+    with closing(_connect()) as db:
+        rows = db.execute(
+            """
+            SELECT client_id,user_name,machine_name,ip_address,app_version,is_admin,last_seen_at
+            FROM workstation_presence
+            ORDER BY last_seen_at DESC, machine_name COLLATE NOCASE, client_id
+            """
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        payload = {key: str(row[key] or "").strip() for key in row.keys() if key != "is_admin"}
+        payload["is_admin"] = bool(row["is_admin"])
+        try:
+            seen = datetime.fromisoformat(payload["last_seen_at"])
+            payload["online"] = (now - seen).total_seconds() <= age_limit
+        except (TypeError, ValueError):
+            payload["online"] = False
+        result.append(payload)
+    return result
 
 
 def source_display_names(source_type: str) -> dict[str, str]:

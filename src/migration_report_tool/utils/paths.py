@@ -51,6 +51,36 @@ def _load_project_data_config() -> dict:
         return {}
 
 
+def configured_project_data_root() -> Path | None:
+    """Return the explicitly selected Project Data path, if one exists.
+
+    This deliberately does not create or rewrite the path.  Keeping the
+    configured value separate from the safe fallback lets the application
+    recover when a network share is temporarily offline without losing the
+    original location.
+    """
+    explicit = os.environ.get("MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT")
+    if explicit:
+        return Path(explicit).expanduser()
+    configured = str(_load_project_data_config().get("root", "") or "").strip()
+    return Path(configured).expanduser() if configured else None
+
+
+def _directory_is_available(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir()
+    except OSError:
+        return False
+
+
+def project_data_root_is_available() -> bool:
+    """Whether the explicitly configured Project Data path can be opened."""
+    configured = configured_project_data_root()
+    if configured is None:
+        return True
+    return _directory_is_available(configured)
+
+
 def project_data_root() -> Path:
     """Persistent root for all per-site project records.
 
@@ -58,32 +88,45 @@ def project_data_root() -> Path:
     replacing or upgrading the application cannot remove Review, Closed,
     Needs Action, Comments, Resolution, Audit, source mappings or snapshots.
     """
-    explicit = os.environ.get("MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT")
-    if explicit:
-        root = Path(explicit).expanduser()
-    else:
-        configured = str(_load_project_data_config().get("root", "") or "").strip()
-        root = Path(configured).expanduser() if configured else user_data_root() / "project_data"
-    root = root.resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    root = configured_project_data_root() or (user_data_root() / "project_data")
+    # Never create a remembered UNC folder while the Qt window is being built.
+    # A disconnected Windows share can make mkdir block for a long time.  The
+    # path is kept unchanged and checked from a background startup task.
+    if os.name == "nt" and str(root).startswith("\\\\"):
+        return root
+    try:
+        root = root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        # A remembered UNC path can disappear when the server is stopped, the
+        # network is disconnected, or credentials have expired.  Never let a
+        # missing share prevent the UI from opening, and never replace the
+        # remembered path.  The setup dialog will ask the user for a usable
+        # location and the fallback is only a temporary local safety net.
+        fallback = (user_data_root() / "project_data_offline").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 
 
 def project_data_root_is_configured() -> bool:
-    """Return True when Project Data has been explicitly chosen or already contains site history.
+    """Return True when Project Data is explicitly chosen and currently usable.
 
     New installs create the default folder lazily, so folder existence alone is
     not enough to consider setup complete. Existing upgrades that already have
     per-site project.db files are treated as established to avoid interrupting
-    reviewers with a one-time migration prompt.
+    reviewers with a one-time migration prompt. A disconnected network path is
+    intentionally reported as unconfigured so the UI can request a replacement.
     """
-    if os.environ.get("MIGRATION_REPORT_TOOL_PROJECT_DATA_ROOT"):
-        return True
-    configured = str(_load_project_data_config().get("root", "") or "").strip()
-    if configured:
-        return True
+    configured = configured_project_data_root()
+    if configured is not None:
+        # UNC reachability is checked by the post-show startup worker. Do not
+        # turn the first GUI event-loop turn into a network timeout.
+        if os.name == "nt" and str(configured).startswith("\\\\"):
+            return True
+        return project_data_root_is_available()
     default_root = user_data_root() / "project_data"
     workspace = default_root / "workspace"
     if not workspace.exists():

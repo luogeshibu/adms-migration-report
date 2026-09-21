@@ -1,6 +1,114 @@
-# NARI Saudi ADMS Migration Report v0.8.196
+# NARI Saudi ADMS Migration Report v0.8.215
 
-## v0.8.196 设备数据审核交互性能重构
+## v0.8.215 修复 Admin 操作误报共享目录不可用
+
+- Admin 状态读取、普通设置、强制接管和释放改用 Qt 后台线程执行，不再启动 Windows 多进程。
+- 避免轻量共享 SQLite 操作因子进程启动/返回失败而显示“共享目录不可用”。
+- 共享目录仍然保持非阻塞访问，按钮结果会直接刷新到当前页面。
+
+## v0.8.214 增加 Admin 强制接管
+
+- 新增 `Force Takeover Admin`，用于原 Admin 机器不可用、无法点击 Release Admin 的恢复场景。
+- 强制接管前必须确认；普通 `Set as Admin` 仍然遵守持久锁定规则，不会自动抢占。
+- 接管结果仍写入共享 Admin 记录，包含用户、机器名、IP 和客户端 ID。
+
+## v0.8.213 Admin 改为持久锁定，不再依赖心跳
+
+- 移除共享 Admin 的工作站心跳和在线列表。
+- Admin 一旦写入共享库就持续有效，不会因为机器离线、关机或网络暂时中断而自动换人。
+- 只有当前 Admin 主动点击 Release Admin 后，其他工作站才能接管；Admin 记录仍保存用户名、机器名、IP 和稳定客户端 ID。
+- 保留旧心跳表结构以兼容已有共享数据库，但新版本不再读写心跳记录。
+
+## v0.8.212 修复共享 Admin 按钮状态不刷新
+
+- “设为 Admin”和“Release Admin”改为后台写入共享数据库，避免网络共享响应慢时卡住界面。
+- 点击成功后立即更新当前窗口的 Admin 状态，不再因为旧的后台读取结果把按钮恢复成“设为 Admin”。
+- 共享数据库仍以 `\\172.16.21.101\Share Folder\Downstream Report\_shared\global_settings.db` 为准。
+
+## v0.8.211 打开共享站点不再自动移动源文件
+
+- 选择站点时只读取目录，不再自动把根目录的 CSV/XLSX 移到 `source_files`。
+- 同时兼容根目录源文件和 `source_files` 布局，避免共享文件被 Excel 或其他工作站占用时触发 WinError 32。
+- 只有明确执行迁移/整理操作时才会复制或整理源文件。
+
+## v0.8.210 共享盘加载超时与启动可恢复
+
+- 共享目录索引、Admin 状态、工作站心跳和共享显示设置都有明确超时，不再因为断开的 Windows 共享盘无限 Loading。
+- 启动阶段只在后台检查共享目录；检查失败会提示重新选择目录，主界面不会一直卡在忙碌状态。
+- Admin 状态等非关键后台任务改为静默重试，不影响用户打开软件和继续查看审核记录。
+
+## v0.8.209 修复 Windows 后台进程重复启动主界面
+
+- Windows `spawn` 后台进程不再重复执行 `main.py` 和创建第二个主窗口。
+- 修复后台 worker 与主界面互相等待造成的“未响应”和无法结束问题。
+
+## v0.8.208 启动与退出稳定性
+
+- 延迟共享 Admin 数据库读取，避免共享盘不可用时卡在启动画面。
+- 共享 Admin 状态和工作站心跳改为独立后台进程读取/写入。
+- 关闭窗口时停止后台任务并增加有界退出保护，避免残留 Python 进程。
+
+## v0.8.207 设置页面自适应布局
+
+- 设置页改为自适应宽度、垂直滚动布局，长文本会正常换行，卡片不会因窗口高度或 Windows 缩放比例变小而互相重叠。
+- 保留大屏横向布局，同时兼容较小窗口、笔记本分辨率和 125%/150% 系统缩放。
+
+## v0.8.206 同名用户识别与内网工作站在线发现
+
+- Admin 身份以每台工作站的稳定 `client_id` 为准，同时显示用户名、机器名和内网 IP；两个工作站使用同一个 Windows 用户名也不会互相覆盖 Admin 权限。
+- 每个运行中的 App 每 30 秒向共享目录 `_shared/global_settings.db` 写入一次轻量在线心跳，设置页显示最近 90 秒在线的工作站、用户、机器名、IP、版本和 Admin 标记。
+- 工作站发现依赖已经存在的 Windows 共享目录，不做全网 IP 扫描、不需要 UDP 广播，也不需要额外开放防火墙端口；共享目录不可用时，心跳失败不会影响本地审核。
+- 旧版共享数据库会自动创建心跳表，不删除既有模板、配置、Comments、Checked 或审核记录。
+
+## v0.8.205 共享 Admin 身份与审核员权限收紧
+
+- Admin 身份显示用户名、机器名和工作站 IP，解决多个工作站使用同名账号的问题。
+- 非 Admin 只能选择站点/查看数据源并填写 Comments、Checked、Review、Resolution；不能选择或替换源文件、修改字段显示、映射、模板、STANDARD 或审核列配置。
+- 旧版 `_shared/global_settings.db` 会自动增加 IP 字段，不删除既有模板和审核数据。
+
+## v0.8.204 共享配置 Admin 模式
+
+- 共享目录中的第一台工作站可以认领全局配置 Admin；同一共享目录下只有一个 Admin。
+- Admin 维护设备审核配置、字段显示/隐藏、比较规则和全局模板；其他工作站自动同步并只读使用。
+- Comments、Checked、Review、Resolution 和 Audit 记录继续允许所有用户写入，且仍保存在各站点自己的 `project.db` 中。
+- Admin 可以主动释放权限，下一台工作站再认领；原有站点目录和历史数据不删除。
+
+## Unified site migration
+
+Settings includes a one-time **Prepare Transfer Package** action that can be used
+at any review status. It combines a site's live CSV/Excel inputs with its existing `project.db` and `project.json`,
+then stores source links as site-relative paths. Copy the resulting site folder
+to another machine to retain Comments, Checked, Review, Resolution and Audit
+history. New sites use the same in-place layout automatically; legacy split
+Project Data sites remain compatible until migrated.
+
+The organized site layout keeps source CSV/XLSX/XLSM files under
+`source_files/`, generated deliverables under `reports/`, and
+`project.db` / `project.json` at the site root. The whole site folder remains
+the portable unit.
+
+## v0.8.203 测试数据隔离与模板字段映射修复
+
+- 测试运行时使用临时全局设置数据库，不再读取或修改共享盘中的真实模板、字段映射和显示隐藏配置。
+- 正式工作站仍然使用共享仓库下的 `_shared/global_settings.db`，全局模板功能不变。
+- 模板比较字段现在会随表头名称一起保存并在目标站点重新匹配。
+
+## v0.8.202 全局模板字段映射与显示状态同步
+
+- 模板同时保存物理字段的显示/隐藏状态和比较规则实际使用的表头名称。
+- 应用模板到其他站点时，比较字段按字段 ID、表头和字段标签重新匹配，避免规则变成“—不参与比较—”。
+- 目标站点确实没有字段时继续保留告警，不阻止其他配置保存。
+
+- 全局比较模板现在同时保存隐藏字段的物理表头名称，不再只依赖某个站点生成的内部字段 ID。
+- 将模板应用到其他站点时，会按字段 ID、表头和字段标签自动重新匹配，因此不同站点的 Excel 字段顺序或内部 ID 不同，也能同步显示/隐藏设置。
+- 保存或更新模板时使用共享仓库下的 `_shared/global_settings.db`，所有连接到同一个共享仓库的应用都能选择同一套全局模板。
+- 如果目标站点完全没有模板配置的字段，只显示告警，不阻止继续保存；模板不会保存其他站点的物理文件路径。
+
+## v0.8.199 共享配置复用、字段告警与英文审核状态
+
+全局比较配置现在会完整复用比较字段、归一化方式、启用状态和字段显示配置。目标站点缺少模板中的物理字段时保留配置并显示非阻塞告警，不会静默丢失规则。英文界面中的 Review 状态统一显示为 Unreviewed / Closed / Needs Action；中文界面继续显示为未审核 / 已关闭 / 需处理。
+
+## v0.8.198 共享站点目录与站点内项目数据库
 
 设备数据审核现在把“数据重算”和“用户操作”彻底分开。站点/数据源真正变化时才重新构建设备审核数据集；搜索、审核状态筛选、Analysis 筛选以及“显示全部”只对已加载行做本地显示/隐藏，不再启动后台进程、不再重新读取 Excel/CSV、不再重建整张表。
 

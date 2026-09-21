@@ -37,7 +37,7 @@ class GlobalMapVisibilitySyncV08175Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_adms_sld_map_display_visibility_and_order_are_global(self):
         set_source_overrides(self.a, "adms_sld", {"rmu": "DeviceName", "rmu_type": "RMUType"}, "alice")

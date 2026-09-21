@@ -12,7 +12,7 @@ from migration_report_tool.version import __version__
 
 class V08173SourceChangeLifecycleTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_semantic_version_beats_newer_unversioned_mtime(self):
         with tempfile.TemporaryDirectory() as td:

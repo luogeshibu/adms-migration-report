@@ -6,8 +6,12 @@ import multiprocessing as mp
 import os
 import queue
 import re
+import socket
 import subprocess
+import threading
+import time
 import traceback
+import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +59,10 @@ from PySide6.QtWidgets import (
     QInputDialog as _QtInputDialog,
 )
 
-from ..utils.paths import standard_reference_path, standard_reference_origin, bundled_standard_reference_path
+from ..utils.paths import (
+    standard_reference_path, standard_reference_origin, bundled_standard_reference_path,
+    configured_project_data_root,
+)
 from ..core import (
     APP_NAME,
     APP_VERSION,
@@ -99,6 +106,11 @@ from ..domain.analysis.signal_action_comment import (
 from ..infrastructure.database.global_settings_store import (
     review_hidden_columns as load_review_hidden_columns,
     replace_review_hidden_columns as save_review_hidden_columns,
+    global_configuration_admin,
+    claim_global_configuration_admin,
+    force_claim_global_configuration_admin,
+    release_global_configuration_admin,
+    is_global_configuration_admin,
 )
 
 from ..config.sources import schema_for
@@ -134,14 +146,17 @@ from ..services.configurable_comparison_service import (
     get_signal_source_assignments as get_configurable_signal_assignments,
     configured_live_source_changes, remember_configured_live_source_metadata,
     configured_live_source_metadata,
+    comparison_field_warnings,
     list_comparison_profiles as list_equipment_comparison_profiles,
     get_comparison_profile as get_equipment_comparison_profile,
     save_comparison_profile as save_equipment_comparison_profile,
     delete_comparison_profile as delete_equipment_comparison_profile,
     apply_comparison_profile as apply_equipment_comparison_profile,
+    ADMIN_ACTIVE_PROFILE_NAME,
     get_profile_link as get_equipment_comparison_profile_link,
     save_profile_link as save_equipment_comparison_profile_link,
     COMPARISON_MODE_DEFAULT, COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK,
+    NORMALIZATION_AUTO, NORMALIZATION_TEXT, NORMALIZATION_FEEDER, NORMALIZATION_SMART, NORMALIZATION_NOP,
 )
 from ..services.audit_presentation import present_audit_item
 from ..services.derived_table_service import (
@@ -256,7 +271,6 @@ from ..repository import (
     save_repository_root,
     save_last_site,
     scan_repository,
-    site_has_tabular_files,
     source_status,
     sync_site_to_project,
     load_source_detection_keywords,
@@ -274,6 +288,11 @@ from ..repository import (
     source_user_visible_path,
     fingerprint,
     discover_site_sources,
+    is_unified_site_folder,
+)
+from ..services.portable_site_service import (
+    migrate_legacy_project_data,
+    prepare_portable_site as prepare_site_transfer_package,
 )
 
 
@@ -287,10 +306,22 @@ REVIEW_VISUALS = {
     "NEEDS ACTION": ("Needs Action", "#D92D20", "#FFFFFF"),
 }
 
-def _review_visual(status: str) -> tuple[str, QColor, QColor]:
-    key = clean(status).upper() or "UNREVIEWED"
+_REVIEW_STATUS_KEYS = {
+    "UNREVIEWED": "UNREVIEWED",
+    "未审核": "UNREVIEWED",
+    "CLOSED": "CLOSED",
+    "已关闭": "CLOSED",
+    "REVIEWED": "CLOSED",
+    "NEEDS ACTION": "NEEDS ACTION",
+    "需处理": "NEEDS ACTION",
+}
+
+
+def _review_visual(status: str, language: str | None = None) -> tuple[str, QColor, QColor]:
+    raw = clean(status)
+    key = _REVIEW_STATUS_KEYS.get(raw.upper(), raw.upper()) or "UNREVIEWED"
     label, fill, text = REVIEW_VISUALS.get(key, (key.title(), "#F3F4F6", "#475467"))
-    return ui_tr(label, current_language()), QColor(fill), QColor(text)
+    return ui_tr(label, language or current_language()), QColor(fill), QColor(text)
 
 COLORS = {
     "nav": "#0F2742",
@@ -454,6 +485,81 @@ class BackgroundTask(QRunnable):
             self.signals.failed.emit(traceback.format_exc())
 
 
+def _startup_directory_available(path: Path | None) -> bool:
+    """Check a startup path without letting a UNC probe run on the GUI thread."""
+    if path is None:
+        return False
+    try:
+        return path.exists() and path.is_dir()
+    except OSError:
+        return False
+
+
+def _startup_workspace_job(repository_root: Path | None, project_root: Path | None, *, progress=None) -> dict:
+    """Probe startup locations and build the cheap site index in a worker."""
+    source_ok = _startup_directory_available(repository_root)
+    project_ok = _startup_directory_available(project_root) if project_root else True
+    sites = scan_repository(repository_root, deep=False) if source_ok and repository_root else []
+    return {
+        "source_ok": source_ok,
+        "project_ok": project_ok,
+        "sites": sites,
+    }
+
+
+def _shared_review_preferences_job(
+    saved_columns: list,
+    known_dynamic: list,
+    saved_column_schema,
+    *,
+    progress=None,
+) -> set[str]:
+    """Read/migrate shared review visibility outside the GUI process thread."""
+    stored_hidden = load_review_hidden_columns("rmu_data_review")
+    if stored_hidden is None:
+        migrated_visible = migrate_comparison_visible_columns(saved_columns or [], saved_column_schema)
+        legacy_known = {key for _group, _color, cols in COMPARISON_GROUPS for key, _label, _width in cols}
+        legacy_known |= set(known_dynamic or [])
+        stored_hidden = (legacy_known - set(migrated_visible)) - {"no", "rmu"}
+        save_review_hidden_columns(stored_hidden, "rmu_data_review")
+    return set(stored_hidden or set()) - {"no", "rmu"}
+
+
+def _shared_admin_status_job(_unused_max_age_seconds: int = 0) -> dict:
+    """Read the persistent shared Admin lock outside the GUI process.
+
+    ``global_settings.db`` may be on an unavailable SMB/UNC path.  Keeping
+    this read in a short-lived worker process means a dead share can never
+    freeze the splash screen or the settings page.
+    """
+    return {"state": global_configuration_admin()}
+
+
+def _shared_claim_admin_job(
+    user_name: str,
+    machine_name: str,
+    client_id: str,
+    ip_address: str,
+) -> dict | None:
+    """Claim the shared Admin role without touching SMB from the GUI thread."""
+    return claim_global_configuration_admin(user_name, machine_name, client_id, ip_address)
+
+
+def _shared_force_claim_admin_job(
+    user_name: str,
+    machine_name: str,
+    client_id: str,
+    ip_address: str,
+) -> dict | None:
+    """Force-replace the shared Admin after an explicit UI confirmation."""
+    return force_claim_global_configuration_admin(user_name, machine_name, client_id, ip_address)
+
+
+def _shared_release_admin_job(user_name: str, client_id: str) -> bool:
+    """Release the shared Admin role without blocking the GUI thread."""
+    return bool(release_global_configuration_admin(user_name, client_id))
+
+
 class BusyMarqueeProgressBar(QProgressBar):
     """Fixed-width marquee segment that visibly travels left/right while busy.
 
@@ -591,7 +697,8 @@ def signal_review_row_hash(row, analysis_column: int | None = None) -> str:
 
 def _load_repository_site(repository_root: Path, site_name: str, *, deep: bool) -> SiteInfo:
     """Discover one active site without parsing every other site in the Workspace."""
-    site_dir = Path(repository_root) / site_name
+    root = Path(repository_root)
+    site_dir = root if is_unified_site_folder(root) and root.name.casefold() == str(site_name).casefold() else root / site_name
     if not site_dir.exists() or not site_dir.is_dir():
         raise RuntimeError(f"Site {site_name} was not found under {repository_root}")
     sources, detections, unmapped = discover_site_sources(site_dir, deep=deep)
@@ -1704,6 +1811,12 @@ def _background_process_job_entry(job_name: str, args: tuple, message_queue) -> 
         "module-signal-load": _background_signal_mapping_module_job,
         "mapping-refresh": _background_mapping_refresh_job,
         "rmu-render-prepare": _background_rmu_render_prepare_job,
+        "startup-workspace": _startup_workspace_job,
+        "shared-review-preferences": _shared_review_preferences_job,
+        "shared-admin-status": _shared_admin_status_job,
+        "shared-claim-admin": _shared_claim_admin_job,
+        "shared-force-claim-admin": _shared_force_claim_admin_job,
+        "shared-release-admin": _shared_release_admin_job,
     }
     try:
         fn = jobs[job_name]
@@ -4161,10 +4274,11 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
     logical review fields to any physical column from any configured source.
     """
 
-    def __init__(self, store, user_name: str, parent=None):
+    def __init__(self, store, user_name: str, parent=None, *, can_edit_global_config: bool = True):
         super().__init__(parent)
         self.store = store
         self.user_name = clean(user_name) or "system"
+        self.can_edit_global_config = bool(can_edit_global_config)
         self.ui_language = normalize_language(getattr(parent, "ui_language", current_language()))
         self.config = json.loads(json.dumps(get_equipment_comparison_config(store, bootstrap=True), ensure_ascii=False))
         self.profile_link = dict(get_equipment_comparison_profile_link(store) or {})
@@ -4189,7 +4303,8 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         root.addWidget(title)
         desc = QLabel(
             "Add any number of CSV/XLSX/XLSM tables. For every table choose the key/index field used to join rows. "
-            "Then define exactly which fields should be compared. All physical columns are shown by default; uncheck Show to hide a field for this site only. "
+            "Then define exactly which fields should be compared. All physical columns are shown by default; uncheck Show to hide a field. "
+            "When this workstation is the shared Admin, the complete configuration is reused by every workstation. Non-admin workstations open it read-only. "
             "Source titles default to filenames and can be renamed. Filenames, worksheets and physical field names are never fixed by the App."
         )
         desc.setObjectName("Muted")
@@ -4228,7 +4343,7 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         self.profile_status_label = QLabel("")
         self.profile_status_label.setObjectName("Muted"); self.profile_status_label.setWordWrap(True)
         profile_layout.addWidget(self.profile_status_label, 3, 0, 1, 6)
-        profile_note = QLabel("A profile reuses source roles/order/titles, Key/Index defaults, Show/Hide defaults, default/per-field comparison modes and comparison field mappings. Physical file paths are never inherited; the target site keeps its own live files. Global profile changes never silently rewrite a site: press Apply / Sync, review the result, then Save & Rebuild Review.")
+        profile_note = QLabel("A profile reuses source roles/order/titles, Key/Index defaults, Show/Hide defaults, default/per-field comparison modes and comparison field mappings. Physical file paths are never inherited; each site keeps its own live files. The shared Admin configuration is synchronized automatically; ordinary reusable templates still require Apply / Sync.")
         profile_note.setObjectName("Muted"); profile_note.setWordWrap(True)
         profile_layout.addWidget(profile_note, 4, 0, 1, 6)
         root.addWidget(profile_card)
@@ -4265,9 +4380,18 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         left_box.addWidget(source_separator)
         left_title = QLabel("Equipment Sources"); left_title.setObjectName("SectionTitle")
         left_box.addWidget(left_title)
+        source_order_note = QLabel("Drag equipment sources to change their order. The order is saved with this site and used in comparison results.")
+        source_order_note.setObjectName("Muted"); source_order_note.setWordWrap(True)
+        left_box.addWidget(source_order_note)
         self.source_list = QListWidget()
         self.source_list.setMinimumWidth(300)
+        self.source_list.setDragEnabled(True)
+        self.source_list.setAcceptDrops(True)
+        self.source_list.setDropIndicatorShown(True)
+        self.source_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.source_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.source_list.currentItemChanged.connect(self._source_selection_changed)
+        self.source_list.model().rowsMoved.connect(self._source_rows_moved)
         left_box.addWidget(self.source_list, 1)
         left_buttons = QHBoxLayout()
         add_btn = QPushButton("Add File(s)"); add_btn.clicked.connect(self._add_sources)
@@ -4275,6 +4399,11 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         remove_btn = QPushButton("Remove"); remove_btn.clicked.connect(self._remove_source)
         left_buttons.addWidget(add_btn); left_buttons.addWidget(toggle_btn); left_buttons.addWidget(remove_btn)
         left_box.addLayout(left_buttons)
+        order_buttons = QHBoxLayout()
+        move_up_btn = QPushButton("Move Up"); move_up_btn.clicked.connect(lambda: self._move_source(-1))
+        move_down_btn = QPushButton("Move Down"); move_down_btn.clicked.connect(lambda: self._move_source(1))
+        order_buttons.addWidget(move_up_btn); order_buttons.addWidget(move_down_btn); order_buttons.addStretch()
+        left_box.addLayout(order_buttons)
         split.addWidget(left)
 
         # Selected source editor ------------------------------------------
@@ -4318,7 +4447,7 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         fields_label = QLabel("Physical Fields · Show / Hide")
         fields_label.setStyleSheet("font-weight:700;")
         middle_box.addWidget(fields_label)
-        fields_note = QLabel("Every detected source field is visible by default. Hiding a field changes only this site's Equipment Data Review presentation; it does not remove the field from comparison rules.")
+        fields_note = QLabel("Every detected source field is visible by default. Hiding a field changes the shared Admin configuration; it does not remove the field from comparison rules.")
         fields_note.setObjectName("Muted"); fields_note.setWordWrap(True)
         middle_box.addWidget(fields_note)
         self.fields_table = QTableWidget(0, 2)
@@ -4353,7 +4482,8 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         right_box.addLayout(default_mode_row)
         compare_note = QLabel(
             "Each row is one Analysis field. Choose which physical field from each source participates and choose its comparison mode. "
-            "Strict mode treats blank as a real value; Ignore Blank keeps the legacy behavior and excludes blank values from the comparison."
+            "Strict mode treats blank as a real value; Ignore Blank keeps the legacy behavior and excludes blank values from the comparison. "
+            "For FEEDER, Smart normalization converts values such as JED-CTL-AJWD-AH331 and AJWD-31 to the same logical feeder."
         )
         compare_note.setObjectName("Muted"); compare_note.setWordWrap(True)
         right_box.addWidget(compare_note)
@@ -4365,7 +4495,10 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         rule_buttons = QHBoxLayout()
         add_rule = QPushButton("Add Comparison Field"); add_rule.setObjectName("Primary"); add_rule.clicked.connect(self._add_rule)
         remove_rule = QPushButton("Remove Rule"); remove_rule.clicked.connect(self._remove_rule)
-        rule_buttons.addWidget(add_rule); rule_buttons.addWidget(remove_rule); rule_buttons.addStretch()
+        smart_fields_btn = QPushButton("Apply Smart FEEDER / SMART / NOP")
+        smart_fields_btn.setToolTip("Apply site-local smart normalization to FEEDER/FDR, SMART and NOP rules.")
+        smart_fields_btn.clicked.connect(self._enable_smart_field_rules)
+        rule_buttons.addWidget(add_rule); rule_buttons.addWidget(remove_rule); rule_buttons.addWidget(smart_fields_btn); rule_buttons.addStretch()
         right_box.addLayout(rule_buttons)
         split.addWidget(right)
 
@@ -4393,7 +4526,38 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         else:
             self._load_source_editor(None)
         self._update_validation_text()
+        self._apply_global_config_access_mode()
         translate_widget_tree(self, self.ui_language)
+
+    def _apply_global_config_access_mode(self):
+        """Lock the configuration editor for non-admin workstations.
+
+        The review window itself is not affected: reviewers still edit
+        Comments, Checked, Review status and Resolution.  Only this source /
+        comparison definition dialog is read-only outside the shared Admin.
+        """
+        if self.can_edit_global_config:
+            return
+        if hasattr(self, "profile_status_label"):
+            current = self.profile_status_label.text().strip()
+            self.profile_status_label.setText(
+                "只读：当前配置由共享 Admin 统一管理。其他用户仍可在审核页面填写 Comments、Checked、Review 和 Resolution。\n" + current
+                if self.ui_language == LANG_ZH_CN else
+                "Read-only: the shared Admin manages this configuration. Other users can still edit Comments, Checked, Review and Resolution in the review pages.\n" + current
+            )
+        cancel_button = None
+        button_box = self.findChild(QDialogButtonBox)
+        if button_box is not None:
+            cancel_button = button_box.button(QDialogButtonBox.Cancel)
+            save_button = button_box.button(QDialogButtonBox.Save)
+            if save_button is not None:
+                save_button.setEnabled(False)
+                save_button.setToolTip("Only the shared configuration Admin can save this configuration.")
+        editable_types = (QComboBox, QCheckBox, QLineEdit, QTableWidget, QListWidget, QPushButton)
+        for widget in self.findChildren(editable_types):
+            if widget is cancel_button:
+                continue
+            widget.setEnabled(False)
 
     def _selected_profile_name(self) -> str:
         if not hasattr(self, "profile_combo"):
@@ -4411,6 +4575,16 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             self.profile_combo.clear()
             self.profile_combo.addItem(ui_tr("— Select reusable profile —", self.ui_language), "")
             profiles = list_equipment_comparison_profiles()
+            # Non-admin workstations show the reserved active Admin profile as
+            # a status item, but it remains non-editable and is not offered as
+            # a normal user-created template.
+            if not self.can_edit_global_config:
+                active = get_equipment_comparison_profile(ADMIN_ACTIVE_PROFILE_NAME)
+                if active:
+                    self.profile_combo.addItem(
+                        ui_tr("Shared Admin configuration", self.ui_language),
+                        ADMIN_ACTIVE_PROFILE_NAME,
+                    )
             for item in profiles:
                 name = clean(item.get("name"))
                 if name:
@@ -4526,7 +4700,7 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         ) != QMessageBox.Yes:
             return
         try:
-            saved = save_equipment_comparison_profile(name, self.config, self.user_name)
+            saved = save_equipment_comparison_profile(name, self.config, self.user_name, store=self.store)
         except Exception as exc:
             QMessageBox.critical(self, ui_tr("Reusable Comparison Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
             return
@@ -4565,7 +4739,7 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         ) != QMessageBox.Yes:
             return
         try:
-            saved = save_equipment_comparison_profile(name, self.config, self.user_name)
+            saved = save_equipment_comparison_profile(name, self.config, self.user_name, store=self.store)
         except Exception as exc:
             QMessageBox.critical(self, ui_tr("Update Reusable Profile", self.ui_language), f"{type(exc).__name__}: {exc}")
             return
@@ -4681,6 +4855,47 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
                 self.source_list.setCurrentRow(restore)
         finally:
             self.source_list.blockSignals(False)
+
+    def _source_rows_moved(self, *_args):
+        """Persist the visual source-list order in the pending site config."""
+        if self._loading_source or not hasattr(self, "source_list"):
+            return
+        ordered_ids = [
+            clean(self.source_list.item(row).data(Qt.ItemDataRole.UserRole))
+            for row in range(self.source_list.count())
+        ]
+        ordered_ids = [source_id for source_id in ordered_ids if source_id]
+        by_id = {
+            clean(source.get("id")): source
+            for source in self.config.get("sources", [])
+            if clean(source.get("id"))
+        }
+        if set(ordered_ids) != set(by_id) or len(ordered_ids) != len(by_id):
+            return
+        self._save_source_editor(self._current_source_id, refresh_ui=False)
+        self.config["sources"] = [by_id[source_id] for source_id in ordered_ids]
+        self._refresh_source_list()
+        self._rebuild_rule_table()
+        self._update_validation_text()
+
+    def _move_source(self, offset: int):
+        """Move the selected source up/down and keep the same site-local order."""
+        current_row = self.source_list.currentRow()
+        target_row = current_row + int(offset)
+        if current_row < 0 or target_row < 0 or target_row >= len(self.config.get("sources", [])):
+            return
+        self._save_source_editor(self._current_source_id, refresh_ui=False)
+        sources = list(self.config.get("sources", []))
+        sources[current_row], sources[target_row] = sources[target_row], sources[current_row]
+        self.config["sources"] = sources
+        selected_id = clean(sources[target_row].get("id"))
+        self._refresh_source_list()
+        for row in range(self.source_list.count()):
+            if clean(self.source_list.item(row).data(Qt.ItemDataRole.UserRole)) == selected_id:
+                self.source_list.setCurrentRow(row)
+                break
+        self._rebuild_rule_table()
+        self._update_validation_text()
 
     def _source_selection_changed(self, current, previous):
         """Commit the previous editor, then load exactly the source the user clicked.
@@ -5126,20 +5341,41 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         # Save edited rule names/bindings first when the table already exists.
         self._capture_rule_table()
         sources = list(self.config.get("sources", []))
-        headers = [ui_tr("Comparison Field", self.ui_language), ui_tr("Comparison Mode", self.ui_language)] + [
+        headers = [
+            ui_tr("Comparison Field", self.ui_language),
+            ui_tr("Normalization", self.ui_language),
+            ui_tr("Comparison Mode", self.ui_language),
+        ] + [
             clean(source.get("title")) or ui_tr("Source", self.ui_language) for source in sources
         ]
         self.rule_table.blockSignals(True)
         self.rule_table.clearContents(); self.rule_table.setColumnCount(len(headers)); self.rule_table.setHorizontalHeaderLabels(headers)
         self.rule_table.setRowCount(len(self.config.get("comparisons", [])))
         self.rule_table.setColumnWidth(0, 180)
-        self.rule_table.setColumnWidth(1, 220)
-        for col in range(2, len(headers)):
+        self.rule_table.setColumnWidth(1, 235)
+        self.rule_table.setColumnWidth(2, 220)
+        for col in range(3, len(headers)):
             self.rule_table.setColumnWidth(col, 190)
         for row, rule in enumerate(self.config.get("comparisons", [])):
             name_item = QTableWidgetItem(clean(rule.get("title")) or f"Comparison {row + 1}")
             name_item.setData(Qt.ItemDataRole.UserRole, rule.get("id"))
             self.rule_table.setItem(row, 0, name_item)
+
+            normalization_combo = QComboBox()
+            normalization_combo.addItem(ui_tr("Text / exact", self.ui_language), NORMALIZATION_TEXT)
+            normalization_combo.addItem(ui_tr("FEEDER smart · station + number", self.ui_language), NORMALIZATION_FEEDER)
+            normalization_combo.addItem(ui_tr("SMART aliases · NORMAL / NONSMART", self.ui_language), NORMALIZATION_SMART)
+            normalization_combo.addItem(ui_tr("NOP contains · any NOP = NOP", self.ui_language), NORMALIZATION_NOP)
+            normalization_combo.addItem(ui_tr("Automatic by field title", self.ui_language), NORMALIZATION_AUTO)
+            normalization_value = clean(rule.get("normalization")) or NORMALIZATION_TEXT
+            normalization_index = normalization_combo.findData(normalization_value)
+            normalization_combo.setCurrentIndex(normalization_index if normalization_index >= 0 else 0)
+            normalization_combo.setToolTip(ui_tr(
+                "FEEDER smart normalization decodes station + feeder number, including ADMS AH3NN values such as JED-CTL-AJWD-AH331 → AJWD-31.",
+                self.ui_language,
+            ))
+            self.rule_table.setCellWidget(row, 1, normalization_combo)
+
             mode_combo = QComboBox()
             mode_combo.addItem(ui_tr("Use site default", self.ui_language), COMPARISON_MODE_DEFAULT)
             mode_combo.addItem(ui_tr("Strict equality · blank participates", self.ui_language), COMPARISON_MODE_STRICT)
@@ -5147,9 +5383,9 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             mode_value = clean(rule.get("comparison_mode")) or COMPARISON_MODE_DEFAULT
             mode_index = mode_combo.findData(mode_value)
             mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
-            self.rule_table.setCellWidget(row, 1, mode_combo)
+            self.rule_table.setCellWidget(row, 2, mode_combo)
             bindings = dict(rule.get("bindings") or {})
-            for col, source in enumerate(sources, start=2):
+            for col, source in enumerate(sources, start=3):
                 combo = QComboBox(); combo.addItem(ui_tr("— Not compared —", self.ui_language), "")
                 for physical in self._source_columns(source):
                     combo.addItem(physical.label, physical.id)
@@ -5172,17 +5408,60 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             if not rule:
                 continue
             rule["title"] = clean(item.text()) or "Comparison"
-            mode_combo = self.rule_table.cellWidget(row, 1)
+            normalization_combo = self.rule_table.cellWidget(row, 1)
+            normalization = clean(normalization_combo.currentData()) if isinstance(normalization_combo, QComboBox) else NORMALIZATION_TEXT
+            rule["normalization"] = normalization if normalization in {NORMALIZATION_AUTO, NORMALIZATION_TEXT, NORMALIZATION_FEEDER, NORMALIZATION_SMART, NORMALIZATION_NOP} else NORMALIZATION_TEXT
+            mode_combo = self.rule_table.cellWidget(row, 2)
             mode = clean(mode_combo.currentData()) if isinstance(mode_combo, QComboBox) else COMPARISON_MODE_DEFAULT
             rule["comparison_mode"] = mode if mode in {COMPARISON_MODE_DEFAULT, COMPARISON_MODE_STRICT, COMPARISON_MODE_IGNORE_BLANK} else COMPARISON_MODE_DEFAULT
             bindings = {}
-            for col, source in enumerate(sources, start=2):
+            for col, source in enumerate(sources, start=3):
                 combo = self.rule_table.cellWidget(row, col)
                 if isinstance(combo, QComboBox):
                     column_id = clean(combo.currentData())
                     if column_id:
                         bindings[source["id"]] = column_id
             rule["bindings"] = bindings
+
+    def _enable_smart_field_rules(self):
+        """Apply site-local semantic normalizers to the standard fields."""
+        self._capture_rule_table()
+        changed = 0
+        for rule in self.config.get("comparisons", []):
+            title = re.sub(r"[^A-Za-z0-9]+", " ", clean(rule.get("title"))).strip().upper()
+            if title in {"FEEDER", "FDR"}:
+                target = NORMALIZATION_FEEDER
+            elif title == "SMART":
+                target = NORMALIZATION_SMART
+            elif title == "NOP":
+                target = NORMALIZATION_NOP
+            else:
+                continue
+            if clean(rule.get("normalization")) != target:
+                changed += 1
+            rule["normalization"] = target
+        self._rebuild_rule_table()
+        self._update_validation_text()
+        if changed:
+            QMessageBox.information(
+                self,
+                ui_tr("Comparison Configuration", self.ui_language),
+                (
+                    f"已为 {changed} 个 FEEDER / SMART / NOP 规则启用站点专用归一化。点击“保存并重建设备审核”后生效。"
+                    if self.ui_language == LANG_ZH_CN else
+                    f"Enabled site-local smart normalization for {changed} FEEDER / SMART / NOP rule(s). Click Save & Rebuild Review to apply it."
+                ),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                ui_tr("Comparison Configuration", self.ui_language),
+                (
+                    "当前没有标题为 FEEDER、FDR、SMART 或 NOP 的比较规则。"
+                    if self.ui_language == LANG_ZH_CN else
+                    "No comparison rule titled FEEDER, FDR, SMART or NOP was found."
+                ),
+            )
 
     def _add_rule(self):
         self._capture_rule_table()
@@ -5194,7 +5473,8 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             return
         rule_id = "cmp_" + hashlib.sha1((name + datetime.now().isoformat()).encode("utf-8")).hexdigest()[:12]
         self.config.setdefault("comparisons", []).append({
-            "id": rule_id, "title": name, "comparison_mode": COMPARISON_MODE_DEFAULT, "bindings": {}
+            "id": rule_id, "title": name, "comparison_mode": COMPARISON_MODE_DEFAULT,
+            "normalization": NORMALIZATION_TEXT, "bindings": {},
         })
         self._rebuild_rule_table(); self.rule_table.setCurrentCell(self.rule_table.rowCount() - 1, 0); self._update_validation_text()
 
@@ -5205,6 +5485,31 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             return
         self.config["comparisons"].pop(row)
         self._rebuild_rule_table(); self._update_validation_text()
+
+    def _comparison_field_warnings(self) -> list[str]:
+        """Return non-blocking warnings for fields absent from this station."""
+        if not self.config.get("sources"):
+            return []
+        try:
+            records = comparison_field_warnings(self.store, self.config)
+        except Exception:
+            return []
+        zh = self.ui_language == LANG_ZH_CN
+        result = []
+        for item in records:
+            source_title = clean(item.get("source_title")) or "Source"
+            rule_title = clean(item.get("rule_title")) or "Comparison"
+            if zh:
+                result.append(
+                    f"告警：数据源“{source_title}”缺少规则“{rule_title}”所需的物理字段；"
+                    "该规则已保留，补充字段映射后即可参与比较。"
+                )
+            else:
+                result.append(
+                    f"Warning: source '{source_title}' is missing the physical field required by rule "
+                    f"'{rule_title}'; the rule is kept and will participate after the field is mapped."
+                )
+        return result
 
     def _validation_errors(self) -> list[str]:
         self._capture_rule_table()
@@ -5235,6 +5540,12 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             valid_ids = {column.id for column in columns}
             if not clean(source.get("key_column")) or source.get("key_column") not in valid_ids:
                 errors.append(f"{title}：请选择有效的主键 / 索引字段。" if zh else f"{title}: choose a valid Key / Index field.")
+        missing_profile_rules = {
+            clean(item.get("rule_title")).casefold()
+            for item in comparison_field_warnings(self.store, self.config)
+            if clean(item.get("rule_title"))
+        }
+        inherited_profile = clean(self._profile_pending_mode) == "inherit"
         for rule in self.config.get("comparisons", []):
             title = clean(rule.get("title")) or "Comparison"
             valid_binding_count = 0
@@ -5242,7 +5553,11 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
                 column_id = clean((rule.get("bindings") or {}).get(source.get("id")))
                 if column_id and any(column.id == column_id for column in self._source_columns(source)):
                     valid_binding_count += 1
-            if valid_binding_count < 2:
+            # A shared profile is allowed to land on a station whose workbook
+            # lacks one configured physical field.  That is a visible warning,
+            # not a reason to discard the rest of the station configuration.
+            missing_profile_field = inherited_profile and title.casefold() in missing_profile_rules
+            if valid_binding_count < 2 and not missing_profile_field:
                 errors.append(
                     f"{title}：至少需要绑定两个数据源字段，才能生成 TRUE/FALSE 比较结果。"
                     if zh else
@@ -5254,9 +5569,15 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
         errors = self._validation_errors() if self.config.get("sources") else [
             "当前还没有配置设备审核数据源。" if self.ui_language == LANG_ZH_CN else "No source table configured yet."
         ]
+        warnings = self._comparison_field_warnings() if self.config.get("sources") else []
         if errors:
             prefix = "配置需要处理：" if self.ui_language == LANG_ZH_CN else "Configuration requires attention: "
-            self.validation_label.setText(prefix + "  |  ".join(errors[:5]) + (" ..." if len(errors) > 5 else ""))
+            messages = errors + warnings
+            self.validation_label.setText(prefix + "  |  ".join(messages[:5]) + (" ..." if len(messages) > 5 else ""))
+            self.validation_label.setStyleSheet(f"color:{COLORS['warning']};font-weight:600;")
+        elif warnings:
+            prefix = "配置告警：" if self.ui_language == LANG_ZH_CN else "Configuration warning: "
+            self.validation_label.setText(prefix + "  |  ".join(warnings[:5]) + (" ..." if len(warnings) > 5 else ""))
             self.validation_label.setStyleSheet(f"color:{COLORS['warning']};font-weight:600;")
         else:
             active_count = sum(bool(source.get("enabled", True)) for source in self.config.get("sources", []))
@@ -5269,6 +5590,17 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             self.validation_label.setStyleSheet(f"color:{COLORS['success']};font-weight:600;")
 
     def _accept_config(self):
+        if not self.can_edit_global_config:
+            QMessageBox.information(
+                self,
+                ui_tr("Comparison Configuration", self.ui_language),
+                (
+                    "当前工作站不是共享配置 Admin，配置由 Admin 统一维护；请到审核页面继续填写 Comments、Checked、Review 和 Resolution。"
+                    if self.ui_language == LANG_ZH_CN else
+                    "This workstation is not the shared configuration Admin. The Admin manages the configuration; continue using the review pages for Comments, Checked, Review and Resolution."
+                ),
+            )
+            return
         self._save_current_source_editor()
         self._capture_rule_table()
         errors = self._validation_errors()
@@ -5276,6 +5608,23 @@ class ConfigurableEquipmentComparisonDialog(QDialog):
             QMessageBox.warning(self, "Comparison Configuration", "Fix the following before saving:\n\n" + "\n".join(f"• {item}" for item in errors[:12]))
             return
         self.config = save_equipment_comparison_config(self.store, self.config, self.user_name)
+        # The Admin's accepted configuration becomes the single active shared
+        # definition. It uses the same path-safe profile format as reusable
+        # templates, so every other station can bind its own live source files.
+        try:
+            save_equipment_comparison_profile(
+                ADMIN_ACTIVE_PROFILE_NAME,
+                self.config,
+                self.user_name,
+                store=self.store,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                ui_tr("Comparison Configuration", self.ui_language),
+                f"Configuration was saved locally, but the shared Admin configuration could not be updated:\n{type(exc).__name__}: {exc}",
+            )
+            return
         mode = clean(self.profile_mode_combo.currentData()) if hasattr(self, "profile_mode_combo") else "local"
         selected_profile = self._selected_profile_name() if mode == "inherit" else ""
         if mode == "inherit" and not selected_profile:
@@ -6311,7 +6660,18 @@ class InitialSetupDialog(QDialog):
         self.setWindowTitle("Set up Migration Report Tool")
         self.setModal(True)
         self.resize(760, 430)
-        self._repository_root = Path(repository_root).resolve() if repository_root else None
+        # Do not hand an unavailable UNC path to the folder picker.  It can be
+        # shown as a value only when it is still reachable; otherwise the user
+        # gets a normal local/Home starting point and can select a replacement.
+        candidate_repository = Path(repository_root).expanduser() if repository_root else None
+        try:
+            self._repository_root = (
+                candidate_repository.resolve()
+                if candidate_repository and candidate_repository.exists() and candidate_repository.is_dir()
+                else None
+            )
+        except OSError:
+            self._repository_root = None
         self._project_root = Path(project_root).resolve()
 
         layout = QVBoxLayout(self)
@@ -6367,7 +6727,11 @@ class InitialSetupDialog(QDialog):
         layout.addLayout(buttons)
 
     def _browse_source(self):
-        initial = self.source_edit.text().strip() or str(Path.home())
+        initial_path = Path(self.source_edit.text().strip()).expanduser() if self.source_edit.text().strip() else Path.home()
+        try:
+            initial = str(initial_path if initial_path.exists() and initial_path.is_dir() else Path.home())
+        except OSError:
+            initial = str(Path.home())
         value = QFileDialog.getExistingDirectory(self, "Select Source Workspace", initial)
         if value:
             self.source_edit.setText(str(Path(value).resolve()))
@@ -6451,6 +6815,8 @@ class MainWindow(QMainWindow):
         self._dirty_pages: set[int] = set(range(9))
         self._startup_repository_loaded = False
         self._startup_setup_checked = False
+        self._startup_path_probe: dict | None = None
+        self._shared_review_preferences_loaded = False
         self._spreadsheet_tables: list[SpreadsheetTableWidget] = []
         # Shared worker pool: file scans, source parsing, validation and
         # resolution persistence run outside the Qt GUI thread.  This machine is
@@ -6493,6 +6859,22 @@ class MainWindow(QMainWindow):
         self._comparison_action_tracking_keys: set[str] = set()
         self._comparison_dataset_ready = False
         self.settings = QSettings()
+        # A stable client id distinguishes two workstations running under the
+        # same Windows account.  It is used only for the shared configuration
+        # administrator lock; reviewer records remain multi-user.
+        self._global_admin_client_id = clean(self.settings.value("global_configuration/client_id", ""))
+        if not self._global_admin_client_id:
+            self._global_admin_client_id = uuid.uuid4().hex
+            self.settings.setValue("global_configuration/client_id", self._global_admin_client_id)
+            self.settings.sync()
+        self._global_admin_refresh_timer = QTimer(self)
+        self._global_admin_refresh_timer.setInterval(5000)
+        self._global_admin_refresh_timer.timeout.connect(self._refresh_global_admin_ui)
+        self._global_admin_refresh_timer.start()
+        self._global_admin_state: dict | None = None
+        self._global_admin_status_loaded = False
+        self._global_admin_status_loading = False
+        self._global_admin_status_generation = 0
         # Equipment Data Review column widths are user presentation preferences.
         # Persist them by stable column key so a reviewer can drag any header
         # divider wider/narrower and keep that width across refreshes, site
@@ -6524,21 +6906,12 @@ class MainWindow(QMainWindow):
         # by a new USER App-column definition is automatically visible until the
         # reviewer explicitly hides it.  The setting lives outside the release
         # folder, so replacing/upgrading the App does not reset the review view.
-        stored_hidden = load_review_hidden_columns("rmu_data_review")
-        if stored_hidden is None:
-            # One-time migration from the older QSettings visible-column model.
-            # Only columns that were already known to that older UI can become
-            # hidden; genuinely new dynamic fields must still appear on first use.
-            saved_columns = self.settings.value("comparison/visible_columns", [], type=list) or []
-            known_dynamic = set(self.settings.value("comparison/known_dynamic_columns", [], type=list) or [])
-            saved_column_schema = self.settings.value("comparison/column_schema_version", 0)
-            migrated_visible = migrate_comparison_visible_columns(saved_columns, saved_column_schema)
-            # COMPARISON_GROUPS is nested; build the known key set explicitly.
-            legacy_known = {key for _group, _color, cols in COMPARISON_GROUPS for key, _label, _width in cols}
-            legacy_known |= known_dynamic
-            stored_hidden = (legacy_known - set(migrated_visible)) - {"no", "rmu"}
-            save_review_hidden_columns(stored_hidden, "rmu_data_review")
-        self.comparison_hidden_keys = set(stored_hidden or set()) - {"no", "rmu"}
+        # Do not open the shared global_settings.db while constructing the
+        # window. If the UNC server is offline, SQLite/path resolution can
+        # otherwise hold the splash screen indefinitely. Start with the safe
+        # default (all columns visible), then load the shared preference after
+        # the window is visible and apply it to the review page.
+        self.comparison_hidden_keys = set()
         base_keys = {key for _group, _color, cols in COMPARISON_GROUPS for key, _label, _width in cols}
         self.comparison_visible_keys = (base_keys - self.comparison_hidden_keys) | {"no", "rmu"}
         self.settings.setValue("comparison/column_schema_version", COMPARISON_COLUMN_SCHEMA_VERSION)
@@ -6561,6 +6934,7 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self)
         self._wire_shortcuts()
         self.set_page(0)
+        QTimer.singleShot(0, self._load_shared_review_preferences)
         # Show the window first, then perform a filename-only repository scan on
         # the next event-loop turn.  Deep CSV/XLSX inspection is explicit via
         # Refresh Sources / Run Validation, so startup is no longer blocked by
@@ -6601,6 +6975,7 @@ class MainWindow(QMainWindow):
                 table.viewport().update()
             except Exception:
                 pass
+        self._refresh_review_status_labels_for_language()
         try:
             self.centralWidget().update()
         except Exception:
@@ -6617,6 +6992,36 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def _refresh_review_status_labels_for_language(self) -> None:
+        """Repaint cached Review cells after a language switch.
+
+        Table bodies are business data and are intentionally excluded from the
+        generic widget translator.  Review status is stored as an English
+        token, but older rendered tables can still contain the Chinese label;
+        normalize both forms before repainting the visible cells.
+        """
+        tables = (
+            (getattr(self, "comparison_locator", None), 4),
+            (getattr(self, "db_smart_locator", None), 1),
+            (getattr(self, "db_smart_table", None), 0),
+        )
+        for table, column in tables:
+            if table is None:
+                continue
+            for row in range(table.rowCount()):
+                item = table.item(row, column)
+                if item is None:
+                    continue
+                label, fill, text = _review_visual(item.text(), self.ui_language)
+                item.setText(label)
+                item.setBackground(fill)
+                item.setForeground(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                table.setItem(row, column, item)
 
     def _change_ui_language(self, _index: int = -1) -> None:
         if not hasattr(self, "settings_language_combo"):
@@ -8276,7 +8681,7 @@ class MainWindow(QMainWindow):
         font = analysis_item.font(); font.setBold(True); analysis_item.setFont(font)
         self.comparison_locator.setItem(r, 3, analysis_item)
 
-        label, review_fill, review_text = _review_visual(review_status)
+        label, review_fill, review_text = _review_visual(review_status, self.ui_language)
         review_item = QTableWidgetItem(label)
         review_item.setBackground(review_fill)
         review_item.setForeground(review_text)
@@ -8684,6 +9089,8 @@ class MainWindow(QMainWindow):
         header.viewport().update()
 
     def open_comparison_columns(self):
+        if not self._require_global_configuration_admin("change Equipment Review column visibility"):
+            return
         all_groups = self._comparison_groups()
         source_group_names = self._comparison_source_group_names()
         # v0.8.168: physical source-field visibility is controlled only in Map
@@ -8712,6 +9119,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(ui_tr("Equipment Data Review column view saved", self.ui_language), 4000)
 
     def reset_comparison_columns(self):
+        if not self._require_global_configuration_admin("reset Equipment Review column visibility"):
+            return
         # Reset means the real default: ALL columns that exist now are visible.
         # Future columns are also visible automatically because the explicit
         # hidden set is empty until the reviewer hides something again.
@@ -9923,6 +10332,8 @@ class MainWindow(QMainWindow):
             self.db_smart_table.setColumnHidden(index, key not in self.db_smart_visible_keys)
 
     def open_db_smart_columns(self):
+        if not self._require_global_configuration_admin("change Signal Mapping Review column visibility"):
+            return
         if not self.db_smart_report:
             QMessageBox.information(self, "Signal Mapping Review", "Load a Signal Mapping Review first.")
             return
@@ -10190,7 +10601,7 @@ class MainWindow(QMainWindow):
                 or row.row_key in getattr(self, "_db_smart_need_action_highlight_keys", set())
             ):
                 row_fill = QColor("#DCEEFF")
-            review_label, review_fill, review_text = _review_visual(status)
+            review_label, review_fill, review_text = _review_visual(status, self.ui_language)
 
             main_rmu = clean(row.values[0]) if len(row.values) > 0 else clean(row.rmu)
             row_type = clean(row.values[1]) if len(row.values) > 1 else ""
@@ -10799,7 +11210,30 @@ class MainWindow(QMainWindow):
 
     # ------------------------- settings -------------------------
     def _build_settings_page(self):
-        page, layout = self._page_container()
+        # Settings is a long form. Keep the page itself responsive and let it
+        # scroll vertically instead of shrinking cards below their QLabel
+        # sizeHint. This is important on 125%/150% Windows scaling and on
+        # smaller laptop windows, where word-wrapped status text otherwise
+        # overlaps the buttons and the next card.
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setAlignment(Qt.AlignTop)
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setSpacing(16)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        self.settings_scroll = scroll
         layout.addWidget(PageHeader("Settings", "Application identity, persistent Project Data, Site Repository, STANDARD management and deployment settings."))
 
         self.settings_setup_card = QFrame()
@@ -10822,6 +11256,73 @@ class MainWindow(QMainWindow):
         setup_box.addWidget(setup_title); setup_box.addWidget(self.settings_setup_status); setup_box.addLayout(setup_actions)
         layout.addWidget(self.settings_setup_card)
 
+        transfer_card = QFrame()
+        transfer_card.setObjectName("Card")
+        transfer_box = QVBoxLayout(transfer_card)
+        transfer_box.setContentsMargins(24, 18, 24, 18)
+        transfer_box.setSpacing(7)
+        transfer_title = QLabel("Unified Site Folder")
+        transfer_title.setObjectName("SectionTitle")
+        transfer_desc = QLabel(
+            "Each site keeps its source files, project.db, Comments and Checked records in one folder. "
+            "Copy the complete site folder to another workstation to continue the review."
+        )
+        transfer_desc.setWordWrap(True)
+        transfer_desc.setObjectName("Muted")
+        transfer_actions = QHBoxLayout()
+        self.settings_transfer_btn = QPushButton("Prepare Transfer Package (One-time)")
+        self.settings_transfer_btn.setObjectName("Primary")
+        self.settings_transfer_btn.setToolTip("Copy the current site's live source files into source_files for one-time transfer to another machine.")
+        self.settings_transfer_btn.clicked.connect(self.prepare_site_transfer_package)
+        transfer_actions.addWidget(self.settings_transfer_btn)
+        transfer_actions.addStretch()
+        transfer_box.addWidget(transfer_title)
+        transfer_box.addWidget(transfer_desc)
+        transfer_box.addLayout(transfer_actions)
+        layout.addWidget(transfer_card)
+
+        admin_card = QFrame()
+        admin_card.setObjectName("Card")
+        admin_box = QVBoxLayout(admin_card)
+        admin_box.setContentsMargins(24, 18, 24, 18)
+        admin_box.setSpacing(7)
+        admin_title = QLabel("Shared Configuration Admin")
+        admin_title.setObjectName("SectionTitle")
+        admin_desc = QLabel(
+            "One workstation manages the shared comparison configuration, templates, source order, field visibility and comparison rules. "
+            "Other workstations use the same configuration as read-only. Comments, Checked, Review, Resolution and Audit records remain writable for every user. "
+            "The Admin lock remains until the current Admin explicitly releases it."
+        )
+        admin_desc.setWordWrap(True)
+        admin_desc.setObjectName("Muted")
+        self.settings_admin_status = QLabel("")
+        self.settings_admin_status.setWordWrap(True)
+        self.settings_admin_status.setObjectName("Muted")
+        admin_actions = QHBoxLayout()
+        self.settings_claim_admin_btn = QPushButton("Set as Admin")
+        self.settings_claim_admin_btn.setObjectName("Primary")
+        self.settings_claim_admin_btn.clicked.connect(self._claim_global_configuration_admin)
+        self.settings_release_admin_btn = QPushButton("Release Admin")
+        self.settings_release_admin_btn.clicked.connect(self._release_global_configuration_admin)
+        self.settings_force_claim_admin_btn = QPushButton("Force Takeover Admin")
+        self.settings_force_claim_admin_btn.setToolTip(
+            "Replace an unavailable Admin after explicit confirmation."
+        )
+        self.settings_force_claim_admin_btn.clicked.connect(self._force_claim_global_configuration_admin)
+        admin_actions.addWidget(self.settings_claim_admin_btn)
+        admin_actions.addWidget(self.settings_release_admin_btn)
+        admin_actions.addWidget(self.settings_force_claim_admin_btn)
+        admin_actions.addStretch()
+        admin_box.addWidget(admin_title)
+        admin_box.addWidget(admin_desc)
+        admin_box.addWidget(self.settings_admin_status)
+        admin_box.addLayout(admin_actions)
+        layout.addWidget(admin_card)
+        # Never read global_settings.db while constructing the window.  The
+        # database normally lives on the shared UNC repository, and a missing
+        # server can otherwise keep the splash screen open indefinitely.
+        QTimer.singleShot(0, self._refresh_global_admin_ui)
+
         card = QFrame()
         card.setObjectName("Card")
         form = QFormLayout(card)
@@ -10837,7 +11338,7 @@ class MainWindow(QMainWindow):
         repo_line = QHBoxLayout(repo_widget); repo_line.setContentsMargins(0, 0, 0, 0)
         repo_line.addWidget(self.settings_repo_label, 1)
         repo_btn = QPushButton("Change..."); repo_btn.clicked.connect(self.choose_repository_root); repo_line.addWidget(repo_btn)
-        policy = QLabel("Source Workspace / Site Repository is read-only input. Project Data Storage is writable persistent application state stored separately from the release and source folders and survives upgrades. Each site keeps project.db, Review/Closed/Needs Action, Comments, Resolution, Change Audit, named revisions, issue/action records, generated sign-off PDFs, signed PDF copies, imported source copies and snapshots under Project Data. Future SQLite schema upgrades are forward-only and create a backup before changing project.db. Automatic validation and review behavior remain unchanged.")
+        policy = QLabel("Source Workspace / Site Repository is read-only during normal validation. New and migrated sites keep project.db, project.json, source_files and reports together inside each site folder. The separate Project Data location is retained only as legacy compatibility storage for importing older records. Review/Closed/Needs Action, Comments, Resolution, Change Audit, named revisions and issue/action records remain in project.db and survive application upgrades. Future SQLite schema upgrades are forward-only and create a backup before changing project.db. Automatic validation and review behavior remain unchanged.")
         policy.setWordWrap(True)
         form.addRow("Application", app_label)
         form.addRow("Current user", user_label)
@@ -10868,7 +11369,7 @@ class MainWindow(QMainWindow):
         project_data_open_btn = QPushButton("Open Folder")
         project_data_open_btn.clicked.connect(lambda: self._open_path(project_data_root()))
         project_data_line.addWidget(project_data_open_btn)
-        form.addRow("Project Data", project_data_widget)
+        form.addRow("Legacy Project Data (compatibility)", project_data_widget)
         form.addRow("Data policy", policy)
         layout.addWidget(card)
 
@@ -11022,6 +11523,8 @@ class MainWindow(QMainWindow):
     def save_detection_rules(self):
         if not hasattr(self, "source_detection_table"):
             return
+        if not self._require_global_configuration_admin("save source recognition rules"):
+            return
         categories = []
         for row in range(self.source_detection_table.rowCount()):
             label_item = self.source_detection_table.item(row, 0)
@@ -11103,6 +11606,8 @@ class MainWindow(QMainWindow):
             pass
 
     def update_standard_reference(self):
+        if not self._require_global_configuration_admin("upload a STANDARD workbook"):
+            return
         initial = str(Path.home())
         try:
             current = standard_reference_path()
@@ -11185,6 +11690,8 @@ class MainWindow(QMainWindow):
     def activate_selected_standard_reference(self):
         if not hasattr(self, "settings_standard_combo"):
             return
+        if not self._require_global_configuration_admin("activate a STANDARD workbook"):
+            return
         key = self.settings_standard_combo.currentData()
         if not key:
             return
@@ -11225,6 +11732,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(ui_tr(f"Active STANDARD: {info.path.name}. Signal Mapping will recalculate from current selected sources.", self.ui_language), 6000)
 
     def restore_standard_reference(self):
+        if not self._require_global_configuration_admin("restore the built-in STANDARD workbook"):
+            return
         try:
             previous = current_standard_reference_info()
             if previous.origin == "Built-in":
@@ -11411,7 +11920,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Ready", 1500)
 
     def _start_background_task(
-        self, key: str, label: str, fn, on_success, *, on_error=None, with_progress: bool = False
+        self, key: str, label: str, fn, on_success, *, on_error=None,
+        with_progress: bool = False, show_status: bool = True
     ) -> bool:
         """Start a worker without ever blocking the GUI event loop."""
         if key in self._background_tasks:
@@ -11420,7 +11930,8 @@ class MainWindow(QMainWindow):
         worker = BackgroundTask(fn, with_progress=with_progress)
         self._background_tasks[key] = worker
         self._set_background_action_state()
-        self.statusBar().showMessage(ui_tr(f"Working · {label} …", self.ui_language))
+        if show_status:
+            self.statusBar().showMessage(ui_tr(f"Working · {label} …", self.ui_language))
         popup_key = f"task:{key}"
         show_popup = bool(with_progress and key != "source-auto-refresh")
         if show_popup:
@@ -11437,7 +11948,8 @@ class MainWindow(QMainWindow):
                     detail=f"{stage_text} · {int(value)}%",
                     progress_value=value,
                 )
-            self.statusBar().showMessage(ui_tr(f"Working · {stage_text} · {int(value)}%", self.ui_language))
+            if show_status:
+                self.statusBar().showMessage(ui_tr(f"Working · {stage_text} · {int(value)}%", self.ui_language))
 
         def finish(result):
             self._background_tasks.pop(key, None)
@@ -11476,6 +11988,9 @@ class MainWindow(QMainWindow):
         on_success,
         *,
         on_error=None,
+        show_popup: bool = True,
+        show_status: bool = True,
+        timeout_seconds: float | None = None,
     ) -> bool:
         """Start a CPU-heavy review build without blocking the Qt event loop.
 
@@ -11503,19 +12018,22 @@ class MainWindow(QMainWindow):
             "result_received": False,
             "finished": False,
             "exit_grace": 0,
+            "started_at": time.monotonic(),
         }
         self._background_tasks[key] = state
         self._set_background_action_state()
-        self.statusBar().showMessage(ui_tr(f"Working · {label} …", self.ui_language))
+        if show_status:
+            self.statusBar().showMessage(ui_tr(f"Working · {label} …", self.ui_language))
         # The popup is shown before even spawning the process.  Its own timer is
         # now guaranteed to keep repainting while the launcher thread waits for
         # Windows/PyInstaller process startup.
-        self._show_busy_operation(
-            popup_key,
-            label,
-            "Starting background worker... Please wait.",
-            progress_value=None,
-        )
+        if show_popup:
+            self._show_busy_operation(
+                popup_key,
+                label,
+                "Starting background worker... Please wait.",
+                progress_value=None,
+            )
 
         def cleanup() -> None:
             if state.get("finished"):
@@ -11524,7 +12042,8 @@ class MainWindow(QMainWindow):
             poll_timer.stop()
             self._background_tasks.pop(key, None)
             self._set_background_action_state()
-            self._hide_busy_operation(popup_key)
+            if show_popup:
+                self._hide_busy_operation(popup_key)
             process = state.get("process")
             message_queue = state.get("queue")
             if process is not None:
@@ -11563,7 +12082,24 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, label, last_line)
 
         def poll_messages_with_exit_guard() -> None:
-            if state.get("finished") or not state.get("launched"):
+            if state.get("finished"):
+                return
+            if timeout_seconds is not None:
+                elapsed = time.monotonic() - float(state.get("started_at") or time.monotonic())
+                if elapsed >= max(0.5, float(timeout_seconds)):
+                    process = state.get("process")
+                    if process is not None:
+                        try:
+                            if process.is_alive():
+                                process.terminate()
+                        except Exception:
+                            pass
+                    deliver_error(
+                        f"{label} timed out after {float(timeout_seconds):g} seconds. "
+                        "Check the network share or choose another folder."
+                    )
+                    return
+            if not state.get("launched"):
                 return
             process = state.get("process")
             message_queue = state.get("queue")
@@ -11594,7 +12130,8 @@ class MainWindow(QMainWindow):
                         detail=f"{stage} · {value}% · working in background",
                         progress_value=None,
                     )
-                    self.statusBar().showMessage(ui_tr(f"Working · {stage} · {value}%", self.ui_language))
+                    if show_status:
+                        self.statusBar().showMessage(ui_tr(f"Working · {stage} · {value}%", self.ui_language))
                 elif kind == "success":
                     got_terminal = True
                     deliver_success(message[1])
@@ -11645,13 +12182,15 @@ class MainWindow(QMainWindow):
             state["queue"] = message_queue
             state["launched"] = True
             state["launcher"] = None
-            self._update_busy_operation(
-                popup_key,
-                title=label,
-                detail="Background worker started · calculating...",
-                progress_value=None,
-            )
-            poll_timer.start()
+            if show_popup:
+                self._update_busy_operation(
+                    popup_key,
+                    title=label,
+                    detail="Background worker started · calculating...",
+                    progress_value=None,
+                )
+            if not poll_timer.isActive():
+                poll_timer.start()
 
         def launch_failed(details: str) -> None:
             state["launcher"] = None
@@ -11660,6 +12199,10 @@ class MainWindow(QMainWindow):
         launcher.signals.succeeded.connect(launched)
         launcher.signals.failed.connect(launch_failed)
         self.thread_pool.start(launcher)
+        # Start the watchdog before process creation.  On a disconnected UNC
+        # path, Windows can block Process.start() itself, so waiting until the
+        # child is launched would leave the UI with an endless spinner.
+        poll_timer.start()
         return True
 
     def _reopen_active_store_after_worker(self, site: SiteInfo) -> None:
@@ -11689,6 +12232,8 @@ class MainWindow(QMainWindow):
             btn.setChecked(i == index)
 
         if index in {2, 3}:
+            if self._sync_global_admin_configuration(self.store):
+                self._mark_site_pages_dirty()
             title = "Loading RMU Data Review" if index == 2 else "Loading Signal Mapping Review"
             detail = "Preparing review data... Please wait."
             self._show_busy_operation("nav-review-load", title, detail)
@@ -11916,36 +12461,397 @@ class MainWindow(QMainWindow):
             on_error=failed,
         )
 
+    def _load_shared_review_preferences(self) -> None:
+        """Load shared column visibility after the first window paint."""
+        if self._shared_review_preferences_loaded or "shared-review-preferences" in self._background_tasks:
+            return
+
+        saved_columns = self.settings.value("comparison/visible_columns", [], type=list) or []
+        known_dynamic = list(self.settings.value("comparison/known_dynamic_columns", [], type=list) or [])
+        saved_column_schema = self.settings.value("comparison/column_schema_version", 0)
+
+        def loaded(hidden: set[str]) -> None:
+            self._shared_review_preferences_loaded = True
+            self.comparison_hidden_keys = set(hidden or set()) - {"no", "rmu"}
+            base_keys = {key for _group, _color, cols in COMPARISON_GROUPS for key, _label, _width in cols}
+            self.comparison_visible_keys = (base_keys - self.comparison_hidden_keys) | {"no", "rmu"}
+            self._dirty_pages.add(2)
+            self._apply_comparison_column_visibility()
+
+        def failed(details: str) -> None:
+            # Shared presentation settings are optional for opening the app.
+            # Keep the default-visible view and allow the reviewer to continue.
+            self.statusBar().showMessage(
+                ui_tr("Shared settings unavailable; using local defaults until the share is reachable.", self.ui_language),
+                6000,
+            )
+
+        self._start_process_background_task(
+            "shared-review-preferences",
+            "Loading shared review settings",
+            "shared-review-preferences",
+            (saved_columns, known_dynamic, saved_column_schema),
+            loaded,
+            on_error=failed,
+            show_popup=False,
+            show_status=False,
+            timeout_seconds=5,
+        )
+
     def _setup_state(self) -> dict:
         """Return lightweight startup configuration state without opening source files."""
         repository = self.repository_root
-        source_ok = bool(repository and Path(repository).exists() and Path(repository).is_dir())
+        repository_path = Path(repository) if repository else None
+        source_deferred = bool(repository_path and str(repository_path).startswith("\\\\"))
+        if source_deferred:
+            # UNC availability is verified in _startup_workspace_job, never
+            # during the first GUI event-loop turn.
+            source_ok = True
+        else:
+            source_ok = _startup_directory_available(repository_path)
         project = project_data_root()
-        project_ok = bool(project.exists() and project.is_dir())
+        configured_project = configured_project_data_root()
+        project_deferred = bool(configured_project and str(configured_project).startswith("\\\\"))
+        if self._startup_path_probe is not None:
+            source_ok = bool(self._startup_path_probe.get("source_ok"))
+            project_ok = bool(self._startup_path_probe.get("project_ok"))
+        elif project_deferred:
+            project_ok = True
+        else:
+            project_ok = _startup_directory_available(project)
+        project_unavailable = bool(self._startup_path_probe is not None and not project_ok)
         project_confirmed = bool(project_data_root_is_configured())
         missing = []
         if not source_ok:
             missing.append("Source Workspace")
-        if not project_ok or not project_confirmed:
-            missing.append("Project Data Storage")
+        if project_unavailable or not project_confirmed:
+            missing.append("Project Data")
         return {
             "source_ok": source_ok,
             "project_ok": project_ok,
+            "source_deferred": source_deferred,
+            "project_deferred": project_deferred,
             "project_confirmed": project_confirmed,
+            "project_unavailable": project_unavailable,
+            "configured_project": configured_project,
             "missing": missing,
         }
+
+    def _global_admin_machine_name(self) -> str:
+        return clean(os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "")
+
+    def _global_admin_ip_address(self) -> str:
+        """Return a useful LAN IPv4 address for the shared-folder workstation."""
+        try:
+            addresses = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+            for item in addresses:
+                value = clean(item[4][0])
+                if value and not value.startswith("127."):
+                    return value
+        except OSError:
+            pass
+        return "127.0.0.1"
+
+    def _is_global_configuration_admin(self) -> bool:
+        state = getattr(self, "_global_admin_state", None)
+        return bool(
+            state
+            and clean(state.get("client_id")) == clean(self._global_admin_client_id)
+        )
+
+    def _sync_global_admin_configuration(self, store=None) -> bool:
+        """Apply the shared administrator configuration to one site's store.
+
+        The shared profile contains only logical source roles and mappings. The
+        apply operation keeps the target site's own source-file paths and only
+        updates that site's configuration document. It never touches Comments,
+        Checked, Review, Resolution or Audit rows in project.db.
+        """
+        target_store = store or self.store
+        if target_store is None:
+            return False
+        admin = global_configuration_admin()
+        if not admin or self._is_global_configuration_admin():
+            return False
+        profile = get_equipment_comparison_profile(ADMIN_ACTIVE_PROFILE_NAME)
+        if not profile:
+            return False
+        profile_modified = clean(profile.get("modified_at"))
+        link = dict(get_equipment_comparison_profile_link(target_store) or {})
+        if (
+            clean(link.get("profile_name")) == ADMIN_ACTIVE_PROFILE_NAME
+            and clean(link.get("profile_modified_at")) == profile_modified
+        ):
+            return False
+        try:
+            current = get_equipment_comparison_config(target_store, bootstrap=True)
+            merged, metadata = apply_equipment_comparison_profile(
+                target_store, ADMIN_ACTIVE_PROFILE_NAME, current_config=current
+            )
+            save_equipment_comparison_config(target_store, merged, "GLOBAL_ADMIN_SYNC")
+            save_equipment_comparison_profile_link(
+                target_store,
+                mode="inherit",
+                profile_name=ADMIN_ACTIVE_PROFILE_NAME,
+                profile_modified_at=clean(metadata.get("profile_modified_at")) or profile_modified,
+                synced_at=clean(metadata.get("applied_at")) or datetime.now().isoformat(timespec="seconds"),
+            )
+            return True
+        except Exception:
+            # A station with a missing source field remains usable and will show
+            # the normal configuration warning when its source is opened.
+            return False
+
+    def _refresh_global_admin_ui(self) -> None:
+        if not hasattr(self, "settings_admin_status"):
+            return
+        admin_mutation_running = any(
+            key in self._background_tasks
+            for key in (
+                "shared-claim-admin",
+                "shared-release-admin",
+                "shared-force-claim-admin",
+            )
+        )
+        if (
+            not admin_mutation_running
+            and not self._global_admin_status_loading
+            and "shared-admin-status" not in self._background_tasks
+        ):
+            self._global_admin_status_loading = True
+            self._global_admin_status_generation += 1
+            request_generation = self._global_admin_status_generation
+
+            def loaded(result: dict):
+                # A refresh started before an Admin claim/release must not
+                # overwrite the result of that newer mutation with stale data.
+                if request_generation != self._global_admin_status_generation:
+                    return
+                self._global_admin_status_loading = False
+                self._global_admin_status_loaded = True
+                self._global_admin_state = result.get("state") if isinstance(result, dict) else None
+                self._refresh_global_admin_ui()
+
+            def failed(_details: str):
+                if request_generation != self._global_admin_status_generation:
+                    return
+                self._global_admin_status_loading = False
+                self._global_admin_status_loaded = True
+                self._global_admin_state = None
+                self._refresh_global_admin_ui()
+
+            self._start_background_task(
+                "shared-admin-status",
+                "Loading shared Admin status",
+                lambda: _shared_admin_status_job(0),
+                loaded,
+                on_error=failed,
+                show_status=False,
+            )
+
+        state = self._global_admin_state
+        mine = self._is_global_configuration_admin()
+        zh = self.ui_language == LANG_ZH_CN
+        if not self._global_admin_status_loaded:
+            self.settings_admin_status.setText(
+                "正在读取共享 Admin 状态……" if zh else "Loading shared Admin status..."
+            )
+        elif state:
+            owner = clean(state.get("user_name")) or "User"
+            machine = clean(state.get("machine_name"))
+            ip_address = clean(state.get("ip_address"))
+            identity_parts = [value for value in (machine, ip_address) if value]
+            owner_text = f"{owner} ({' · '.join(identity_parts)})" if identity_parts else owner
+            self.settings_admin_status.setText(
+                (f"当前 Admin：{owner_text}。其他工作站自动使用 Admin 的全局配置；评论、勾选和审核记录仍可编辑。" if zh else
+                 f"Current Admin: {owner_text}. Other workstations use the Admin's shared configuration; comments, checks and review records remain editable.")
+            )
+        elif self._global_admin_status_loaded:
+            self.settings_admin_status.setText(
+                "尚未设置 Admin。第一台点击“设为 Admin”的工作站将拥有全局配置编辑权。" if zh else
+                "No Admin is assigned. The first workstation to click Set as Admin can edit shared configuration."
+            )
+        self.settings_claim_admin_btn.setEnabled(self._global_admin_status_loaded and (not state or mine))
+        self.settings_claim_admin_btn.setText("已是 Admin" if mine and zh else "Admin 已占用" if state and not mine and zh else "设为 Admin" if zh else "Already Admin" if mine else "Admin is occupied" if state else "Set as Admin")
+        self.settings_release_admin_btn.setEnabled(self._global_admin_status_loaded and mine)
+        self.settings_force_claim_admin_btn.setEnabled(
+            self._global_admin_status_loaded and bool(state) and not mine
+        )
+
+    def _claim_global_configuration_admin(self) -> None:
+        if "shared-claim-admin" in self._background_tasks:
+            return
+        # Invalidate an older read that may still be returning from the share.
+        # Its result must not repaint the button back to "Set as Admin".
+        self._global_admin_status_generation += 1
+        self.settings_claim_admin_btn.setEnabled(False)
+
+        def completed(result: dict | None) -> None:
+            self._global_admin_status_loading = False
+            self._global_admin_status_loaded = True
+            if result is None:
+                self._global_admin_state = None
+                QMessageBox.information(
+                    self,
+                    "Global Configuration Admin",
+                    "Another workstation is already the Admin. It must release the role before this workstation can take over.",
+                )
+            else:
+                # Update the local view immediately. The next periodic refresh
+                # still verifies the shared database, but the click is visible
+                # at once even if an older status read is finishing.
+                self._global_admin_state = dict(result)
+                self.statusBar().showMessage("This workstation is now the shared configuration Admin.", 5000)
+            self._refresh_global_admin_ui()
+
+        def failed(details: str) -> None:
+            self._global_admin_status_loading = False
+            self.statusBar().showMessage(
+                ui_tr("Unable to update shared Admin status. Check the shared folder connection.", self.ui_language),
+                7000,
+            )
+            self._refresh_global_admin_ui()
+
+        self._start_background_task(
+            "shared-claim-admin",
+            "Claiming shared Admin",
+            lambda: _shared_claim_admin_job(
+                self.user_name,
+                self._global_admin_machine_name(),
+                self._global_admin_client_id,
+                self._global_admin_ip_address(),
+            ),
+            completed,
+            on_error=failed,
+            show_status=False,
+        )
+
+    def _release_global_configuration_admin(self) -> None:
+        if not self._is_global_configuration_admin():
+            self._refresh_global_admin_ui()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Release Global Configuration Admin",
+            "Release Admin so another workstation can manage the shared configuration?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if "shared-release-admin" in self._background_tasks:
+            return
+        self._global_admin_status_generation += 1
+        self.settings_release_admin_btn.setEnabled(False)
+
+        def completed(released: bool) -> None:
+            self._global_admin_status_loading = False
+            self._global_admin_status_loaded = True
+            if released:
+                self._global_admin_state = None
+                self.statusBar().showMessage("Shared configuration Admin released.", 5000)
+            self._refresh_global_admin_ui()
+
+        def failed(details: str) -> None:
+            self._global_admin_status_loading = False
+            self.statusBar().showMessage(
+                ui_tr("Unable to release shared Admin. Check the shared folder connection.", self.ui_language),
+                7000,
+            )
+            self._refresh_global_admin_ui()
+
+        self._start_background_task(
+            "shared-release-admin",
+            "Releasing shared Admin",
+            lambda: _shared_release_admin_job(self.user_name, self._global_admin_client_id),
+            completed,
+            on_error=failed,
+            show_status=False,
+        )
+
+    def _force_claim_global_configuration_admin(self) -> None:
+        if "shared-force-claim-admin" in self._background_tasks:
+            return
+        current = self._global_admin_state or {}
+        owner = clean(current.get("user_name")) or "the current Admin"
+        machine = clean(current.get("machine_name"))
+        ip_address = clean(current.get("ip_address"))
+        identity = " · ".join(value for value in (owner, machine, ip_address) if value)
+        answer = QMessageBox.question(
+            self,
+            "Force Takeover Admin",
+            f"This will replace the current shared Admin ({identity}).\n\n"
+            "Use this only when that workstation is unavailable and cannot release Admin. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._global_admin_status_generation += 1
+        self.settings_force_claim_admin_btn.setEnabled(False)
+
+        def completed(result: dict | None) -> None:
+            self._global_admin_status_loading = False
+            self._global_admin_status_loaded = True
+            if result is None:
+                self.statusBar().showMessage(
+                    ui_tr("Unable to take over shared Admin.", self.ui_language),
+                    7000,
+                )
+                self._refresh_global_admin_ui()
+                return
+            self._global_admin_state = dict(result)
+            self.statusBar().showMessage(
+                "This workstation forcibly took over shared configuration Admin.",
+                6000,
+            )
+            self._refresh_global_admin_ui()
+
+        def failed(details: str) -> None:
+            self._global_admin_status_loading = False
+            self.statusBar().showMessage(
+                ui_tr("Unable to take over shared Admin. Check the shared folder connection.", self.ui_language),
+                7000,
+            )
+            self._refresh_global_admin_ui()
+
+        self._start_background_task(
+            "shared-force-claim-admin",
+            "Taking over shared Admin",
+            lambda: _shared_force_claim_admin_job(
+                self.user_name,
+                self._global_admin_machine_name(),
+                self._global_admin_client_id,
+                self._global_admin_ip_address(),
+            ),
+            completed,
+            on_error=failed,
+            show_status=False,
+        )
+
+    def _require_global_configuration_admin(self, action: str = "change shared configuration") -> bool:
+        if self._is_global_configuration_admin():
+            return True
+        state = global_configuration_admin()
+        owner = clean((state or {}).get("user_name")) or "the current Admin"
+        QMessageBox.information(
+            self,
+            "Shared Configuration",
+            f"Only {owner} can {action}. This workstation can still edit Comments, Checked, Review, Resolution and Audit records.",
+        )
+        return False
 
     def _refresh_setup_guidance(self) -> None:
         state = self._setup_state()
         missing = state["missing"]
         if not missing:
-            message = "Setup complete. Source Workspace and Project Data Storage are configured and will be reused automatically on future launches."
-        elif "Source Workspace" in missing and "Project Data Storage" in missing:
-            message = "Choose the read-only Source Workspace and confirm the writable Project Data Storage location before starting site validation."
-        elif "Source Workspace" in missing:
-            message = "Source Workspace is not configured or is unavailable. Choose the folder that contains the site source files."
+            message = "Setup complete. Each site's project.db is stored inside that site folder and will travel with its source files."
+        elif state.get("project_unavailable"):
+            message = "The previously selected Project Data folder is unavailable. Choose a reachable folder in Setup; the original path and data have not been changed."
+        elif len(missing) > 1:
+            message = "Choose a reachable Source Workspace and Project Data folder in Setup before using the application."
         else:
-            message = f"Project Data Storage has not been confirmed. The app is currently using the safe default location: {project_data_root()}"
+            message = "Source Workspace is not configured or is unavailable. Choose the folder that contains the site source files. Each site will keep its own project.db."
         display_message = ui_tr(message, self.ui_language)
         if hasattr(self, "setup_guidance_card"):
             self.setup_guidance_label.setText(display_message)
@@ -11956,10 +12862,81 @@ class MainWindow(QMainWindow):
             repo_text = str(self.repository_root) if self.repository_root else ui_tr("Not configured", self.ui_language)
             self.settings_repo_label.setText(repo_text)
         if hasattr(self, "settings_project_data_label"):
-            suffix = "" if state["project_confirmed"] else (
-                "  ·  使用默认位置（未确认）" if self.ui_language == LANG_ZH_CN else "  ·  using default (not confirmed)"
+            if state.get("project_unavailable") and state.get("configured_project"):
+                suffix = "  ·  原位置不可用，请重新选择" if self.ui_language == LANG_ZH_CN else "  ·  previous location unavailable; choose again"
+                shown_project = state["configured_project"]
+            else:
+                suffix = "" if state["project_confirmed"] else (
+                    "  ·  使用默认位置（未确认）" if self.ui_language == LANG_ZH_CN else "  ·  using default (not confirmed)"
+                )
+                shown_project = project_data_root()
+            self.settings_project_data_label.setText(f"{shown_project}{suffix}")
+        self._refresh_transfer_package_button()
+
+    def _refresh_transfer_package_button(self) -> None:
+        if not hasattr(self, "settings_transfer_btn"):
+            return
+        prepared = bool(self.selected_site and self.store and is_unified_site_folder(self.store.folder))
+        self.settings_transfer_btn.setEnabled(bool(self.selected_site and self.store and not prepared))
+        self.settings_transfer_btn.setText("Site Folder Already Unified" if prepared else "Prepare Transfer Package (One-time)")
+
+    def prepare_site_transfer_package(self) -> None:
+        """Create a self-contained copy of the current site's live inputs."""
+        if not self._require_global_configuration_admin("prepare a site transfer package"):
+            return
+        if not self.selected_site or not self.store:
+            QMessageBox.information(
+                self,
+                "Site Transfer Package",
+                "Select a site before preparing the one-time unified site package.",
             )
-            self.settings_project_data_label.setText(f"{project_data_root()}{suffix}")
+            return
+        if is_unified_site_folder(self.store.folder):
+            self._refresh_transfer_package_button()
+            QMessageBox.information(
+                self,
+                "Site Transfer Package",
+                f"This site has already been prepared as a transfer package:\n{self.store.folder}",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Prepare Site Transfer Package",
+            "This one-time action can be performed at any review status. It will copy the current site's CSV/Excel source files "
+            "into source_files, keep all existing review records, and update source links to local relative paths.\n\n"
+            "Original source files will not be deleted or changed. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            result = prepare_site_transfer_package(self.store, self.selected_site.path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Site Transfer Package", f"Unable to prepare package:\n{type(exc).__name__}: {exc}")
+            return
+        # Make the merged folder the active Source Workspace immediately. From
+        # this point forward this site uses one folder for source files and
+        # project data; the old repository copy remains untouched as backup.
+        package = Path(result["package"]).resolve()
+        sources, detections, unmapped = discover_site_sources(package, deep=False)
+        self.repository_root = package
+        save_repository_root(self.repository_root)
+        self.selected_site = SiteInfo(package.name, package, sources, detections, unmapped)
+        self.repository_sites = scan_repository(package, deep=False)
+        self._activate_site_workspace(self.selected_site)
+        self._refresh_transfer_package_button()
+        self._render_site_list(preferred_name=self.selected_site.name)
+        self._mark_site_pages_dirty()
+        self.statusBar().showMessage(f"Transfer package ready · {result['package']}", 8000)
+        QMessageBox.information(
+            self,
+            "Site Transfer Package Ready",
+            f"Package ready:\n{result['package']}\n\n"
+            f"Copied source files: {result['source_count']}\n\n"
+            "Close the application, copy this entire site folder to the other machine, "
+            "then select this folder as Source Workspace. The embedded project.db will provide the existing Comments and Checked records.",
+        )
 
     def open_setup_dialog(self) -> bool:
         """Open the two-path setup guide and persist both locations when accepted."""
@@ -12002,7 +12979,11 @@ class MainWindow(QMainWindow):
         if repository_changed or project_changed:
             self.selected_site = None
             self.statusBar().showMessage(ui_tr("Setup saved · loading Source Workspace...", self.ui_language), 5000)
-            self.refresh_site_repository(force=False, deep=False)
+            # The selected location may be a UNC share. Never scan it from the
+            # setup dialog's GUI callback; restart the post-show worker path.
+            self._startup_repository_loaded = False
+            self._startup_path_probe = None
+            QTimer.singleShot(0, self._load_initial_workspace)
             self._mark_site_pages_dirty()
             self.refresh_dashboard()
         else:
@@ -12018,7 +12999,11 @@ class MainWindow(QMainWindow):
         if not state["missing"]:
             return
         already_seen = self.settings.value("onboarding/initial_setup_seen_v1", False, type=bool)
-        if not already_seen:
+        # A previously completed setup must be reopened when its remembered
+        # network location disappears.  Otherwise the app would silently use
+        # a local fallback and make new review records look as if they were
+        # saved to the shared workspace.
+        if not already_seen or state.get("project_unavailable") or not state.get("source_ok"):
             self.open_setup_dialog()
 
     def _load_initial_workspace(self) -> None:
@@ -12036,22 +13021,67 @@ class MainWindow(QMainWindow):
             self.refresh_dashboard()
             self._dirty_pages.discard(0)
             return
-        try:
-            self.statusBar().showMessage(ui_tr("Loading workspace index...", self.ui_language))
-            self.refresh_site_repository(force=False, deep=False)
-        except Exception as exc:
-            self.statusBar().showMessage(ui_tr(f"Workspace index warning: {type(exc).__name__}: {exc}", self.ui_language), 8000)
-        finally:
-            if self.selected_site:
-                self.statusBar().showMessage(ui_tr(f"Ready · {self.selected_site.name}", self.ui_language), 3000)
-                # Keep the last Workspace/Site/source selections for instant
-                # startup, then verify the live files asynchronously. Only files
-                # whose cheap metadata changed are re-read.
-                QTimer.singleShot(250, self._check_live_source_changes)
-            else:
-                self.statusBar().showMessage("Ready", 3000)
+        repository_root = Path(self.repository_root)
+        project_root = configured_project_data_root() or project_data_root()
+
+        def loaded(result: dict) -> None:
+            self._startup_path_probe = result
+            if not result.get("source_ok") or not result.get("project_ok"):
+                self._refresh_setup_guidance()
+                accepted = self.open_setup_dialog()
+                if accepted:
+                    # The setup dialog may have replaced an offline UNC path.
+                    # Re-run the same worker with the new locations; never scan
+                    # the selected share on the GUI thread.
+                    self._startup_repository_loaded = False
+                    self._startup_path_probe = None
+                    QTimer.singleShot(0, self._load_initial_workspace)
+                return
+
+            self.repository_sites = list(result.get("sites") or [])
+            selected_name = self.selected_site.name if self.selected_site else None
+            if not selected_name and self.store:
+                selected_name = self.store.config.get("repository_site")
+            if not selected_name:
+                selected_name = load_last_site() or None
+            if hasattr(self, "repository_root_edit"):
+                self.repository_root_edit.setText(str(self.repository_root))
+            if hasattr(self, "repository_summary"):
+                text = (
+                    f"{len(self.repository_sites)} 个站点 · 数据源数量按站点自由配置"
+                    if self.ui_language == LANG_ZH_CN else
+                    f"{len(self.repository_sites)} sites · source count is configurable per site"
+                )
+                self.repository_summary.setText(text)
+            if hasattr(self, "repository_last_scan"):
+                self.repository_last_scan.setText(ui_tr("Last scan: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.ui_language))
+            self._render_site_list(selected_name)
+            self.refresh_dashboard()
+            self._dirty_pages.discard(0)
+            self.statusBar().showMessage("Ready", 3000)
             if not self._source_watch_timer.isActive():
                 self._source_watch_timer.start()
+            if self.selected_site:
+                QTimer.singleShot(250, self._check_live_source_changes)
+
+        def failed(details: str) -> None:
+            self._startup_path_probe = {"source_ok": False, "project_ok": False, "sites": []}
+            self._refresh_setup_guidance()
+            self.statusBar().showMessage(
+                ui_tr("Workspace is unavailable. Choose a reachable folder in Setup.", self.ui_language),
+                8000,
+            )
+            self.open_setup_dialog()
+
+        self._start_process_background_task(
+            "startup-workspace",
+            "Loading workspace index",
+            "startup-workspace",
+            (repository_root, project_root),
+            loaded,
+            on_error=failed,
+            timeout_seconds=15,
+        )
 
     def _wire_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.run_comparison)
@@ -12162,7 +13192,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(ui_tr(f"Project Data: {project_data_root()}", self.ui_language), 6000)
 
     def choose_repository_root(self):
-        initial = str(self.repository_root) if self.repository_root else str(Path.home())
+        initial_path = Path(self.repository_root) if self.repository_root else Path.home()
+        try:
+            initial = str(initial_path if initial_path.exists() and initial_path.is_dir() else Path.home())
+        except OSError:
+            initial = str(Path.home())
         path = QFileDialog.getExistingDirectory(self, "Select Workspace", initial)
         if not path:
             return
@@ -12290,7 +13324,10 @@ class MainWindow(QMainWindow):
             # A site may organize inputs under arbitrary nested folders.
             # Never derive this status from the legacy root-only source-role
             # resolver; recursively inspect the actual site tree instead.
-            has_tabular_files = site_has_tabular_files(site.path)
+            # The worker already inspected this site's source tree.  Reusing
+            # its result avoids a second recursive UNC scan on the GUI thread
+            # immediately after the startup index completes.
+            has_tabular_files = bool(site.sources or site.unmapped_files)
             current_site_configured = False
             if (
                 self.store
@@ -12345,6 +13382,8 @@ class MainWindow(QMainWindow):
         # workspace and rebuild every review page. If neither site identity nor
         # cheap source metadata changed, keep the already loaded in-memory pages.
         if same_snapshot:
+            if self._sync_global_admin_configuration(self.store):
+                self._mark_site_pages_dirty()
             self._refresh_site_source_table()
             return
 
@@ -12354,6 +13393,7 @@ class MainWindow(QMainWindow):
         # site switching felt frozen.  Pages are marked dirty and refreshed only
         # when the reviewer actually opens them.
         self._activate_site_workspace(site)
+        self._sync_global_admin_configuration(self.store)
         self.db_smart_report = None
         self._db_smart_report_site = site.name
         self._db_smart_ui_ready = False
@@ -13038,6 +14078,8 @@ class MainWindow(QMainWindow):
         if not self.selected_site or not self.store:
             QMessageBox.information(self, "Source File", "Select a site first.")
             return
+        if not self._require_global_configuration_admin("choose or replace a source file"):
+            return
         if self._source_pipeline_busy():
             self.statusBar().showMessage(ui_tr("Source processing is already running. Please wait for it to finish.", self.ui_language), 4000)
             return
@@ -13152,6 +14194,8 @@ class MainWindow(QMainWindow):
         if not self.selected_site or not self.store:
             QMessageBox.information(self, "Source Sheet", "Select a site first.")
             return
+        if not self._require_global_configuration_admin("choose a source worksheet"):
+            return
         if self._source_pipeline_busy():
             self.statusBar().showMessage(ui_tr("Source processing is already running. Please wait for it to finish.", self.ui_language), 4000)
             return
@@ -13211,6 +14255,8 @@ class MainWindow(QMainWindow):
         """Choose AUTO latest or pin one exact published V version."""
         if not self.selected_site or not self.store:
             QMessageBox.information(self, "Choose Active File", "Select a site first.")
+            return
+        if not self._require_global_configuration_admin("choose an active source file"):
             return
         if self._source_pipeline_busy():
             self.statusBar().showMessage(ui_tr("Source processing is already running. Please wait for it to finish.", self.ui_language), 4000)
@@ -13447,7 +14493,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Equipment Comparison", "Select a site first.")
             return
         try:
-            dialog = ConfigurableEquipmentComparisonDialog(self.store, self.user_name, self)
+            # Non-admin clients always receive the latest shared definition
+            # before the dialog is shown. The merge preserves this station's
+            # physical file paths and never replaces review/history records.
+            self._sync_global_admin_configuration(self.store)
+            dialog = ConfigurableEquipmentComparisonDialog(
+                self.store,
+                self.user_name,
+                self,
+                can_edit_global_config=self._is_global_configuration_admin(),
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Equipment Comparison", f"{type(exc).__name__}: {exc}")
             return
@@ -13485,6 +14540,8 @@ class MainWindow(QMainWindow):
     def open_source_mapping(self, *_args):
         if not self.selected_site or not self.store:
             QMessageBox.information(self, "Source Mapping", "Select a site first.")
+            return
+        if not self._require_global_configuration_admin("edit source mappings"):
             return
         module, ref, _table = self._current_module_source_selection()
         if module is not None and module.key == "rmu_review":
@@ -13750,11 +14807,23 @@ class MainWindow(QMainWindow):
         return False
 
     def _activate_site_workspace(self, site: SiteInfo) -> None:
-        """Bind one repository site to its persistent Project Data workspace."""
-        folder = workspace_root() / re.sub(r"[^A-Za-z0-9._-]+", "_", site.name)
-        if not is_inside_workspace(folder):
-            QMessageBox.critical(self, "Workspace restriction", f"Site project data must stay inside:\n{workspace_root()}")
-            return
+        """Open the site's own folder as the authoritative Project Data store."""
+        # From the unified-layout release onward, every site owns its project
+        # database.  This also works on UNC paths such as
+        # ``\\\\172.16.21.101\\Share Folder\\Downstream Report\\1-ABH``.
+        # Keep the old per-site workspace only as a migration source.
+        folder = Path(site.path).resolve()
+        legacy_folder = workspace_root() / re.sub(r"[^A-Za-z0-9._-]+", "_", site.name)
+        if not (folder / "project.db").is_file() and (legacy_folder / "project.db").is_file():
+            try:
+                migrate_legacy_project_data(legacy_folder, folder)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Site Project Data",
+                    f"Unable to migrate the legacy project database into the site folder:\n{type(exc).__name__}: {exc}",
+                )
+                return
         if self.store and self.store.folder.resolve() == folder.resolve():
             self.store.config["project_name"] = site.name  # backward compatibility
             self.store.config["site_name"] = site.name
@@ -13773,6 +14842,12 @@ class MainWindow(QMainWindow):
             self.store.config["repository_site"] = site.name
             self.store.config["repository_path"] = str(site.path.resolve())
             self.store.save_config()
+        # Opening a site must be read-only with respect to source files.  In
+        # particular, do not automatically move root-level CSV/XLSX files into
+        # ``source_files``: another workstation or Excel may have the file
+        # open, and a normal site selection must never fail with WinError 32.
+        # Discovery supports both layouts; explicit transfer/package actions
+        # remain the only operations that reorganize or copy source files.
         self.project_title.setText(site.name)
         self.project_subtitle.setText(ui_tr(f"Migration Report · User: {self.user_name} · Site DB: project.db", self.ui_language))
         self.statusBar().showMessage(ui_tr(f"Site selected: {site.name}", self.ui_language), 5000)
@@ -14032,7 +15107,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "comparison_locator") and target_row < self.comparison_locator.rowCount():
             self.comparison_locator.setRowHeight(target_row, height)
-            label, review_fill, review_text = _review_visual(review_status)
+            label, review_fill, review_text = _review_visual(review_status, self.ui_language)
             review_item = self.comparison_locator.item(target_row, 4) or QTableWidgetItem()
             review_item.setText(label)
             review_item.setBackground(review_fill)
@@ -14297,7 +15372,7 @@ class MainWindow(QMainWindow):
             data = data or {}
             state = (entry or {}).get("state") if isinstance(entry, dict) else None
             state = state or analysis_review_state(data)
-            label, review_fill, review_text = _review_visual(value)
+            label, review_fill, review_text = _review_visual(value, self.ui_language)
             item = self.comparison_locator.item(row_index, 4) or QTableWidgetItem()
             item.setText(label)
             item.setBackground(review_fill)
@@ -16300,6 +17375,61 @@ class MainWindow(QMainWindow):
         translate_widget_tree(self.export_page, self.ui_language)
 
     def closeEvent(self, event):
+        # QThreadPool cannot forcibly stop a Python callable that is blocked in
+        # Windows SMB/UNC I/O.  Do the normal cleanup first, then arm a bounded
+        # process-exit watchdog so closing the window can never leave a hidden
+        # python.exe running forever.  This is deliberately only armed after
+        # an explicit window close, never during normal application use.
+        if not getattr(self, "_shutdown_watchdog_started", False):
+            self._shutdown_watchdog_started = True
+
+            def force_exit():
+                os._exit(0)
+
+            watchdog = threading.Timer(2.0, force_exit)
+            watchdog.daemon = True
+            watchdog.start()
+
+        for timer_name in (
+            "_source_watch_timer",
+            "_global_admin_refresh_timer",
+            "_comparison_width_save_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        # Startup/review workers may be probing a disconnected UNC share.
+        # Terminate spawned workers before Qt begins tearing down the window;
+        # otherwise a network call in a child can keep the Python process alive
+        # after the user has closed the application.
+        for state in list(self._background_tasks.values()):
+            if not isinstance(state, dict):
+                continue
+            state["finished"] = True
+            process = state.get("process")
+            if process is not None:
+                try:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=0.25)
+                except Exception:
+                    pass
+            message_queue = state.get("queue")
+            if message_queue is not None:
+                try:
+                    message_queue.close()
+                    message_queue.cancel_join_thread()
+                except Exception:
+                    pass
+        self._background_tasks.clear()
+        try:
+            self.thread_pool.clear()
+        except Exception:
+            pass
         if self.store:
             try:
                 self.store.db.close()

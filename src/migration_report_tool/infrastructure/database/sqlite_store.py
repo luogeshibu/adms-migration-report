@@ -58,6 +58,9 @@ class ProjectStore:
         except sqlite3.DatabaseError:
             pass
         self._init_db()
+        restored_checks = self._restore_historical_rmu_checks()
+        if restored_checks:
+            self.db.commit()
         self._promote_legacy_custom_fields_to_global()
         self._promote_legacy_source_overrides_to_global()
         # Keep project.json metadata aligned with the migrated SQLite schema so
@@ -238,6 +241,76 @@ class ProjectStore:
         if "ever_needs_action" not in signal_review_columns:
             self.db.execute("ALTER TABLE db_smart_reviews ADD COLUMN ever_needs_action INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
+
+    def _restore_historical_rmu_checks(self) -> int:
+        """Restore checks cleared by the pre-unified refresh behavior.
+
+        Older releases cleared ``rmu_reviews.check_passed`` when a refreshed
+        Analysis fingerprint changed, but recorded the transition in
+        ``changes``.  The checkbox is an independent human verification record,
+        so recover only the latest PASS that was followed by an automatic reset.
+        A later explicit/manual clear remains authoritative and is never
+        overwritten.
+        """
+        history = list(self.db.execute(
+            """SELECT rmu,old_value,new_value,reason,modified_by,modified_at,id
+               FROM changes
+               WHERE field_name='rmu_check_passed'
+               ORDER BY id"""
+        ))
+        if not history:
+            return 0
+
+        latest: dict[str, dict] = {}
+        previous_pass: dict[str, dict] = {}
+        for event in history:
+            rmu = clean(event["rmu"])
+            if not rmu:
+                continue
+            old_value = clean(event["old_value"]).upper()
+            new_value = clean(event["new_value"]).upper()
+            if new_value == "PASS":
+                previous_pass[rmu] = dict(event)
+                latest[rmu] = {"kind": "PASS", "event": dict(event)}
+            elif old_value == "PASS" and not new_value:
+                automatic = "automatic reset" in clean(event["reason"]).casefold()
+                latest[rmu] = {"kind": "AUTO_RESET" if automatic else "CLEARED", "event": dict(event)}
+            elif not new_value:
+                latest[rmu] = {"kind": "CLEARED", "event": dict(event)}
+
+        restored = 0
+        for rmu, state in latest.items():
+            if state.get("kind") != "AUTO_RESET":
+                continue
+            current = self.db.execute(
+                "SELECT check_passed FROM rmu_reviews WHERE rmu=?", (rmu,)
+            ).fetchone()
+            if current is None or bool(int(current["check_passed"] or 0)):
+                continue
+            passed_event = previous_pass.get(rmu)
+            if passed_event is None:
+                continue
+            self.db.execute(
+                """UPDATE rmu_reviews
+                   SET check_passed=1,check_passed_by=?,check_passed_at=?,updated_at=?
+                   WHERE rmu=?""",
+                (
+                    clean(passed_event["modified_by"]), clean(passed_event["modified_at"]),
+                    datetime.now().isoformat(timespec="seconds"), rmu,
+                ),
+            )
+            self.db.execute(
+                """INSERT INTO changes
+                   (rmu,field_name,old_value,new_value,reason,modified_by,modified_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (
+                    rmu, "rmu_check_passed", "", "PASS",
+                    "Restore historical Checked after automatic validation reset",
+                    "SYSTEM", datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            restored += 1
+        return restored
 
 
     def _local_custom_source_fields(self, source_type: str) -> list[dict]:
@@ -1083,7 +1156,6 @@ class ProjectStore:
         old_hash = clean(current["analysis_hash"])
         status = clean(current["review_status"]).upper() or "UNREVIEWED"
         explicit_unreviewed = status == "UNREVIEWED" and bool(clean(current["reviewed_by"]) or clean(current["reviewed_at"]))
-        check_passed = bool(int(current["check_passed"] or 0)) if "check_passed" in current.keys() else False
         if old_hash and old_hash != analysis_hash and (status != "UNREVIEWED" or explicit_unreviewed):
             self._record_issue_field_change(
                 "RMU", rmu, field_name="analysis_hash", old_value=old_hash, new_value=analysis_hash,
@@ -1093,7 +1165,7 @@ class ProjectStore:
             self.db.execute(
                 """UPDATE rmu_reviews
                 SET review_status='UNREVIEWED',reviewed_by='',reviewed_at='',
-                    check_passed=0,check_passed_by='',check_passed_at='',updated_at=?,analysis_hash=?
+                    updated_at=?,analysis_hash=?
                 WHERE rmu=?""",
                 (now, analysis_hash, rmu),
             )
@@ -1110,12 +1182,6 @@ class ProjectStore:
                 reason="Automatic reset: RMU validation result changed after source refresh",
                 rmu=rmu, snapshot=self._rmu_issue_snapshot(rmu, row=row),
             )
-            if check_passed:
-                self.db.execute(
-                    "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
-                    (rmu, "rmu_check_passed", "PASS", "",
-                     "Automatic reset: RMU validation result changed after source refresh", "SYSTEM", now),
-                )
         elif old_hash != analysis_hash:
             if old_hash:
                 self._record_issue_field_change(
@@ -1123,18 +1189,10 @@ class ProjectStore:
                     modified_by="SYSTEM", reason="RMU validation result changed after source refresh",
                     snapshot=self._rmu_issue_snapshot(rmu, row=row), event_type="VALIDATION_CHANGED", rmu=rmu,
                 )
-            if check_passed and old_hash:
-                self.db.execute(
-                    "UPDATE rmu_reviews SET check_passed=0,check_passed_by='',check_passed_at='',analysis_hash=?,updated_at=? WHERE rmu=?",
-                    (analysis_hash, now, rmu),
-                )
-                self.db.execute(
-                    "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
-                    (rmu, "rmu_check_passed", "PASS", "",
-                     "Automatic reset: RMU validation result changed after source refresh", "SYSTEM", now),
-                )
-            else:
-                self.db.execute("UPDATE rmu_reviews SET analysis_hash=?,updated_at=? WHERE rmu=?", (analysis_hash, now, rmu))
+            # Checked is an independent human verification record.  A source
+            # refresh or changed analysis fingerprint must not erase the
+            # historical checkbox; only an explicit user action can clear it.
+            self.db.execute("UPDATE rmu_reviews SET analysis_hash=?,updated_at=? WHERE rmu=?", (analysis_hash, now, rmu))
 
     _SOURCE_AUDIT_NAMES = {
         "se_list": "SE",
@@ -2481,9 +2539,10 @@ class ProjectStore:
         details so every site NEEDS ACTION remains reportable even if a later
         source refresh changes or removes the calculated row.
 
-        CLOSED/manual-check decisions are invalidated when the validation row
-        itself changes. NEEDS ACTION is deliberately preserved until a reviewer
-        explicitly changes it, because it represents an unresolved site action.
+        Review status may be invalidated when the validation row itself changes,
+        while the independent manual Checked decision is retained. NEEDS ACTION
+        is deliberately preserved until a reviewer explicitly changes it,
+        because it represents an unresolved site action.
         """
         reset_count = 0
         now = datetime.now().isoformat(timespec="seconds")
@@ -2551,7 +2610,6 @@ class ProjectStore:
                 old_row_hash = clean(current["row_hash"])
                 old_source_hash = clean(current["source_hash"])
                 status = clean(current["review_status"]).upper() or "UNREVIEWED"
-                check_passed = bool(int(current["check_passed"] or 0)) if "check_passed" in current.keys() else False
                 changed = bool(old_row_hash and new_row_hash and old_row_hash != new_row_hash)
                 if not old_row_hash and old_source_hash and new_source_hash and old_source_hash != new_source_hash:
                     changed = True
@@ -2582,24 +2640,17 @@ class ProjectStore:
                 if changed and status == "NEEDS ACTION":
                     # An unresolved action belongs to the site until a human
                     # closes/reclassifies it. Refreshing source data must not
-                    # silently erase it; only a manual Checked flag is stale.
+                    # silently erase the unresolved action or the independent
+                    # manual Checked record.
                     self.db.execute(
                         """UPDATE db_smart_reviews SET
-                           check_passed=0,check_passed_by='',check_passed_at='',
                            source_hash=?,row_hash=?,updated_at=? WHERE row_key=?""",
                         (new_source_hash, new_row_hash, now, row_key),
                     )
-                    if check_passed:
-                        self.db.execute(
-                            "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
-                            (f"DBSMART:{clean(current['rmu']) or row_key[:12]}", "db_smart_check_passed", "PASS", "",
-                             "Automatic reset: Signal Mapping source changed while Needs Action remains open", modified_by or "SYSTEM", now),
-                        )
                 elif changed and (status != "UNREVIEWED" or explicit_unreviewed):
                     self.db.execute(
                         """UPDATE db_smart_reviews
                         SET review_status='UNREVIEWED',reviewed_by='',reviewed_at='',
-                            check_passed=0,check_passed_by='',check_passed_at='',
                             source_hash=?,row_hash=?,updated_at=? WHERE row_key=?""",
                         (new_source_hash, new_row_hash, now, row_key),
                     )
@@ -2608,25 +2659,7 @@ class ProjectStore:
                         (f"DBSMART:{clean(current['rmu']) or row_key[:12]}", "db_smart_review_status", status, "UNREVIEWED",
                          "Automatic reset: Signal Mapping validation result changed after source refresh", modified_by or "SYSTEM", now),
                     )
-                    if check_passed:
-                        self.db.execute(
-                            "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
-                            (f"DBSMART:{clean(current['rmu']) or row_key[:12]}", "db_smart_check_passed", "PASS", "",
-                             "Automatic reset: Signal Mapping validation result changed after source refresh", modified_by or "SYSTEM", now),
-                        )
                     reset_count += 1
-                elif changed and check_passed:
-                    self.db.execute(
-                        """UPDATE db_smart_reviews
-                        SET check_passed=0,check_passed_by='',check_passed_at='',
-                            source_hash=?,row_hash=?,updated_at=? WHERE row_key=?""",
-                        (new_source_hash, new_row_hash, now, row_key),
-                    )
-                    self.db.execute(
-                        "INSERT INTO changes(rmu,field_name,old_value,new_value,reason,modified_by,modified_at) VALUES(?,?,?,?,?,?,?)",
-                        (f"DBSMART:{clean(current['rmu']) or row_key[:12]}", "db_smart_check_passed", "PASS", "",
-                         "Automatic reset: Signal Mapping validation result changed after source refresh", modified_by or "SYSTEM", now),
-                    )
                 elif old_source_hash != new_source_hash or old_row_hash != new_row_hash:
                     self.db.execute(
                         "UPDATE db_smart_reviews SET source_hash=?,row_hash=?,updated_at=? WHERE row_key=?",
@@ -2782,5 +2815,3 @@ class ProjectStore:
                 old_status=clean(current["review_status"]).upper() if current else "UNREVIEWED",
             )
         self.db.commit()
-
-

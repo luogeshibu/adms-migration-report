@@ -10,7 +10,7 @@ class V08133LivePulseAndRmuOnlyTypeWarningTests(unittest.TestCase):
         cls.version = (cls.root / "src" / "migration_report_tool" / "version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', self.version)
+        self.assertIn('__version__ = "0.8.215"', self.version)
 
     def test_busy_popup_never_switches_to_static_percentage_mode(self):
         block = self.ui[self.ui.index("def set_message(self, title:"):self.ui.index("def signal_review_row_hash")]

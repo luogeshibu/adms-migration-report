@@ -13,7 +13,7 @@ class V08174UnlockNonstandardSystemMappingTests(unittest.TestCase):
         cls.ui = (root / "src/migration_report_tool/ui/main_window.py").read_text(encoding="utf-8")
 
     def test_release_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_nonstandard_se_equipment_name_can_be_explicitly_bound(self):
         headers = [

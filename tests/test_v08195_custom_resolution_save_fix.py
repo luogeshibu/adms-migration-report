@@ -9,7 +9,7 @@ VERSION = (ROOT / 'src/migration_report_tool/version.py').read_text(encoding='ut
 
 class V08195CustomResolutionSaveFixTests(unittest.TestCase):
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION)
+        self.assertIn('__version__ = "0.8.215"', VERSION)
 
     def test_other_branch_resolves_field_label_before_description(self):
         start = UI.index('    def decisions(self) -> dict[str, dict | None]:')

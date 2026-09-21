@@ -494,7 +494,16 @@ def build_equipment_source_view(
     asld = adapter.load_rows("adms_sld") or []
 
     wanted = clean(profile).upper() or "__ALL__"
-    zsld_rows = _filter_zenon_inventory_for_profile(zsld_all, wanted) if wanted not in {"__ALL__", "ALL", "ALL EQUIPMENT"} else list(zsld_all)
+    all_equipment_profiles = {"__ALL__", "ALL", "ALL EQUIPMENT"}
+
+    # A project that has never explicitly saved the v0.8.178 configurable
+    # source contract is still a legacy five-source project.  In that mode the
+    # old comparison engine used the union of all source keys; making
+    # ZENON-SLD the sole inventory here silently drops valid legacy rows when
+    # the graphical inventory is incomplete or from a different export.
+    # Keep the source-driven inventory contract for explicitly configurable
+    # projects, but preserve the legacy union until the reviewer opts in.
+    legacy_union_mode = not bool(configurable.get("sources"))
     site_name = clean(store.config.get("repository_site") or store.config.get("site_name")) if store else ""
 
     indices = {
@@ -503,6 +512,53 @@ def build_equipment_source_view(
         "adms_db": _equipment_rows_by_name(adb),
         "adms_sld": _equipment_rows_by_name(asld),
     }
+
+    if legacy_union_mode:
+        source_rows_by_type = {
+            "se_list": se,
+            "zenon_db": zdb,
+            "zenon_sld": zsld_all,
+            "adms_db": adb,
+            "adms_sld": asld,
+        }
+        raw_name_by_key: dict[str, str] = {}
+        for source_type in ("zenon_sld", "se_list", "zenon_db", "adms_db", "adms_sld"):
+            for item in source_rows_by_type[source_type]:
+                key = normalize_name((item or {}).get("rmu"))
+                if key and key not in raw_name_by_key:
+                    raw_name_by_key[key] = clean((item or {}).get("rmu"))
+
+        if wanted in all_equipment_profiles:
+            legacy_keys = set(raw_name_by_key)
+        else:
+            # Device-type filters still use the graphical inventory when one
+            # exists; this keeps the historical RMU/non-RMU scope behavior
+            # while allowing All Equipment to retain the complete key union.
+            legacy_keys = {
+                normalize_name(item.get("rmu"))
+                for item in _filter_zenon_inventory_for_profile(zsld_all, wanted)
+                if normalize_name(item.get("rmu"))
+            }
+
+        def legacy_sort_key(value: str) -> tuple[int, object]:
+            token = clean(value)
+            return (0, int(token)) if token.isdigit() else (1, token.casefold())
+
+        zsld_by_key = _equipment_rows_by_name(zsld_all)
+        zsld_rows = []
+        for key in sorted(legacy_keys, key=legacy_sort_key):
+            item = dict((zsld_by_key.get(key) or [{}])[0] or {})
+            if not item:
+                # Keep the identity available for the union row, but mark it
+                # so the loop below does not falsely count ZENON-SLD as a
+                # participating source.
+                item = {"rmu": raw_name_by_key.get(key) or key, "_legacy_missing_zsld": True}
+            zsld_rows.append(item)
+    else:
+        zsld_rows = (
+            _filter_zenon_inventory_for_profile(zsld_all, wanted)
+            if wanted not in all_equipment_profiles else list(zsld_all)
+        )
     feeder_key = {
         "se_list": "feeder",
         "zenon_db": "feeder",
@@ -527,11 +583,12 @@ def build_equipment_source_view(
 
     for zrow in zsld_rows:
         zrow = dict(zrow or {})
+        legacy_missing_zsld = bool(zrow.pop("_legacy_missing_zsld", False))
         equipment_name = clean(zrow.get("rmu"))
         name_key = normalize_name(equipment_name)
         target_feeder = clean(zrow.get("feeder"))
         target_device_type = clean(zrow.get("device_type")).upper()
-        source_rows = {"zenon_sld": zrow}
+        source_rows = {"zenon_sld": {} if legacy_missing_zsld else zrow}
         for source_type in ("se_list", "zenon_db", "adms_db", "adms_sld"):
             source_rows[source_type] = _best_equipment_source_candidate(
                 indices[source_type].get(name_key, []),
@@ -548,15 +605,24 @@ def build_equipment_source_view(
         x = source_rows["zenon_sld"]
         present = [
             label for source_type, label in _EQUIPMENT_SOURCE_LABELS
-            if source_type == "zenon_sld" or bool(source_rows.get(source_type))
+            if bool(source_rows.get(source_type))
         ]
         missing = [label for _source_type, label in _EQUIPMENT_SOURCE_LABELS if label not in present]
         source_count = len(present)
         coverage_counts[f"{source_count}/5"] += 1
-        quality, quality_detail = _inventory_quality(x)
+        if legacy_missing_zsld:
+            quality, quality_detail = "REVIEW", "Legacy row retained; ZENON-SLD inventory row is missing."
+        else:
+            quality, quality_detail = _inventory_quality(x)
         quality_counts[quality] += 1
 
-        device_type = clean(x.get("device_type")).upper() or "UNCLASSIFIED"
+        # Rows retained only by the legacy union belong to the historical RMU
+        # review scope.  Keep their plain RMU review key so old Review,
+        # Checked and Resolution records can still be found by the new UI.
+        device_type = (
+            "RMU" if legacy_missing_zsld
+            else (clean(x.get("device_type")).upper() or "UNCLASSIFIED")
+        )
         source_rows_for_analysis = {
             "SE": s,
             "ZENON DB": z,
@@ -950,4 +1016,3 @@ def build_comparison(store: ProjectStore, adapter: SourceAdapter | None = None) 
         rows.append(row_data)
     summary = Counter(r["status"] for r in rows)
     return rows, dict(summary)
-

@@ -18,7 +18,7 @@ class V08140AutoDetectionFallbackPriorityTests(unittest.TestCase):
     def test_release_version(self):
         root = Path(__file__).resolve().parents[1]
         version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "0.8.196"', version)
+        self.assertIn('__version__ = "0.8.215"', version)
 
     def test_latest_valid_v_wins_over_unversioned_rule_fallback(self):
         with tempfile.TemporaryDirectory() as td:

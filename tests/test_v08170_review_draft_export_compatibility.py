@@ -9,7 +9,7 @@ VERSION = (ROOT / "src/migration_report_tool/version.py").read_text(encoding="ut
 
 class ReviewDraftExportCompatibilityTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION)
+        self.assertIn('__version__ = "0.8.215"', VERSION)
 
     def test_validation_pending_is_confirmation_not_hard_gate(self):
         helper_start = UI.index("    def _confirm_review_draft_export")

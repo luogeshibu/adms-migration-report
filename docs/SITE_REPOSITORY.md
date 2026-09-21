@@ -3,6 +3,29 @@
 The Site Repository is the user-managed source tree. One direct child folder is
 one site. Normal validation/sync operations are read-only.
 
+## Unified site storage
+
+A migrated or newly created site may keep its source tables and persistent
+Project Data together:
+
+```text
+1-AJWD/
+  project.db
+  project.json
+  PORTABLE_SITE.json       # created by the one-time migration action
+  source_files/
+    ADMS-DB.xlsx
+    ZENON-DB.xlsx
+    ZENON-SLD.xlsx
+    ...
+  reports/
+```
+
+The application detects this layout and opens `project.db` directly in the site
+folder. This preserves Comments and Checked records when the folder is copied
+to another machine. New imports use `source_files/` automatically. Existing
+split-layout sites remain supported for backward compatibility.
+
 ## Recommended site inputs
 
 ```text

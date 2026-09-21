@@ -80,7 +80,7 @@ class PersistentSiteRecordsTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         text = (root / "src" / "migration_report_tool" / "ui" / "main_window.py").read_text(encoding="utf-8")
         self.assertIn('workspace_caption = QLabel("PROJECT DATA")', text)
-        self.assertIn('form.addRow("Project Data", project_data_widget)', text)
+        self.assertIn('form.addRow("Legacy Project Data (compatibility)", project_data_widget)', text)
         self.assertIn('choose_project_data_root', text)
         self.assertNotIn('workspace_caption = QLabel("PROJECT APP WORKSPACE")', text)
 

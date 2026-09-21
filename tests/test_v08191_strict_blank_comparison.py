@@ -37,7 +37,7 @@ class TestV08191StrictBlankComparison(unittest.TestCase):
         return {column.header: column.id for column in inspect_table(path).columns}
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_strict_helper_treats_blank_as_real_value(self):
         normalizer = lambda value: "" if value is None else str(value).strip()

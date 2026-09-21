@@ -9,7 +9,7 @@ VERSION = ROOT / "src" / "migration_report_tool" / "version.py"
 
 class AutoFitReviewColumnTests(unittest.TestCase):
     def test_version_bumped_to_08190(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION.read_text(encoding="utf-8"))
+        self.assertIn('__version__ = "0.8.215"', VERSION.read_text(encoding="utf-8"))
 
     def test_finish_render_runs_content_aware_auto_fit(self):
         source = UI.read_text(encoding="utf-8")

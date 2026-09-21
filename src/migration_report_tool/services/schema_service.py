@@ -523,6 +523,13 @@ def get_source_display_names(store, source_type: str) -> dict[str, str]:
     ``store`` is accepted for API compatibility only.  Display Names are no
     longer site-local; one saved name applies to every site and formal export.
     """
+    # During MainWindow construction there is no active ProjectStore yet.
+    # Do not touch global_settings.db at that point: the global settings DB is
+    # normally on the shared UNC repository, and an offline server must not
+    # block the splash screen. Once a site store is active, the normal shared
+    # lookup applies and the labels are refreshed with the site view.
+    if store is None:
+        return {}
     return dict(global_source_display_names(source_type) or {})
 
 

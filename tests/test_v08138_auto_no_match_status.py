@@ -13,7 +13,7 @@ class V08138AutoNoMatchStatusTests(unittest.TestCase):
         cls.version = (root / "src/migration_report_tool/version.py").read_text(encoding="utf-8")
 
     def test_version(self):
-        self.assertIn('__version__ = "0.8.196"', self.version)
+        self.assertIn('__version__ = "0.8.215"', self.version)
 
     def test_unresolved_auto_is_explicit_in_ui(self):
         self.assertIn('else "Auto · No match"', self.ui)

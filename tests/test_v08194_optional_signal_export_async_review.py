@@ -18,7 +18,7 @@ STORE_SOURCE = (ROOT / "src/migration_report_tool/infrastructure/database/sqlite
 
 class TestV08194OptionalSignalExportAsyncReview(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_equipment_excel_export_does_not_require_signal_mapping_sources(self):
         with tempfile.TemporaryDirectory() as td:

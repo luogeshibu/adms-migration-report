@@ -8,7 +8,7 @@ from migration_report_tool.version import __version__
 
 class RMUFullLifecycleTests(unittest.TestCase):
     def test_release_and_schema_remain_compatible(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
         with tempfile.TemporaryDirectory() as td:
             store = ProjectStore(Path(td) / "site")
             try:

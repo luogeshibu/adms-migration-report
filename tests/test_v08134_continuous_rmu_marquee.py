@@ -9,7 +9,7 @@ VERSION = (ROOT / "src/migration_report_tool/version.py").read_text(encoding="ut
 
 class ContinuousRmuMarqueeTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertIn('__version__ = "0.8.196"', VERSION)
+        self.assertIn('__version__ = "0.8.215"', VERSION)
 
     def test_busy_bar_is_fixed_width_marquee(self):
         self.assertIn("class BusyMarqueeProgressBar(QProgressBar):", UI)

@@ -15,7 +15,7 @@ DB = (ROOT / "src" / "migration_report_tool" / "infrastructure" / "database" / "
 
 class TestV08193ReviewCheckPerformance(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_equipment_check_does_not_sync_refresh_heavy_pages(self):
         start = UI.index("def _on_comparison_locator_check_passed_toggled")

@@ -11,7 +11,7 @@ class V08177BuildTestIsolationTests(unittest.TestCase):
         cls.build = (cls.root / "build.ps1").read_text(encoding="utf-8-sig")
 
     def test_release_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_regression_tests_use_isolated_global_and_project_data(self):
         self.assertIn("function Invoke-IsolatedRegressionTests", self.build)

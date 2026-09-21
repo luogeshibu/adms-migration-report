@@ -49,7 +49,7 @@ class TestV08183ComparisonProfilesInheritance(unittest.TestCase):
         return {column.header: column.id for column in inspect_table(path).columns}
 
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_profile_never_stores_origin_site_physical_paths(self):
         site = self.root / "SOURCE_SITE"
@@ -112,7 +112,7 @@ class TestV08183ComparisonProfilesInheritance(unittest.TestCase):
         finally:
             store.close()
 
-    def test_sync_preserves_existing_site_path_id_and_disabled_state(self):
+    def test_sync_preserves_existing_site_path_and_id_and_applies_enabled_state(self):
         site = self.root / "SITE"
         local = self._csv(site / "custom-location.csv", [["ID", "FEEDER"], ["D1", "F1"]])
         ids = self._ids(local)
@@ -140,7 +140,7 @@ class TestV08183ComparisonProfilesInheritance(unittest.TestCase):
             merged, _ = apply_comparison_profile(store, "Sync Test", current_config=current)
             self.assertEqual(merged["sources"][0]["id"], "local_stable_id")
             self.assertEqual(source_path(store, merged["sources"][0]), local)
-            self.assertFalse(merged["sources"][0]["enabled"])
+            self.assertTrue(merged["sources"][0]["enabled"])
         finally:
             store.close()
 

@@ -85,4 +85,3 @@ def test_declared_zenon_duplicate_count_remains_an_issue_when_csv_is_consolidate
             assert row['status'] == 'FAILED'
         finally:
             store.db.close()
-

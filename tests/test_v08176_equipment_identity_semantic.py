@@ -7,7 +7,7 @@ from migration_report_tool.version import __version__
 
 class V08176EquipmentIdentitySemanticTests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_equipment_sources_use_equipment_name_for_legacy_rmu_key(self):
         for source_type in ("se_list", "zenon_db", "zenon_sld", "adms_db", "adms_sld"):

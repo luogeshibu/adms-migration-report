@@ -11,7 +11,7 @@ UI = (ROOT / "src" / "migration_report_tool" / "ui" / "main_window.py").read_tex
 
 class TestV08196ReviewInteractionPerformance(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_filters_are_local_not_full_refresh(self):
         build_start = UI.index("def _build_comparison_page")

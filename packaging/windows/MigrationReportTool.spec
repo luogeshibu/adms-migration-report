@@ -24,7 +24,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / "packaging" / "windows" / "qt_runtime_hook.py")],
     excludes=[],
     noarchive=False,
     optimize=1,

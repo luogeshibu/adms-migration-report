@@ -8,7 +8,7 @@ from migration_report_tool.version import __version__
 
 class V08172FullStatusLifecycleTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(__version__, "0.8.196")
+        self.assertEqual(__version__, "0.8.215")
 
     def test_all_manual_statuses_remain_after_first_need_action(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,6 +73,60 @@ class V08172FullStatusLifecycleTests(unittest.TestCase):
                 self.assertEqual(status_events[-1]["modified_by"], "SYSTEM")
             finally:
                 store.close()
+
+    def test_automatic_validation_change_keeps_manual_checked_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProjectStore(Path(tmp) / "project")
+            try:
+                rmu = "8515B"
+                row1 = {
+                    "rmu": rmu,
+                    "analysis_name": "TRUE", "analysis_feeder": "FALSE",
+                    "analysis_smart": "TRUE", "analysis_type": "TRUE", "analysis_ip": "TRUE",
+                }
+                store._sync_rmu_review_analysis_hash(rmu, "hash-1", row=row1)
+                store.update_rmu_check_passed(rmu, True, "alice")
+
+                row2 = dict(row1)
+                row2["analysis_feeder"] = "TRUE"
+                store._sync_rmu_review_analysis_hash(rmu, "hash-2", row=row2)
+                store.db.commit()
+
+                review = store.rmu_review_record(rmu)
+                self.assertEqual(int(review["check_passed"]), 1)
+                self.assertEqual(review["check_passed_by"], "alice")
+            finally:
+                store.close()
+
+    def test_opening_database_restores_check_cleared_by_older_automatic_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "project"
+            store = ProjectStore(folder)
+            try:
+                rmu = "8516B"
+                store.update_rmu_check_passed(rmu, True, "alice")
+                now = "2026-09-16T10:00:00"
+                store.db.execute(
+                    "UPDATE rmu_reviews SET check_passed=0,check_passed_by='',check_passed_at='' WHERE rmu=?",
+                    (rmu,),
+                )
+                store.db.execute(
+                    """INSERT INTO changes
+                       (rmu,field_name,old_value,new_value,reason,modified_by,modified_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (rmu, "rmu_check_passed", "PASS", "", "Automatic reset: legacy refresh", "SYSTEM", now),
+                )
+                store.db.commit()
+            finally:
+                store.close()
+
+            reopened = ProjectStore(folder)
+            try:
+                review = reopened.rmu_review_record(rmu)
+                self.assertEqual(int(review["check_passed"]), 1)
+                self.assertEqual(review["check_passed_by"], "alice")
+            finally:
+                reopened.close()
 
     def test_compact_tracker_uses_equipment_scoped_case_label(self):
         root = Path(__file__).resolve().parents[1]
